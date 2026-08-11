@@ -100,6 +100,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return False, "플러그인 ID가 누락되었습니다."
             return self._toggle_plugin(plugin_id, enabled, db_type)
 
+        elif action == "check_update":
+            plugin_id = str(item_data.get("plugin_id", "")).strip()
+            if not plugin_id:
+                return False, "업데이트 확인할 플러그인 ID가 누락되었습니다."
+            return self._check_update_action(plugin_id, db_type)
+
         return False, f"지원하지 않는 액션입니다: {action}"
 
     def get_dashboard_data(self, db_type, limit=10):
@@ -193,8 +199,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     enabled_val = str(enabled_raw or "1")
                 is_enabled = (enabled_val == "1")
 
-                # 4. 업데이트 체크 (update_manifest 기반만)
-                has_update, latest_version = self._check_plugin_update(plugin_id, version, cls_obj)
+                # 4. 업데이트 체크는 목록 응답에서 제외 (프론트가 check_update 액션으로 비동기 조회)
+                has_update, latest_version = False, version
 
                 plugins.append({
                     "id": plugin_id,
@@ -375,6 +381,45 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return self._parse_remote_version(self._fetch_text(url), version_key)
         except Exception:
             return None
+
+    def _check_update_action(self, plugin_id, db_type):
+        """단일 플러그인 업데이트 여부 비동기 조회 (check_update 액션)"""
+        base_dir = self._get_plugins_base_dir()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", plugin_id or ""):
+            return False, f"유효하지 않은 플러그인 ID입니다: {plugin_id}"
+        full_path = os.path.join(base_dir, plugin_id)
+        if not os.path.isdir(full_path):
+            return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
+
+        # 로컬 버전 읽기
+        version = "1.0.0"
+        version_file = os.path.join(full_path, "VERSION")
+        if os.path.isfile(version_file):
+            try:
+                with open(version_file, "r", encoding="utf-8") as f:
+                    vdata = json.load(f)
+                    version = vdata.get("plugin version") or vdata.get("version") or "1.0.0"
+            except Exception:
+                pass
+
+        # provider 클래스 조회
+        cls_obj = None
+        try:
+            from services.metadata_factory import MetadataFactory
+            for p_name, target_cls in MetadataFactory._discover_provider_classes():
+                if getattr(target_cls, 'id', p_name) == plugin_id:
+                    cls_obj = target_cls
+                    break
+        except Exception as e:
+            print(f"[PluginManager] check_update discover error: {e}")
+
+        has_update, latest_version = self._check_plugin_update(plugin_id, version, cls_obj)
+        return True, {
+            "plugin_id": plugin_id,
+            "version": version,
+            "has_update": has_update,
+            "latest_version": latest_version,
+        }
 
     def _check_plugin_update(self, plugin_id, local_version, cls_obj):
         """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)"""

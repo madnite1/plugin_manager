@@ -71,6 +71,7 @@
                     allPlugins = data.plugins;
                     updateCounts();
                     renderPlugins();
+                    checkUpdatesAsync();
                 } else {
                     showAlert(data.error || '플러그인 목록을 불러올 수 없습니다.', true);
                 }
@@ -78,6 +79,113 @@
             .catch(err => {
                 showAlert('플러그인 목록 통신 오류: ' + err.message, true);
             });
+    }
+
+    // 업데이트 버튼 이벤트 바인딩 (renderPlugins + patchCardUpdate 공용)
+    // escapeHtml 로컬 폴백 (전역 미정의 대비)
+    const escapeHtml = (typeof window.escapeHtml === 'function')
+        ? window.escapeHtml
+        : function(v) {
+            return String(v == null ? '' : v)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        };
+
+    function bindUpdateButton(btn) {
+        btn.addEventListener('click', async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const pluginId = this.getAttribute('data-id');
+            const pluginName = this.getAttribute('data-name');
+            if (!pluginId) return;
+
+            const origHtml = this.innerHTML;
+            this.disabled = true;
+            this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 업데이트 중...';
+
+            try {
+                const res = await callPluginAction({ action: 'update', plugin_id: pluginId });
+                this.disabled = false;
+                this.innerHTML = origHtml;
+                if (res.success) {
+                    showAlert(res.message || `'${pluginName}' 플러그인이 최신 버전으로 업데이트되었습니다!`);
+                    loadPlugins();
+                } else {
+                    showAlert(res.error || '플러그인 업데이트 실패', true);
+                }
+            } catch(err) {
+                this.disabled = false;
+                this.innerHTML = origHtml;
+                showAlert('업데이트 중 통신 오류가 발생했습니다: ' + err.message, true);
+            }
+        });
+    }
+
+    // 업데이트 체크 비동기 진행 (목록 렌더 이후 개별 조회)
+    let updateCheckSeq = 0;
+    function checkUpdatesAsync() {
+        const seq = ++updateCheckSeq; // loadPlugins 재호출 시 이전 배치 결과 무시
+        const targets = allPlugins.filter(p => p.has_update_manifest);
+        if (targets.length === 0) return;
+
+        const CONCURRENCY = 3;
+        const queue = targets.slice();
+
+        function markChecking(p, checking) {
+            const idEl = document.querySelector(`#pm-card-${CSS.escape(p.id)} .pm-plugin-id`);
+            if (!idEl) return;
+            const spinner = idEl.querySelector('.pm-update-spinner');
+            if (checking && !spinner) {
+                idEl.insertAdjacentHTML('beforeend',
+                    ' <i class="pm-update-spinner fa-solid fa-circle-notch fa-spin" title="업데이트 확인 중" style="opacity:0.6;"></i>');
+            } else if (!checking && spinner) {
+                spinner.remove();
+            }
+        }
+
+        function next() {
+            if (seq !== updateCheckSeq) return;
+            const p = queue.shift();
+            if (!p) return;
+            markChecking(p, true);
+            callPluginAction({ action: 'check_update', plugin_id: p.id })
+                .then(res => {
+                    if (seq !== updateCheckSeq) return;
+                    markChecking(p, false);
+                    // 성공 시 message에 결과 객체가 담김
+                    const r = res && res.success ? res.message : null;
+                    if (r && typeof r === 'object') {
+                        patchCardUpdate(r.plugin_id, !!r.has_update, r.latest_version);
+                    }
+                })
+                .catch(() => { markChecking(p, false); })
+                .finally(() => { next(); });
+        }
+
+        for (let i = 0; i < CONCURRENCY; i++) next();
+    }
+
+    // 개별 카드 업데이트 상태 반영 (부분 DOM 패치)
+    function patchCardUpdate(pluginId, hasUpdate, latestVersion) {
+        const p = allPlugins.find(x => x.id === pluginId);
+        if (!p) return;
+        p.has_update = hasUpdate;
+        p.latest_version = latestVersion;
+        if (!hasUpdate) return;
+
+        const card = document.getElementById(`pm-card-${pluginId}`);
+        if (!card) return; // 필터로 숨겨진 상태 — 데이터만 갱신
+        const actions = card.querySelector('.pm-card-action-btns');
+        if (!actions || actions.querySelector('.pm-btn-update')) return;
+
+        const btnHtml = `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtml(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(latestVersion)})" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.45); font-size: 0.76rem; padding: 0.35rem 0.65rem; border-radius: 6px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.3rem;">
+            <i class="fa-solid fa-arrow-up-from-bracket"></i> 업데이트 (v${escapeHtml(latestVersion)})
+           </button>`;
+        actions.insertAdjacentHTML('afterbegin', btnHtml);
+
+        const btn = actions.querySelector('.pm-btn-update');
+        if (btn) bindUpdateButton(btn);
     }
 
     // 카운트 배지 업데이트
@@ -244,36 +352,7 @@
         });
 
         // Update Button
-        document.querySelectorAll('.pm-btn-update').forEach(btn => {
-            btn.addEventListener('click', async function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-
-                const pluginId = this.getAttribute('data-id');
-                const pluginName = this.getAttribute('data-name');
-                if (!pluginId) return;
-
-                const origHtml = this.innerHTML;
-                this.disabled = true;
-                this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 업데이트 중...';
-
-                try {
-                    const res = await callPluginAction({ action: 'update', plugin_id: pluginId });
-                    this.disabled = false;
-                    this.innerHTML = origHtml;
-                    if (res.success) {
-                        showAlert(res.message || `'${pluginName}' 플러그인이 최신 버전으로 업데이트되었습니다!`);
-                        loadPlugins();
-                    } else {
-                        showAlert(res.error || '플러그인 업데이트 실패', true);
-                    }
-                } catch(err) {
-                    this.disabled = false;
-                    this.innerHTML = origHtml;
-                    showAlert('업데이트 중 통신 오류가 발생했습니다: ' + err.message, true);
-                }
-            });
-        });
+        document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
 
         // Settings Button (카드 우상단 톱니바퀴)
         document.querySelectorAll('.pm-btn-settings').forEach(btn => {
