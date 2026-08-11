@@ -1,0 +1,57 @@
+name: Auto Release on VERSION bump
+
+# VERSION 파일이 main에 push될 때 자동으로 GitHub Release 생성
+# (태그 = VERSION의 "plugin version" 값, 중복 태그면 스킵)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from VERSION
+        id: version
+        run: |
+          VER="$(jq -r '."plugin version"' VERSION)"
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "Detected version: ${VER}"
+
+      - name: Check duplicate tag
+        id: tagcheck
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "Tag ${TAG} already exists — skip release"
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create Release
+        if: steps.tagcheck.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body: |
+            자동 릴리즈 — VERSION 파일 bump 시 생성됩니다.
+
+            버전: `${{ steps.version.outputs.version }}`
+          files: |
+            plugin_manager.py
+            __init__.py
+            VERSION
+            index.html
+            style.css
+            script.js
+          fail_on_unmatched_files: false
