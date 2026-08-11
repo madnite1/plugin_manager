@@ -6,6 +6,7 @@ import shutil
 import json
 import re
 import tempfile
+import time
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -14,6 +15,10 @@ import logging
 from plugins.metadata.base import BaseMetadataProvider
 
 logger = logging.getLogger(__name__)
+
+# GitHub 릴리즈 태그 조회 TTL 캐시 (releases/latest 리다이렉트는 요청마다 수행하면 느리므로 5분 캐시)
+_RELEASE_TAG_CACHE = {}
+_RELEASE_TAG_CACHE_TTL = 300  # 초
 
 
 class PluginManagerMetadataProvider(BaseMetadataProvider):
@@ -208,28 +213,193 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             return plugins
 
+    # ------------------------------------------------------------------
+    # Self Update Engine (릴리즈 태그 우선, 브랜치 폴백 — 코어 PluginService 미사용)
+    # ------------------------------------------------------------------
+
+    _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+
+    def _build_update_spec(self, plugin_id, manifest):
+        """update_manifest 검증 + 업데이트 spec 구성 (코어 _validate_update_manifest 축소판)"""
+        if not (manifest and isinstance(manifest, dict)):
+            return None
+        if not manifest.get("enabled"):
+            return None
+        if str(manifest.get("provider", "") or "").strip() != "github-raw":
+            return None
+        raw_base_url = str(manifest.get("raw_base_url", "") or "").strip().rstrip("/")
+        if not raw_base_url:
+            return None
+        files_raw = manifest.get("files")
+        if not isinstance(files_raw, list) or not files_raw:
+            return None
+        safe_files = []
+        for path in files_raw:
+            clean = os.path.normpath(str(path))
+            if (clean.startswith("..") or clean.startswith("/") or clean.startswith("\\")
+                    or clean in (".", "")):
+                return None
+            safe_files.append(str(path))
+        version_file = str(manifest.get("version_file", "VERSION") or "VERSION").strip()
+        version_key = str(manifest.get("version_key", "plugin version") or "plugin version").strip()
+        if version_file not in safe_files:
+            safe_files.append(version_file)
+        return {
+            "raw_base_url": raw_base_url,
+            "files": safe_files,
+            "version_file": version_file,
+            "version_key": version_key,
+        }
+
+    def _read_git_source_info(self, plugin_id):
+        """플러그인 설치 시 저장된 .git_source 메타 읽기 (없으면 None)"""
+        try:
+            pdir = os.path.join(self._get_plugins_base_dir(), plugin_id)
+            path = os.path.join(pdir, ".git_source")
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _parse_github_repo(self, git_url):
+        """GitHub 저장소 URL에서 (owner, repo) 추출. GitHub가 아니면 None."""
+        url = str(git_url or "").strip().rstrip("/")
+        url = re.sub(r"\.git$", "", url)
+        m = re.match(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:/tree/([^/]+))?$", url)
+        if m:
+            return m.group(1), m.group(2)
+        return None
+
+    def _fetch_latest_release_tag(self, owner, repo):
+        """
+        GitHub 최신 릴리즈 태그 조회.
+
+        API 키 불필요: /releases/latest 는 최신 릴리즈 태그로 리다이렉트됨.
+        최종 URL이 .../releases/tag/{tag} 이면 태그 반환, 릴리즈가 없으면
+        /releases 로 폴백되어 None. TTL 캐시 적용.
+        """
+        repo_key = f"{owner}/{repo}"
+        now = time.time()
+        cached = _RELEASE_TAG_CACHE.get(repo_key)
+        if cached and (now - cached[1]) < _RELEASE_TAG_CACHE_TTL:
+            return cached[0]
+
+        tag = None
+        try:
+            url = f"https://github.com/{owner}/{repo}/releases/latest"
+            req = Request(url, headers={"User-Agent": "BookOasis/1.0"})
+            with urlopen(req, timeout=15) as resp:
+                final_url = resp.geturl()
+            if final_url:
+                m = re.search(r"/releases/tag/([^/?#]+)$", final_url)
+                if m:
+                    tag = m.group(1)
+        except Exception:
+            tag = None
+
+        _RELEASE_TAG_CACHE[repo_key] = (tag, now)
+        return tag
+
+    def _resolve_update_base_url(self, plugin_id, raw_base_url):
+        """업데이트 소스 URL 결정: GitHub 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백."""
+        try:
+            git_info = self._read_git_source_info(plugin_id)
+            repo = self._parse_github_repo(git_info.get("git_url")) if git_info else None
+            if repo:
+                tag = self._fetch_latest_release_tag(repo[0], repo[1])
+                if tag:
+                    return f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{tag}"
+        except Exception:
+            pass
+        return raw_base_url
+
+    def _fetch_text(self, url, timeout=15):
+        """URL GET → 텍스트 (UTF-8, 오류 시 예외 전파)"""
+        req = Request(url, headers={"User-Agent": "BookOasis/1.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    def _parse_remote_version(self, text, version_key="plugin version"):
+        """VERSION 텍스트에서 버전 문자열 추출 (JSON dict 우선, 키 정규식 폴백)"""
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                for key in (version_key, "plugin version", "plugin_version", "version"):
+                    val = data.get(key)
+                    if val:
+                        return str(val).strip()
+        except Exception:
+            pass
+        for key in (version_key, "plugin version", "plugin_version", "version"):
+            if not key:
+                continue
+            m = re.search(r'"%s"\s*:\s*"([^"]+)"' % re.escape(str(key)), text)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    def _parse_version_tuple(self, v):
+        """버전 문자열 → (major, minor, patch) tuple (v 접두사/pre-release 무시, 실패 시 None)"""
+        if not v:
+            return None
+        m = self._VERSION_RE.match(str(v).strip())
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    def _can_update_to_version(self, local_version, remote_version):
+        """로컬 < 원격일 때만 업데이트 허용 (동일/다운그레이드 차단, 코어 규칙과 동일)"""
+        local_t = self._parse_version_tuple(local_version)
+        remote_t = self._parse_version_tuple(remote_version)
+        if not local_t or not remote_t:
+            return False
+        return local_t < remote_t
+
+    def _read_local_plugin_version(self, pdir, version_file, version_key):
+        """로컬 VERSION 파일 읽기"""
+        try:
+            vpath = os.path.join(pdir, version_file)
+            with open(vpath, "r", encoding="utf-8") as f:
+                return self._parse_remote_version(f.read(), version_key)
+        except Exception:
+            return None
+
+    def _fetch_remote_plugin_version(self, base_url, version_file="VERSION", version_key="plugin version"):
+        """원격 VERSION 조회 (실패/파싱 불가 시 None — 체크는 조용히 실패)"""
+        try:
+            url = f"{base_url.rstrip('/')}/{version_file}"
+            return self._parse_remote_version(self._fetch_text(url), version_key)
+        except Exception:
+            return None
+
     def _check_plugin_update(self, plugin_id, local_version, cls_obj):
-        """update_manifest 기반 신규 업데이트 유무 체크 (자동 업데이트는 진행하지 않음)"""
+        """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)"""
         has_update = False
         latest_version = local_version
 
-        # 1. update_manifest 기반 체크
         update_manifest = getattr(cls_obj, "update_manifest", None) if cls_obj else None
-        if update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled"):
-            try:
-                from services.plugin_service import PluginService
-                spec = PluginService._validate_update_manifest(plugin_id, update_manifest)
-                remote_ver = PluginService._fetch_remote_plugin_version(
-                    spec["raw_base_url"],
-                    version_file=spec.get("version_file", "VERSION"),
-                    version_key=spec.get("version_key", "plugin version")
-                )
-                if remote_ver:
-                    can_up, _ = PluginService.can_update_to_github_version(local_version, remote_ver)
-                    if can_up:
-                        return True, remote_ver
-            except Exception:
-                pass
+        if not (update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled")):
+            return has_update, latest_version
+
+        try:
+            spec = self._build_update_spec(plugin_id, update_manifest)
+            if not spec:
+                return has_update, latest_version
+
+            base_url = self._resolve_update_base_url(plugin_id, spec["raw_base_url"])
+            remote_ver = self._fetch_remote_plugin_version(
+                base_url,
+                version_file=spec["version_file"],
+                version_key=spec["version_key"],
+            )
+            if remote_ver and self._can_update_to_version(local_version, remote_ver):
+                return True, remote_ver
+        except Exception:
+            pass
 
         return has_update, latest_version
 
@@ -652,22 +822,72 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return ""
 
     def _update_plugin(self, plugin_id, db_type):
-        """특정 플러그인 업데이트 실행 (update_manifest 기반만)"""
-        base_dir = self._get_plugins_base_dir()
-        pdir = os.path.join(base_dir, plugin_id)
+        """특정 플러그인 업데이트 실행 (릴리즈 태그 우선, 브랜치 폴백 — 코어 sample_update_plugin 미사용)"""
+        pdir, err = self._validate_plugin_path(plugin_id)
+        if err or not pdir:
+            return False, err or "유효하지 않은 플러그인 ID입니다."
 
         if not os.path.exists(pdir):
             return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
 
-        # update_manifest 통한 업데이트 시도
-        from services.plugin_service import PluginService
         try:
-            success, res = PluginService.sample_update_plugin(plugin_id)
-            if success:
-                return True, f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{res.get('github_version')})."
-            return False, res.get('error') or "업데이트에 실패했습니다."
+            from services.metadata_factory import MetadataFactory
+            _, target_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
         except Exception as e:
-            return False, f"업데이트 도중 오류 발생: {str(e)}"
+            return False, f"플러그인 로드 실패: {e}"
+
+        manifest = getattr(target_cls, "update_manifest", None)
+        spec = self._build_update_spec(plugin_id, manifest)
+        if not spec:
+            return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
+
+        local_ver = self._read_local_plugin_version(pdir, spec["version_file"], spec["version_key"])
+        base_url = self._resolve_update_base_url(plugin_id, spec["raw_base_url"])
+        remote_ver = self._fetch_remote_plugin_version(
+            base_url,
+            version_file=spec["version_file"],
+            version_key=spec["version_key"],
+        )
+
+        if not remote_ver:
+            return False, f"원격 버전을 확인할 수 없습니다. (소스: {base_url})"
+        if not self._can_update_to_version(local_ver, remote_ver):
+            return False, (
+                f"업데이트 불가: 원격 버전({remote_ver})이 현재 버전({local_ver or '알 수 없음'})보다 "
+                f"낮거나 같습니다."
+            )
+
+        # 파일 다운로드 → 교체
+        downloaded = {}
+        for name in spec["files"]:
+            file_url = f"{base_url.rstrip('/')}/{name}"
+            try:
+                downloaded[name] = self._fetch_text(file_url)
+            except HTTPError as e:
+                if e.code == 404:
+                    return False, f"원격 저장소에서 파일을 찾을 수 없습니다: {name}"
+                raise
+            except Exception as e:
+                return False, f"파일 다운로드 실패 ({name}): {str(e)}"
+
+        for name, content in downloaded.items():
+            fpath = os.path.join(pdir, name)
+            fdir = os.path.dirname(fpath)
+            if fdir and not os.path.exists(fdir):
+                os.makedirs(fdir, exist_ok=True)
+            with open(fpath, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+
+        # 핫 리로드 (업데이트 자체는 성공 유지, 리로드 실패는 경고로 포함)
+        reload_warning = ""
+        try:
+            from services.metadata_factory import MetadataFactory
+            MetadataFactory.hot_reload_plugin(plugin_id)
+        except Exception as e:
+            reload_warning = f" (단, 리로드 실패: {str(e)})"
+
+        source_label = "릴리즈 태그" if base_url != spec["raw_base_url"] else "브랜치(main)"
+        return True, f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{remote_ver}, {source_label} 기준).{reload_warning}"
 
     def _update_all_plugins(self, db_type):
         """설치된 모든 플러그인 일괄 업데이트"""
