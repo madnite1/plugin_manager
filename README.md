@@ -95,12 +95,15 @@ https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{bra
 
 설치 절차:
 
-1. 저장소 소스를 HTTP ZIP 으로 다운로드 (`codeload.github.com` / `archive/{branch}.zip` — 표준 라이브러리만 사용, git 바이너리 불필요)
+1. 저장소 소스를 HTTP ZIP 으로 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
+   - **GitHub 소스 + 브랜치 미지정이면 최신 릴리즈 태그 ZIP 우선** (`/releases/latest` 태그 조회, API 키 불필요)
+   - 태그가 없거나 `/tree/<branch>` 로 브랜치를 명시한 경우에는 브랜치 ZIP (`codeload` → main, 실패 시 master 폴백)
 2. 저장소 루트에서 `update_manifest` 를 AST 로 추출 (없으면 설치 거부)
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
 4. `plugins/metadata/<plugin_id>` 로 복사 → `.git_source` 메타 저장 → 활성화 + hot reload
 
-설치 시 `.git_source` 파일이 생성되어 `source_type` / `git_url` / `branch` / `manifest_files` 이력이 남습니다.
+설치 시 `.git_source` 파일이 생성되어 `source_type` / `git_url` / `branch`(릴리즈 태그 설치 시 태그명) / `manifest_files` 이력이 남습니다.
+설치와 업데이트가 같은 소스(릴리즈 태그 우선, 브랜치 폴백)를 바라보므로 버전 불일치가 없습니다.
 
 ---
 
