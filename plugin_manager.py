@@ -45,7 +45,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js"],
         "version_file": "VERSION",
         "version_key": "plugin version",
-        "show_sample_update_button": True,
+        "show_sample_update_button": False,
     }
 
     def search(self, db_type, query):
