@@ -144,7 +144,7 @@
                 ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-magnifying-glass"></i> 수동 검색</span>'
                 : '';
 
-            const updateBtnHtml = (p.has_update && !p.is_system)
+            const updateBtnHtml = (p.has_update && (p.has_update_manifest || !p.is_system))
                 ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${p.name}" title="최신 버전으로 업데이트 (v${p.latest_version})" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.45); font-size: 0.76rem; padding: 0.35rem 0.65rem; border-radius: 6px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.3rem;">
                     <i class="fa-solid fa-arrow-up-from-bracket"></i> 업데이트 (v${escapeHtml(p.latest_version)})
                    </button>`
