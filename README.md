@@ -93,11 +93,26 @@ https://github.com/<owner>/<repo>.git                  # .git 형식
 https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{branch}.zip 방식)
 ```
 
+### 소스 다운로드 후보 순서
+
+```
+GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
+  1) 최신 릴리즈 태그 ZIP   ← /releases/latest 리다이렉트로 태그 조회 (API 키 불필요)
+  2) main 브랜치 ZIP        ← 태그 없음(릴리즈 미생성) 또는 태그 ZIP 실패 시
+  3) master 브랜치 ZIP      ← main 실패 시 폴백
+```
+
+예외 조건:
+
+- `/tree/<branch>` 로 브랜치를 **명시한 URL** → 태그 조회 생략, 해당 브랜치 ZIP만 사용
+- **Gitea 등 GitHub 이외 호스트** → 태그 조회 자체를 하지 않음 (브랜치 ZIP만, `archive/{branch}.zip`)
+- 태그 ZIP 다운로드가 404/오류여도 **자동으로 main → master 로 폴백** (후보 순차 시도 구조)
+
+설치 완료 시 사용된 소스가 표시됩니다 (`릴리즈 태그 1.0.0` 또는 `브랜치 main`).
+
 설치 절차:
 
-1. 저장소 소스를 HTTP ZIP 으로 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
-   - **GitHub 소스 + 브랜치 미지정이면 최신 릴리즈 태그 ZIP 우선** (`/releases/latest` 태그 조회, API 키 불필요)
-   - 태그가 없거나 `/tree/<branch>` 로 브랜치를 명시한 경우에는 브랜치 ZIP (`codeload` → main, 실패 시 master 폴백)
+1. 위 후보 순서대로 소스 ZIP 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
 2. 저장소 루트에서 `update_manifest` 를 AST 로 추출 (없으면 설치 거부)
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
 4. `plugins/metadata/<plugin_id>` 로 복사 → `.git_source` 메타 저장 → 활성화 + hot reload
