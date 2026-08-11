@@ -1,6 +1,6 @@
 # 플러그인 매니저 (plugin_manager)
 
-> 저장소: [github.com/madnite1/bookoasis_plugin_manager](https://github.com/madnite1/bookoasis_plugin_manager)
+> 저장소: [github.com/madnite1/plugin_manager](https://github.com/madnite1/plugin_manager)
 
 BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이트·삭제·활성화 관리하는 시스템 플러그인입니다.
 **ZIP 파일 업로드 설치**, **Git 저장소 URL 설치**, **update_manifest 기반 자동 업데이트** 세 가지 경로를 지원합니다.
@@ -14,7 +14,7 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 - **Git URL 설치** — 플러그인 매니저(또는 대상 서버의 설치 UI)의 "Git 저장소 URL 설치"에 아래 주소 입력:
 
   ```text
-  https://github.com/madnite1/bookoasis_plugin_manager
+  https://github.com/madnite1/plugin_manager
   ```
 
 - **ZIP 업로드 설치** — 저장소 소스를 ZIP 으로 묶어 업로드 (루트에 `update_manifest` 필수)
@@ -111,7 +111,7 @@ https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{bra
 update_manifest = {
     "enabled": True,
     "provider": "github-raw",
-    "raw_base_url": "https://raw.githubusercontent.com/madnite1/bookoasis_plugin_manager/main",
+    "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
     "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js"],
     "version_file": "VERSION",
     "version_key": "plugin version",

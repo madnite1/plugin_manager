@@ -36,7 +36,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     update_manifest = {
         "enabled": True,
         "provider": "github-raw",
-        "raw_base_url": "https://raw.githubusercontent.com/madnite1/bookoasis_plugin_manager/main",
+        "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
         "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js"],
         "version_file": "VERSION",
         "version_key": "plugin version",
