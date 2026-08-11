@@ -512,14 +512,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             import io
             import zipfile
 
-            # 1. ZIP 다운로드 (기본 브랜치 main → 실패 시 master 폴백)
+            # 1. ZIP 다운로드 (릴리즈 태그 우선 → 기본 브랜치 main → 실패 시 master 폴백)
+            #    GitHub 소스 + 브랜치 미지정(/tree/ 또는 /src/branch/ 없음)이면
+            #    최신 릴리즈 태그 ZIP을 최우선 후보로 사용 — 설치와 업데이트 소스 일치.
+            candidates = list(self._zip_url_candidates(zip_url))
+            release_zip_url = None
+            release_tag = None
+            if "/tree/" not in git_url and "/src/branch/" not in git_url:
+                repo = self._parse_github_repo(git_url)
+                if repo:
+                    release_tag = self._fetch_latest_release_tag(repo[0], repo[1])
+                    if release_tag:
+                        release_zip_url = (
+                            f"https://codeload.github.com/{repo[0]}/{repo[1]}"
+                            f"/zip/refs/tags/{release_tag}"
+                        )
+                        if release_zip_url not in candidates:
+                            candidates.insert(0, release_zip_url)
+
             zip_bytes = None
             last_err = None
-            for cand_url in self._zip_url_candidates(zip_url):
+            used_url = None
+            for cand_url in candidates:
                 try:
                     req = Request(cand_url, headers={"User-Agent": "BookOasis/1.0"})
                     with urlopen(req, timeout=60) as resp:
                         zip_bytes = resp.read()
+                    used_url = cand_url
                     break
                 except HTTPError as e:
                     last_err = f"{e.code} {e.reason}"
@@ -527,6 +546,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     last_err = str(e)
             if not zip_bytes:
                 return False, f"저장소 ZIP 다운로드 실패: {last_err}"
+
+            # 릴리즈 태그로 설치한 경우 branch 메타를 태그명으로 기록 (업데이트 엔진 소스와 일치)
+            if release_zip_url and used_url == release_zip_url:
+                branch = release_tag
 
             # 2. 압축 해제 (Zip Slip 차단)
             zip_file = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -599,8 +622,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
 
+            source_label = (
+                f"릴리즈 태그 {release_tag}"
+                if (release_zip_url and used_url == release_zip_url)
+                else f"브랜치 {branch}"
+            )
             return True, (
-                f"Git 저장소에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
+                f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
                 f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지)"
             )
 
