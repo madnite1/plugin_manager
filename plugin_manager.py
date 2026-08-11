@@ -5,7 +5,6 @@ import ast
 import shutil
 import json
 import re
-import subprocess
 import tempfile
 from datetime import datetime
 from urllib.request import Request, urlopen
