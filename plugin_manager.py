@@ -668,8 +668,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             for rel in manifest_files:
                 rel_clean = os.path.normpath(str(rel))
                 if (rel_clean.startswith("..") or rel_clean.startswith("/")
-                        or rel_clean.startswith("\\") or rel_clean in (".", "")):
+                        or rel_clean.startswith("\\\\") or rel_clean in (".", "")):
                     return False, f"update_manifest 에 유효하지 않은 파일 경로가 포함되어 있습니다: {rel}"
+
+            # 5-1. 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔, zip 설치와 동일 기준)
+            #      prune 전에 수행해야 UI 번들/VERSION/symlink 등 전체 파일 기준 검사 가능
+            source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
+            if not source_ok:
+                failed_items = [f"- {c['name']}: {c['detail']}" for c in source_checks if not c.get("ok")]
+                return False, (
+                    "플러그인 검증 실패 — 설치를 중단했습니다 (기존 폴더는 변경되지 않음):\n"
+                    + "\n".join(failed_items)
+                )
 
             # 6. manifest 목록 외 전부 삭제 (.git 등 포함 안전 처리)
             try:
@@ -700,15 +710,36 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
 
+            # 2차 검증: 실제 플러그인 로드 확인 (실패 시 설치 폴더 삭제 — zip 설치와 동일 기준)
+            loaded_ok = False
+            try:
+                providers = MetadataFactory.get_available_providers()
+                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
+            except Exception as e:
+                logger.warning("플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
+
+            if not loaded_ok:
+                if os.path.exists(dest_dir):
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                return False, (
+                    f"검증 실패: '{plugin_id}' 플러그인이 설치 후 로드되지 않았습니다. "
+                    f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
+                )
+
+            passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
+            warns = [c["detail"] for c in source_checks if c.get("warn")]
             source_label = (
                 f"릴리즈 태그 {release_tag}"
                 if (release_zip_url and used_url == release_zip_url)
                 else f"브랜치 {branch}"
             )
-            return True, (
+            result_msg = (
                 f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
-                f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지)"
+                f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지, 검증 통과: {', '.join(passed)})"
             )
+            if warns:
+                result_msg += " 경고: " + "; ".join(warns)
+            return True, result_msg
 
         except Exception as e:
             return False, f"Git 플러그인 설치 중 오류가 발생했습니다: {str(e)}"
