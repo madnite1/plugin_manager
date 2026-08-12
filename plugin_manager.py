@@ -930,14 +930,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _validate_plugin_source(self, plugin_dir, detected_id):
         """
         설치 대상 플러그인 소스 정적 검증 (코드 실행 없음 — AST/파일 스캔만).
+        개발 가이드(guide_plugins.md) 규격 기반.
 
         검증 항목:
-          1. VERSION 파일 존재 + JSON 파싱 + 'plugin version' 키
+          1. VERSION: update_manifest 선언 시 필수 (JSON + 'plugin version' 키).
+             미선언 시 VERSION 없음/비표준은 경고만 (업데이트 미지원 플러그인 허용)
           2. 메인 .py 존재 (BaseMetadataProvider 상속 클래스)
           3. 클래스 id == 감지된 plugin_id (폴더명과 일치해야 목록/카테고리 표시)
-          4. 필수 메서드 search/apply 구현 (AST 클래스 본문 검사)
-          5. 금지 패턴 없음 (eval/exec/subprocess/os.system/os.popen/shell=True)
-          6. update_manifest 선언 시: files 목록 파일 실제 존재 + raw_base_url 비어있지 않음
+          4. 필수 클래스 필드 (가이드 필수/권장): name(str), is_searchable(bool), config_schema(list)
+          5. 필수 메서드 search/apply 구현 (AST 클래스 본문 검사)
+          6. 금지 패턴 없음 (eval/exec/subprocess/os.system/os.popen/shell=True)
+          7. 심볼릭 링크 없음 (가이드 보안 규정 — 외부 경로 접근 차단)
+          8. update_manifest 규격: provider=='github-raw' + version_file/version_key/files
+             존재 + raw_base_url 비어있지 않음 + files 실제 존재
+          9. category_tab 선언 시 UI 번들(index.html/script.js/style.css) 필수
+             (가이드: 카테고리 레벨 플러그인 = 풀페이지 UI 제공 계약)
+             미선언 시 부분 번들은 경고만
 
         반환: (성공 여부, 체크 결과 리스트 [{'name', 'ok', 'detail'}])
         """
@@ -947,26 +955,41 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         checks = []
         base_names = ("base.py", "__init__.py")
 
-        # 1. VERSION 파일 검사 (없어도 설치는 허용 — 경고만, 업데이트 체크만 불가)
+        # manifest 사전 추출 (VERSION 필수 판정에 사용)
+        manifest_files, manifest = self._extract_update_manifest_files(plugin_dir)
+
+        # 1. VERSION 파일 검사 (update_manifest 선언 시 필수, 미선언 시 경고만)
         vpath = os.path.join(plugin_dir, "VERSION")
+        vfile_ok = False
+        vdetail = ""
         if os.path.isfile(vpath):
             try:
                 with open(vpath, "r", encoding="utf-8") as f:
                     vdata = json.load(f)
                 vkey = vdata.get("plugin version") or vdata.get("version")
                 if vkey:
-                    checks.append({"name": "VERSION", "ok": True, "detail": "버전 %s" % vkey})
+                    vfile_ok = True
+                    vdetail = "버전 %s" % vkey
                 else:
-                    checks.append({"name": "VERSION", "ok": True, "warn": True,
-                                   "detail": "경고: 'plugin version' 키가 없습니다 (업데이트 체크 불가)"})
+                    vdetail = "'plugin version' 키가 없습니다 (업데이트 체크 불가)"
             except Exception:
-                checks.append({"name": "VERSION", "ok": True, "warn": True,
-                               "detail": "경고: VERSION 형식이 표준 JSON이 아닙니다 (업데이트 체크 불가)"})
+                vdetail = "VERSION 형식이 표준 JSON이 아닙니다 (업데이트 체크 불가)"
+        else:
+            vdetail = "VERSION 파일 없음"
+
+        if manifest_files:
+            if vfile_ok:
+                checks.append({"name": "VERSION", "ok": True, "detail": vdetail})
+            else:
+                checks.append({"name": "VERSION", "ok": False,
+                               "detail": "update_manifest 선언 시 VERSION 필수 — " + vdetail})
+        elif vfile_ok:
+            checks.append({"name": "VERSION", "ok": True, "detail": vdetail})
         else:
             checks.append({"name": "VERSION", "ok": True, "warn": True,
-                           "detail": "경고: VERSION 파일 없음 (업데이트 체크 불가)"})
+                           "detail": "경고: " + vdetail + " (업데이트 체크 불가)"})
 
-        # 2~5. 파이썬 소스 AST 분석
+        # 2~6. 파이썬 소스 AST 분석
         py_files = []
         try:
             py_files = [f for f in sorted(os.listdir(plugin_dir))
@@ -977,6 +1000,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         provider_found = False
         class_id = None
+        cls_attrs = set()   # provider 클래스 본문에서 수집한 필드명 (리터럴 타입 검증 완료)
         has_search = False
         has_apply = False
         forbidden_hits = []
@@ -1024,18 +1048,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     except Exception:
                         bases.append("")
 
-                # 플러그인 클래스 내 id / search / apply 수집
+                # 클래스 본문에서 필수/선택 필드 + 메서드 수집 (리터럴 타입 검증)
                 cls_id = None
+                cls_fields = set()
                 cls_search = False
                 cls_apply = False
                 for stmt in node.body:
                     if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
                         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
                         for t in targets:
-                            if isinstance(t, ast.Name) and t.id == "id":
-                                val = stmt.value
+                            if not isinstance(t, ast.Name):
+                                continue
+                            val = stmt.value
+                            if t.id == "id":
                                 if isinstance(val, ast.Constant) and isinstance(val.value, str):
                                     cls_id = val.value
+                            elif t.id == "name":
+                                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                                    cls_fields.add("name")
+                            elif t.id == "is_searchable":
+                                if isinstance(val, ast.Constant) and isinstance(val.value, bool):
+                                    cls_fields.add("is_searchable")
+                            elif t.id == "config_schema":
+                                if isinstance(val, (ast.List, ast.Tuple)):
+                                    cls_fields.add("config_schema")
+                            elif t.id in ("category_tab", "update_manifest", "dashboard_widget"):
+                                if isinstance(val, ast.Dict):
+                                    cls_fields.add(t.id)
                     elif isinstance(stmt, ast.FunctionDef):
                         if stmt.name == "search":
                             cls_search = True
@@ -1043,7 +1082,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                             cls_apply = True
 
                 # BaseMetadataProvider 직접 상속 또는 id 속성을 가진 클래스 = provider 후보
-                # (_BASE 같은 alias 상속 / 상속명 해석 불가 케이스 대비)
                 is_provider = any("BaseMetadataProvider" in b for b in bases)
                 if not is_provider and cls_id is not None:
                     is_provider = True
@@ -1053,6 +1091,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
                 if is_provider:
                     provider_found = True
+                    cls_attrs.update(cls_fields)
                     if cls_search:
                         has_search = True
                     if cls_apply:
@@ -1079,7 +1118,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         else:
             checks.append({"name": "클래스 id", "ok": False, "detail": "클래스를 찾을 수 없어 검사 불가"})
 
-        # 4. 필수 메서드 검사
+        # 4. 필수 클래스 필드 검사 (가이드: id/name/is_searchable/config_schema)
+        if provider_found:
+            missing_fields = [f for f in ("name", "is_searchable", "config_schema")
+                              if f not in cls_attrs]
+            if missing_fields:
+                checks.append({"name": "필수 필드", "ok": False,
+                               "detail": "클래스에 없음: " + ", ".join(missing_fields)})
+            else:
+                checks.append({"name": "필수 필드", "ok": True,
+                               "detail": "name/is_searchable/config_schema 확인"})
+        else:
+            checks.append({"name": "필수 필드", "ok": False, "detail": "클래스 없음"})
+
+        # 5. 필수 메서드 검사
         if provider_found:
             missing = []
             if not has_search:
@@ -1094,31 +1146,81 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         else:
             checks.append({"name": "필수 메서드", "ok": False, "detail": "클래스 없음"})
 
-        # 5. 금지 패턴 검사
+        # 6. 금지 패턴 검사
         if forbidden_hits:
             checks.append({"name": "금지 패턴", "ok": False,
                            "detail": "; ".join(forbidden_hits[:3])})
         else:
             checks.append({"name": "금지 패턴", "ok": True, "detail": "eval/exec/subprocess 없음"})
 
-        # 6. update_manifest 검사 (선언된 경우에만)
-        manifest_files, manifest = self._extract_update_manifest_files(plugin_dir)
+        # __init__.py 존재 여부 (없으면 폴백 로드 — 경고만)
+        if os.path.isfile(os.path.join(plugin_dir, "__init__.py")):
+            checks.append({"name": "__init__.py", "ok": True, "detail": "확인"})
+        else:
+            checks.append({"name": "__init__.py", "ok": True, "warn": True,
+                           "detail": "경고: __init__.py 없음 (폴백 로드 사용)"})
+
+        # 7. 심볼릭 링크 검사 (가이드 보안 규정 — 외부 경로 접근 차단)
+        symlinks = []
+        try:
+            for root_dir, dirs, files in os.walk(plugin_dir):
+                for entry in dirs + files:
+                    p = os.path.join(root_dir, entry)
+                    if os.path.islink(p):
+                        symlinks.append(os.path.relpath(p, plugin_dir))
+        except Exception:
+            pass
+        if symlinks:
+            checks.append({"name": "심볼릭 링크", "ok": False,
+                           "detail": "플러그인 폴더 내 심볼릭 링크 금지: " + ", ".join(symlinks[:3])})
+        else:
+            checks.append({"name": "심볼릭 링크", "ok": True, "detail": "없음"})
+
+        # 8. update_manifest 규격 검사 (선언된 경우에만)
         if manifest_files:
+            problems = []
+            m_provider = str(manifest.get("provider") or "").strip()
+            if m_provider != "github-raw":
+                problems.append("provider='%s' (github-raw만 지원)" % (m_provider or "없음"))
+            if not str(manifest.get("version_file") or "").strip():
+                problems.append("version_file 없음")
+            if not str(manifest.get("version_key") or "").strip():
+                problems.append("version_key 없음")
             missing_files = [rel for rel in manifest_files
                              if not os.path.isfile(os.path.join(plugin_dir, rel))]
-            raw_base = str(manifest.get("raw_base_url") or "").strip()
             if missing_files:
+                problems.append("files에 선언된 파일이 없음: " + ", ".join(missing_files[:3]))
+            if not str(manifest.get("raw_base_url") or "").strip():
+                problems.append("raw_base_url이 비어 있음")
+            if problems:
                 checks.append({"name": "update_manifest", "ok": False,
-                               "detail": "files에 선언된 파일이 없음: " + ", ".join(missing_files[:3])})
-            elif not raw_base:
-                checks.append({"name": "update_manifest", "ok": False,
-                               "detail": "raw_base_url이 비어 있어 업데이트 체크가 동작하지 않습니다"})
+                               "detail": "; ".join(problems[:4])})
             else:
                 checks.append({"name": "update_manifest", "ok": True,
-                               "detail": "files %d개 + raw_base_url 확인" % len(manifest_files)})
+                               "detail": "provider/files %d개/raw_base_url/version_file/version_key 확인" % len(manifest_files)})
         else:
             checks.append({"name": "update_manifest", "ok": True,
                            "detail": "미선언 (업데이트 미지원)"})
+
+        # 9. UI 번들 검사 (category_tab 선언 시 index.html/script.js/style.css 필수)
+        ui_files = {f: os.path.isfile(os.path.join(plugin_dir, f))
+                    for f in ("index.html", "script.js", "style.css")}
+        if "category_tab" in cls_attrs:
+            missing_ui = [f for f, ok in ui_files.items() if not ok]
+            if missing_ui:
+                checks.append({"name": "UI 번들", "ok": False,
+                               "detail": "category_tab 선언 시 필수: " + ", ".join(missing_ui)})
+            else:
+                checks.append({"name": "UI 번들", "ok": True, "detail": "index/script/style 확인"})
+        else:
+            present_ui = [f for f, ok in ui_files.items() if ok]
+            if present_ui and len(present_ui) < 3:
+                checks.append({"name": "UI 번들", "ok": True, "warn": True,
+                               "detail": "경고: UI 파일 일부만 존재 (" + ", ".join(present_ui) + ")"})
+            elif present_ui:
+                checks.append({"name": "UI 번들", "ok": True, "detail": "UI 번들 확인"})
+            else:
+                checks.append({"name": "UI 번들", "ok": True, "detail": "미선언"})
 
         all_ok = all(c.get("ok") for c in checks)
         return all_ok, checks
