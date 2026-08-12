@@ -238,7 +238,9 @@
                 ? '<span class="pm-badge pm-badge-system">SYSTEM</span>'
                 : '';
 
-            const originBadge = '<span class="pm-badge pm-badge-local"><i class="fa-solid fa-folder"></i> 로컬 플러그인</span>';
+            const originBadge = p.git_url
+                ? `<a class="pm-badge pm-badge-git" href="${escapeHtml(p.git_url)}" target="_blank" rel="noopener noreferrer" title="Git 저장소 열기 (${escapeHtml(p.git_url)})" onclick="event.stopPropagation();"><i class="fa-brands fa-github"></i> GitHub</a>`
+                : '<span class="pm-badge pm-badge-local"><i class="fa-solid fa-folder"></i> 로컬 플러그인</span>';
 
             const categoryBadge = p.is_category
                 ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-layer-group"></i> 카테고리 뷰</span>'

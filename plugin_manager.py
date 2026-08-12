@@ -202,6 +202,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 # 4. 업데이트 체크는 목록 응답에서 제외 (프론트가 check_update 액션으로 비동기 조회)
                 has_update, latest_version = False, version
 
+                # 4-1. Git 소스 메타 (설치 경로 표시용 — .git_source의 source_type == git_url)
+                git_url = None
+                git_info = self._read_git_source_info(plugin_id)
+                if git_info and git_info.get("source_type") == "git_url":
+                    git_url = str(git_info.get("git_url") or "").strip() or None
+
                 plugins.append({
                     "id": plugin_id,
                     "name": name,
@@ -215,6 +221,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "has_update_manifest": bool(update_manifest),
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
+                    "git_url": git_url,
                 })
 
             return plugins

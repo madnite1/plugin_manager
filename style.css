@@ -471,6 +471,20 @@
     border: 1px solid rgba(148, 163, 184, 0.3);
 }
 
+.pm-badge-git {
+    background: rgba(110, 84, 148, 0.18);
+    color: #c4b5fd;
+    border: 1px solid rgba(110, 84, 148, 0.4);
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.pm-badge-git:hover {
+    background: rgba(110, 84, 148, 0.32);
+    color: #ddd6fe;
+}
+
 .pm-badge-system {
     background: rgba(99, 102, 241, 0.15);
     color: #818cf8;
