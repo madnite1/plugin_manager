@@ -1,3 +1,4 @@
 {
-  "plugin version": "1.0.7"
+  "plugin version": "1.0.7",
+  "_trigger": "release"
 }
