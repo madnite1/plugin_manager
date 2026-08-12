@@ -315,14 +315,66 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         _RELEASE_TAG_CACHE[repo_key] = (tag, now)
         return tag
 
-    def _resolve_update_base_url(self, plugin_id, raw_base_url):
-        """업데이트 소스 URL 결정: GitHub 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백."""
+    def _parse_raw_base_url(self, raw_base_url):
+        """raw.githubusercontent.com URL에서 (owner, repo, branch, subpath) 추출.
+        subpath: branch 이후의 서브디렉토리 경로 (없으면 '').
+        e.g. .../madnite1/plugin_manager/main → ('madnite1', 'plugin_manager', 'main', '')
+             .../leeyj/BookOasis_stable/main/plugins/metadata/stats_dashboard → ('leeyj', 'BookOasis_stable', 'main', 'plugins/metadata/stats_dashboard')
+        """
+        url = str(raw_base_url or "").strip().rstrip("/")
+        m = re.match(
+            r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)(/.*)?$", url
+        )
+        if m:
+            subpath = (m.group(4) or "").strip("/")
+            return m.group(1), m.group(2), m.group(3), subpath
+        return None
+
+    def _ensure_git_source_from_raw_base_url(self, plugin_id, raw_base_url, manifest_files):
+        """.git_source 파일이 없을 때, raw_base_url에서 GitHub 정보를 추론하여
+        git 설치 시와 동일한 형태의 .git_source 파일을 생성한다.
+        단, 서브디렉토리 경로(monorepo 내 플러그인)는 릴리즈 태그 기준이 달라
+        잘못된 태그를 참조하므로 생성하지 않는다."""
+        try:
+            parsed = self._parse_raw_base_url(raw_base_url)
+            if not parsed:
+                return None
+            owner, repo, branch, subpath = parsed
+            if subpath:
+                # 모놀리식 저장소의 서브디렉토리 — 릴리즈 태그가 플러그인 기준이 아니므로 스킵
+                return None
+            git_url = f"https://github.com/{owner}/{repo}"
+            git_source_info = {
+                "source_type": "git_url",
+                "git_url": git_url,
+                "branch": branch,
+                "installed_at": datetime.now().isoformat(),
+                "manifest_files": manifest_files or [],
+            }
+            pdir = os.path.join(self._get_plugins_base_dir(), plugin_id)
+            with open(os.path.join(pdir, ".git_source"), "w", encoding="utf-8") as f:
+                json.dump(git_source_info, f, indent=2, ensure_ascii=False)
+            return git_source_info
+        except Exception:
+            return None
+
+    def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None):
+        """업데이트 소스 URL 결정: GitHub 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백.
+        .git_source 파일이 없으면 raw_base_url에서 추론하여 생성한 뒤 동일하게 처리."""
         try:
             git_info = self._read_git_source_info(plugin_id)
+            if not git_info:
+                git_info = self._ensure_git_source_from_raw_base_url(
+                    plugin_id, raw_base_url, manifest_files
+                )
             repo = self._parse_github_repo(git_info.get("git_url")) if git_info else None
             if repo:
                 tag = self._fetch_latest_release_tag(repo[0], repo[1])
                 if tag:
+                    branch = str(git_info.get("branch") or "").strip()
+                    prefix = f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{branch}"
+                    if branch and raw_base_url.startswith(prefix):
+                        return raw_base_url.replace(prefix, f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{tag}", 1)
                     return f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{tag}"
         except Exception:
             pass
@@ -442,7 +494,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not spec:
                 return has_update, latest_version
 
-            base_url = self._resolve_update_base_url(plugin_id, spec["raw_base_url"])
+            base_url = self._resolve_update_base_url(
+                plugin_id, spec["raw_base_url"], spec.get("files")
+            )
             remote_ver = self._fetch_remote_plugin_version(
                 base_url,
                 version_file=spec["version_file"],
@@ -1284,7 +1338,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
 
         local_ver = self._read_local_plugin_version(pdir, spec["version_file"], spec["version_key"])
-        base_url = self._resolve_update_base_url(plugin_id, spec["raw_base_url"])
+        base_url = self._resolve_update_base_url(
+            plugin_id, spec["raw_base_url"], spec.get("files")
+        )
         remote_ver = self._fetch_remote_plugin_version(
             base_url,
             version_file=spec["version_file"],
