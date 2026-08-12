@@ -342,6 +342,7 @@
 
 .pm-search-input {
     width: 100%;
+    box-sizing: border-box;
     height: 38px;
     padding-left: 2.3rem;
     padding-right: 0.8rem;
@@ -689,4 +690,133 @@ input:checked + .pm-slider:before {
 @keyframes pmScaleIn {
     from { opacity: 0; transform: scale(0.95); }
     to { opacity: 1; transform: scale(1); }
+}
+
+/* ── 반응형 (모바일) ── */
+    @media (max-width: 768px) {
+        .pm-container {
+            padding: 0.75rem;
+            overflow-x: hidden;
+        }
+        .pm-header-panel {
+            padding: 1rem;
+        }
+        .pm-header-content {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 0.75rem;
+        }
+        .pm-header-actions {
+            justify-content: flex-end;
+        }
+        .pm-install-row {
+            grid-template-columns: 1fr !important;
+            gap: 1rem !important;
+        }
+        .pm-plugins-grid {
+            grid-template-columns: 1fr;
+            gap: 1rem;
+        }
+        .pm-controls-bar {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 0.75rem;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .pm-tabs {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            max-width: 100%;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .pm-tab-btn {
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .pm-search-box {
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        .pm-card {
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+        .pm-plugin-card {
+            padding: 1rem;
+        }
+        .pm-input-group {
+            flex-wrap: wrap;
+        }
+        .pm-input-group .pm-input {
+            flex: 1 1 100%;
+            border-radius: 8px 8px 0 0;
+            min-width: 0;
+        }
+        .pm-input-group .pm-btn {
+            flex: 1 1 100%;
+            border-radius: 0 0 8px 8px;
+        }
+        .pm-modal {
+            width: 94%;
+            max-width: none;
+            padding: 1rem;
+        }
+        .pm-modal.pm-settings-modal-box {
+            width: 96%;
+            max-height: 90vh;
+        }
+        .pm-plugin-footer {
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        .pm-card-action-btns {
+            flex-wrap: wrap;
+        }
+        .pm-plugin-source {
+            white-space: normal;
+            word-break: break-all;
+        }
+        .pm-plugin-top {
+            flex-wrap: wrap;
+        }
+    }
+
+@media (max-width: 480px) {
+    .pm-container {
+        padding: 0.5rem;
+    }
+    .pm-header-title {
+        font-size: 1.25rem;
+    }
+    .pm-header-subtitle {
+        font-size: 0.82rem;
+    }
+    .pm-header-icon-box {
+        width: 42px;
+        height: 42px;
+        border-radius: 10px;
+        font-size: 1.3rem;
+    }
+    .pm-plugin-avatar {
+        width: 38px;
+        height: 38px;
+        font-size: 1.1rem;
+    }
+    .pm-plugin-name {
+        font-size: 0.95rem;
+    }
+    .pm-badges-row {
+        gap: 0.3rem;
+    }
+    .pm-badge {
+        font-size: 0.68rem;
+        padding: 0.15rem 0.45rem;
+    }
+    .pm-plugin-source {
+        white-space: normal;
+        word-break: break-all;
+    }
 }
