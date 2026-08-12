@@ -488,6 +488,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if plugin_id in ("base.py", "base", "__pycache__", "plugin_manager"):
                 return False, "시스템 예약어 또는 핵심 플러그인은 덮어쓸 수 없습니다."
 
+            # 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔)
+            source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
+            if not source_ok:
+                failed_items = [f"- {c['name']}: {c['detail']}" for c in source_checks if not c.get("ok")]
+                return False, (
+                    "플러그인 검증 실패 — 설치를 중단했습니다 (기존 폴더는 변경되지 않음):\n"
+                    + "\n".join(failed_items)
+                )
+
             dest_dir, err = self._validate_plugin_path(plugin_id)
             if err or not dest_dir:
                 return False, err or "유효하지 않은 플러그인 경로입니다."
@@ -519,7 +528,31 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
 
-            return True, f"ZIP 압축 파일을 통해 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다!"
+            # 2차 검증: 실제 플러그인 로드 확인 (실패 시 설치 폴더 삭제)
+            loaded_ok = False
+            try:
+                providers = MetadataFactory.get_available_providers()
+                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
+            except Exception as e:
+                logger.warning("플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
+
+            if not loaded_ok:
+                if os.path.exists(dest_dir):
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                return False, (
+                    f"검증 실패: '{plugin_id}' 플러그인이 설치 후 로드되지 않았습니다. "
+                    f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
+                )
+
+            passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
+            warns = [c["detail"] for c in source_checks if c.get("warn")]
+            result_msg = (
+                f"ZIP 압축 파일을 통해 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
+                f"(검증 통과: {', '.join(passed)})"
+            )
+            if warns:
+                result_msg += " 경고: " + "; ".join(warns)
+            return True, result_msg
 
         except zipfile.BadZipFile:
             return False, "올바른 ZIP 압축 파일 형식이 아닙니다."
@@ -893,6 +926,202 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return clean_name
 
         return ""
+
+    def _validate_plugin_source(self, plugin_dir, detected_id):
+        """
+        설치 대상 플러그인 소스 정적 검증 (코드 실행 없음 — AST/파일 스캔만).
+
+        검증 항목:
+          1. VERSION 파일 존재 + JSON 파싱 + 'plugin version' 키
+          2. 메인 .py 존재 (BaseMetadataProvider 상속 클래스)
+          3. 클래스 id == 감지된 plugin_id (폴더명과 일치해야 목록/카테고리 표시)
+          4. 필수 메서드 search/apply 구현 (AST 클래스 본문 검사)
+          5. 금지 패턴 없음 (eval/exec/subprocess/os.system/os.popen/shell=True)
+          6. update_manifest 선언 시: files 목록 파일 실제 존재 + raw_base_url 비어있지 않음
+
+        반환: (성공 여부, 체크 결과 리스트 [{'name', 'ok', 'detail'}])
+        """
+        if os.path.basename(os.path.normpath(plugin_dir)) == "__pycache__":
+            return False, []
+
+        checks = []
+        base_names = ("base.py", "__init__.py")
+
+        # 1. VERSION 파일 검사 (없어도 설치는 허용 — 경고만, 업데이트 체크만 불가)
+        vpath = os.path.join(plugin_dir, "VERSION")
+        if os.path.isfile(vpath):
+            try:
+                with open(vpath, "r", encoding="utf-8") as f:
+                    vdata = json.load(f)
+                vkey = vdata.get("plugin version") or vdata.get("version")
+                if vkey:
+                    checks.append({"name": "VERSION", "ok": True, "detail": "버전 %s" % vkey})
+                else:
+                    checks.append({"name": "VERSION", "ok": True, "warn": True,
+                                   "detail": "경고: 'plugin version' 키가 없습니다 (업데이트 체크 불가)"})
+            except Exception:
+                checks.append({"name": "VERSION", "ok": True, "warn": True,
+                               "detail": "경고: VERSION 형식이 표준 JSON이 아닙니다 (업데이트 체크 불가)"})
+        else:
+            checks.append({"name": "VERSION", "ok": True, "warn": True,
+                           "detail": "경고: VERSION 파일 없음 (업데이트 체크 불가)"})
+
+        # 2~5. 파이썬 소스 AST 분석
+        py_files = []
+        try:
+            py_files = [f for f in sorted(os.listdir(plugin_dir))
+                        if f.endswith(".py") and f not in base_names
+                        and os.path.isfile(os.path.join(plugin_dir, f))]
+        except Exception:
+            pass
+
+        provider_found = False
+        class_id = None
+        has_search = False
+        has_apply = False
+        forbidden_hits = []
+
+        for fname in py_files:
+            fpath = os.path.join(plugin_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                tree = ast.parse(content, filename=fpath)
+            except SyntaxError:
+                forbidden_hits.append(f"{fname}: 파이썬 구문 오류")
+                continue
+
+            # 금지 패턴 검사 (AST 기반 — 주석/문자열 언급은 무시, 실제 호출/import만 차단)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    fn = node.func
+                    if isinstance(fn, ast.Name) and fn.id in ("eval", "exec"):
+                        forbidden_hits.append(f"{fname}: {fn.id}() 호출 발견")
+                    elif (isinstance(fn, ast.Attribute)
+                          and fn.attr in ("system", "popen")):
+                        forbidden_hits.append(f"{fname}: os.{fn.attr}() 호출 발견")
+                elif isinstance(node, ast.Import):
+                    for a in node.names:
+                        if a.name == "subprocess" or a.name.startswith("subprocess."):
+                            forbidden_hits.append(f"{fname}: subprocess import 발견")
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module == "subprocess":
+                        forbidden_hits.append(f"{fname}: subprocess import 발견")
+                elif isinstance(node, ast.keyword) and node.arg == "shell":
+                    try:
+                        if ast.literal_eval(node.value) is True:
+                            forbidden_hits.append(f"{fname}: shell=True 사용")
+                    except Exception:
+                        pass
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = []
+                for b in node.bases:
+                    try:
+                        bases.append(ast.unparse(b))
+                    except Exception:
+                        bases.append("")
+
+                # 플러그인 클래스 내 id / search / apply 수집
+                cls_id = None
+                cls_search = False
+                cls_apply = False
+                for stmt in node.body:
+                    if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                        for t in targets:
+                            if isinstance(t, ast.Name) and t.id == "id":
+                                val = stmt.value
+                                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                                    cls_id = val.value
+                    elif isinstance(stmt, ast.FunctionDef):
+                        if stmt.name == "search":
+                            cls_search = True
+                        elif stmt.name == "apply":
+                            cls_apply = True
+
+                # BaseMetadataProvider 직접 상속 또는 id 속성을 가진 클래스 = provider 후보
+                # (_BASE 같은 alias 상속 / 상속명 해석 불가 케이스 대비)
+                is_provider = any("BaseMetadataProvider" in b for b in bases)
+                if not is_provider and cls_id is not None:
+                    is_provider = True
+
+                if is_provider and cls_id is not None and class_id is None:
+                    class_id = cls_id
+
+                if is_provider:
+                    provider_found = True
+                    if cls_search:
+                        has_search = True
+                    if cls_apply:
+                        has_apply = True
+
+        if not py_files:
+            checks.append({"name": "소스", "ok": False, "detail": "메인 .py 파일이 없습니다"})
+        elif not provider_found:
+            checks.append({"name": "소스", "ok": False,
+                           "detail": "BaseMetadataProvider 상속 클래스를 찾을 수 없습니다"})
+        else:
+            checks.append({"name": "소스", "ok": True, "detail": "%d개 .py 파일, BaseMetadataProvider 클래스 발견" % len(py_files)})
+
+        # 3. 클래스 id 일치 검사 (폴더명/감지 id와 일치해야 목록 표시)
+        if class_id is not None:
+            if str(class_id).strip() == str(detected_id).strip():
+                checks.append({"name": "클래스 id", "ok": True, "detail": class_id})
+            else:
+                checks.append({"name": "클래스 id", "ok": False,
+                               "detail": f"코드 내 id='{class_id}' ≠ 감지된 id='{detected_id}' — 설치 후 목록에 표시되지 않을 수 있습니다"})
+        elif provider_found:
+            checks.append({"name": "클래스 id", "ok": False,
+                           "detail": "플러그인 클래스에 id 속성이 없습니다"})
+        else:
+            checks.append({"name": "클래스 id", "ok": False, "detail": "클래스를 찾을 수 없어 검사 불가"})
+
+        # 4. 필수 메서드 검사
+        if provider_found:
+            missing = []
+            if not has_search:
+                missing.append("search")
+            if not has_apply:
+                missing.append("apply")
+            if missing:
+                checks.append({"name": "필수 메서드", "ok": False,
+                               "detail": "구현 안 됨: " + ", ".join(missing)})
+            else:
+                checks.append({"name": "필수 메서드", "ok": True, "detail": "search/apply 확인"})
+        else:
+            checks.append({"name": "필수 메서드", "ok": False, "detail": "클래스 없음"})
+
+        # 5. 금지 패턴 검사
+        if forbidden_hits:
+            checks.append({"name": "금지 패턴", "ok": False,
+                           "detail": "; ".join(forbidden_hits[:3])})
+        else:
+            checks.append({"name": "금지 패턴", "ok": True, "detail": "eval/exec/subprocess 없음"})
+
+        # 6. update_manifest 검사 (선언된 경우에만)
+        manifest_files, manifest = self._extract_update_manifest_files(plugin_dir)
+        if manifest_files:
+            missing_files = [rel for rel in manifest_files
+                             if not os.path.isfile(os.path.join(plugin_dir, rel))]
+            raw_base = str(manifest.get("raw_base_url") or "").strip()
+            if missing_files:
+                checks.append({"name": "update_manifest", "ok": False,
+                               "detail": "files에 선언된 파일이 없음: " + ", ".join(missing_files[:3])})
+            elif not raw_base:
+                checks.append({"name": "update_manifest", "ok": False,
+                               "detail": "raw_base_url이 비어 있어 업데이트 체크가 동작하지 않습니다"})
+            else:
+                checks.append({"name": "update_manifest", "ok": True,
+                               "detail": "files %d개 + raw_base_url 확인" % len(manifest_files)})
+        else:
+            checks.append({"name": "update_manifest", "ok": True,
+                           "detail": "미선언 (업데이트 미지원)"})
+
+        all_ok = all(c.get("ok") for c in checks)
+        return all_ok, checks
 
     def _update_plugin(self, plugin_id, db_type):
         """특정 플러그인 업데이트 실행 (릴리즈 태그 우선, 브랜치 폴백 — 코어 sample_update_plugin 미사용)"""
