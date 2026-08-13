@@ -382,8 +382,68 @@ _conn2 = sqlite3.connect(_old_db)
 _new_cols = {r[1] for r in _conn2.execute("PRAGMA table_info(repos)")}
 _conn2.close()
 shutil.rmtree(os.path.dirname(_old_db), ignore_errors=True)
-check("구버전 DB plugin_name 자동 추가", "plugin_name" in _new_cols,
+check("구버전 DB plugin_name/install_error 자동 추가", "plugin_name" in _new_cols and "install_error" in _new_cols,
       f"cols={sorted(_new_cols)}")
+
+# =================================================================
+section("E-3. install_error — 설치 실패 기록/클리어/갱신 리셋/응답 포함")
+# -----------------------------------------------------------------
+# 1) 실패 메시지 저장 (GitHub URL → full_name 파싱)
+P._catalog_record_install_error(
+    "https://github.com/javara999/naverkakaoridi", "검증 실패:\n- 금지 패턴: eval() 호출 발견"
+)
+row = P._catalog_db_query(
+    "SELECT install_error FROM repos WHERE full_name='javara999/naverkakaoridi'"
+)[0]
+check("실패 메시지 저장", row["install_error"] == "검증 실패:\n- 금지 패턴: eval() 호출 발견",
+      f"got {row['install_error']!r}")
+
+# 2) 비GitHub URL → 저장 안 함
+P._catalog_record_install_error("https://gitea.example.com/u/r", "저장되면 안 됨")
+rows = P._catalog_db_query("SELECT COUNT(*) AS c FROM repos WHERE install_error IS NOT NULL")
+check("비GitHub URL은 저장 안 함", rows[0]["c"] == 1, f"got {rows[0]['c']}")
+
+# 3) 2000자 절단
+P._catalog_record_install_error("https://github.com/javara999/naverkakaoridi", "x" * 5000)
+row = P._catalog_db_query(
+    "SELECT install_error FROM repos WHERE full_name='javara999/naverkakaoridi'"
+)[0]
+check("2000자 절단", len(row["install_error"]) == 2000, f"got {len(row['install_error'])}")
+
+# 4) 갱신(upsert) 시 install_error 리셋
+with mock.patch.object(P, "_catalog_search_topic", side_effect=fake_search), \
+     mock.patch.object(P, "_catalog_check_repo_version", side_effect=fake_check):
+    P._catalog_refresh_once("general")
+row = P._catalog_db_query(
+    "SELECT install_error FROM repos WHERE full_name='javara999/naverkakaoridi'"
+)[0]
+check("갱신 시 install_error 리셋", row["install_error"] is None,
+      f"got {row['install_error']!r}")
+
+# 5) 실패 재기록 + 목록 SELECT 응답 포함
+P._catalog_record_install_error("https://github.com/javara999/naverkakaoridi", "네트워크 오류")
+r_valid = P._catalog_list_valid_repos()
+r_nav = next((x for x in r_valid if x["full_name"] == "javara999/naverkakaoridi"), None)
+check("목록 SELECT에 install_error 포함", r_nav and r_nav["install_error"] == "네트워크 오류",
+      f"got {r_nav and r_nav.get('install_error')}")
+
+# 6) merge 응답 install_error 포함 + 성공/클리어
+P._catalog_db_execute(
+    "UPDATE repos SET install_error='클래스 id 불일치' WHERE full_name='colaiuta77/activity_desk'"
+)
+merged3, _ = P._merge_catalog_plugins(installed, "general")
+ad3 = next((p for p in merged3 if p["id"] == "activity_desk"), None)
+check("merge 응답 install_error 포함", ad3 and ad3["install_error"] == "클래스 id 불일치",
+      f"got {ad3 and ad3.get('install_error')}")
+check("merge 응답 오류 없으면 None", all(p.get("install_error") is None
+      for p in merged3 if p["id"] != "activity_desk"))
+P._catalog_clear_install_error("https://github.com/colaiuta77/activity_desk")
+row = P._catalog_db_query(
+    "SELECT install_error FROM repos WHERE full_name='colaiuta77/activity_desk'"
+)[0]
+check("성공 시 install_error 클리어", row["install_error"] is None,
+      f"got {row['install_error']!r}")
+# F 섹션이 activity_desk 레코드를 사용하므로 레코드는 유지 (install_error만 리셋 상태) 
 
 # =================================================================
 section("F. get_dashboard_data 통합")

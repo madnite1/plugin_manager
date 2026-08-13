@@ -924,3 +924,58 @@ input:checked + .pm-slider:before {
 .pm-catalog-meta a:hover {
     text-decoration: underline;
 }
+
+/* 설치 오류 상태 카드 (install_error) */
+.pm-btn-install.pm-btn-disabled {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    cursor: not-allowed;
+    opacity: 0.85;
+}
+
+.pm-badge-install-error {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.pm-tooltip {
+    display: none;
+    position: absolute;
+    left: 0.9rem;
+    right: 0.9rem;
+    bottom: 0.9rem;
+    z-index: 30;
+    background: #0f172a;
+    border: 1px solid rgba(239, 68, 68, 0.55);
+    border-radius: 10px;
+    padding: 0.7rem 0.85rem;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+
+.pm-tooltip-visible {
+    display: block;
+}
+
+.pm-tooltip-title {
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: #f87171;
+    margin-bottom: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.pm-tooltip pre {
+    margin: 0;
+    font-family: inherit;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: #e2e8f0;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 160px;
+    overflow-y: auto;
+}

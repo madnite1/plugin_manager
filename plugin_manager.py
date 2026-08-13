@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -104,7 +104,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             git_url = str(item_data.get("git_url", "")).strip()
             if not git_url:
                 return False, "Git 저장소 URL이 누락되었습니다."
-            return self._install_from_git(git_url, db_type)
+            ok, msg = self._install_from_git(git_url, db_type)
+            # 카탈로그 저장소라면 설치 결과를 install_error에 기록 (프론트 카드 상태 반영)
+            if ok:
+                self._catalog_clear_install_error(git_url)
+            else:
+                self._catalog_record_install_error(git_url, msg)
+            return ok, msg
 
         elif action == "update":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
@@ -1728,6 +1734,43 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """카탈로그 SQLite DB 경로 (플러그인 폴더 내 catalog.db)"""
         return os.path.join(self._get_plugins_base_dir(), "plugin_manager", "catalog.db")
 
+    def _catalog_full_name_from_url(self, git_url):
+        """git_url → full_name (owner/repo). GitHub가 아니면 None."""
+        try:
+            repo = self._parse_github_repo(git_url)
+            if repo:
+                return "{}/{}".format(repo[0], repo[1])
+        except Exception:
+            pass
+        return None
+
+    def _catalog_record_install_error(self, git_url, message):
+        """Git 설치 실패 메시지를 catalog.db repos.install_error에 저장 (최대 2000자)."""
+        full_name = self._catalog_full_name_from_url(git_url)
+        if not full_name:
+            return
+        try:
+            self._catalog_init_db()
+            err = str(message or "")[:2000]
+            self._catalog_db_execute(
+                "UPDATE repos SET install_error=? WHERE full_name=?", (err, full_name)
+            )
+        except Exception:
+            pass
+
+    def _catalog_clear_install_error(self, git_url):
+        """Git 설치 성공 시 install_error 초기화."""
+        full_name = self._catalog_full_name_from_url(git_url)
+        if not full_name:
+            return
+        try:
+            self._catalog_init_db()
+            self._catalog_db_execute(
+                "UPDATE repos SET install_error=NULL WHERE full_name=?", (full_name,)
+            )
+        except Exception:
+            pass
+
     def _catalog_init_db(self):
         """catalog.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _CATALOG_DB_LOCK"""
         db_path = self._get_catalog_db_path()
@@ -1752,14 +1795,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         plugin_name    TEXT,
                         latest_version TEXT,
                         is_valid       TEXT DEFAULT 'unknown',
-                        last_checked   TEXT
+                        last_checked   TEXT,
+                        install_error  TEXT
                     )
                     """
                 )
-                # 기존 DB(구버전 스키마)에 plugin_name 없으면 추가
+                # 기존 DB(구버전 스키마)에 누락 컬럼 추가
                 repo_cols = {row[1] for row in conn.execute("PRAGMA table_info(repos)")}
                 if "plugin_name" not in repo_cols:
                     conn.execute("ALTER TABLE repos ADD COLUMN plugin_name TEXT")
+                if "install_error" not in repo_cols:
+                    conn.execute("ALTER TABLE repos ADD COLUMN install_error TEXT")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS meta (
@@ -2008,7 +2054,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         topics=excluded.topics,
                         default_branch=excluded.default_branch,
                         pushed_at=excluded.pushed_at,
-                        plugin_id=excluded.plugin_id
+                        plugin_id=excluded.plugin_id,
+                        install_error=NULL
                     """,
                     (
                         full_name,
@@ -2038,7 +2085,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 removed += 1
 
             # 4. VERSION 판별 (rate 보호: 저장소 20개 초과 시 24시간 내 검증 결과 재사용)
-            now = datetime.now().isoformat(timespec="seconds")
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             repo_rows = self._catalog_db_query(
                 "SELECT full_name, default_branch, is_valid, last_checked FROM repos"
             )
@@ -2150,7 +2197,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             return self._catalog_db_query(
                 "SELECT full_name, html_url, description, topics, default_branch, pushed_at, "
-                "plugin_id, plugin_name, latest_version, last_checked FROM repos "
+                "plugin_id, plugin_name, latest_version, last_checked, install_error FROM repos "
                 "WHERE is_valid='valid' ORDER BY COALESCE(pushed_at, '') DESC"
             )
         except Exception:
@@ -2193,6 +2240,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "is_system": False,
                 "is_installed": False,
                 "git_url": git_url,
+                "install_error": r.get("install_error"),
                 "catalog": {
                     "full_name": r["full_name"],
                     "html_url": r.get("html_url"),

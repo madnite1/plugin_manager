@@ -129,6 +129,7 @@
             const d = new Date(iso);
             if (isNaN(d.getTime())) return String(iso);
             return d.toLocaleString('ko-KR', {
+                timeZone: 'Asia/Seoul', hour12: false,
                 month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
             });
         } catch(e) { return String(iso); }
@@ -155,12 +156,26 @@
         } else {
             el.className = 'pm-catalog-status pm-catalog-status-idle';
             const interval = catalogMeta.refresh_interval_hours || 6;
-            const topics = Array.isArray(catalogMeta.topics) ? catalogMeta.topics : [];
-            const topicText = topics.length ? '#' + topics.join(' #') : '';
             el.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> 카탈로그 ' + escapeHtml(formatTime(catalogMeta.last_refresh)) +
-                ' <span class="pm-catalog-status-meta" title="' + escapeHtml(topicText) + '">(' + interval + 'h' + (topicText ? ' · ' + escapeHtml(topicText) : '') + ')</span>';
+                ' <span class="pm-catalog-status-meta" title="카탈로그 갱신 주기">(' + interval + 'h)</span>';
         }
     }
+
+    // 설치 오류 툴팁 — 카드 마우스 오버/아웃 (이벤트 위임, 동적 카드 대응)
+    // data-install-error 속성을 가진 카드에만 동작. 카드 내부 이동 시 깜빡임 방지(relatedTarget 체크).
+    document.addEventListener('mouseover', function(e) {
+        const card = e.target && e.target.closest ? e.target.closest('.pm-catalog-card[data-install-error]') : null;
+        if (!card) return;
+        const tip = card.querySelector('.pm-tooltip');
+        if (tip) tip.classList.add('pm-tooltip-visible');
+    });
+    document.addEventListener('mouseout', function(e) {
+        const card = e.target && e.target.closest ? e.target.closest('.pm-catalog-card[data-install-error]') : null;
+        if (!card) return;
+        if (card.contains(e.relatedTarget)) return; // 카드 내부로 이동한 경우 유지
+        const tip = card.querySelector('.pm-tooltip');
+        if (tip) tip.classList.remove('pm-tooltip-visible');
+    });
 
     // 업데이트 버튼 이벤트 바인딩 (renderPlugins + patchCardUpdate 공용)
     // escapeHtml 로컬 폴백 (전역 미정의 대비)
@@ -290,6 +305,7 @@
         const fullName = cat.full_name || p.git_url || p.id;
         // 수집된 플러그인 이름 우선, 없으면 owner/repo 표시
         const displayName = (p.name && p.name !== p.id) ? p.name : fullName;
+        const installErr = (p.install_error || '').trim();
         const topics = Array.isArray(cat.topics) ? cat.topics : [];
         const topicBadges = topics.map(t =>
             '<span class="pm-badge pm-badge-topic">#' + escapeHtml(t) + '</span>'
@@ -302,7 +318,7 @@
             : '';
 
         return `
-            <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}">
+            <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}"${installErr ? ` data-install-error="${escapeHtml(installErr)}"` : ''}>
                 <div>
                     <div class="pm-plugin-top">
                         <div class="pm-plugin-icon-title">
@@ -318,6 +334,7 @@
 
                     <div class="pm-badges-row">
                         <span class="pm-badge pm-badge-uninstalled"><i class="fa-solid fa-circle-down"></i> 미설치</span>
+                        ${installErr ? '<span class="pm-badge pm-badge-install-error"><i class="fa-solid fa-triangle-exclamation"></i> 설치 오류</span>' : ''}
                         ${versionBadge}
                         ${topicBadges}
                     </div>
@@ -331,11 +348,20 @@
                         </a>
                     </div>
                     <div class="pm-card-action-btns">
-                        <button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="GitHub 저장소에서 설치">
-                            <i class="fa-solid fa-download"></i> 설치
-                        </button>
+                        ${installErr
+                            ? `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
+                                <i class="fa-solid fa-circle-exclamation"></i> 설치 불가
+                               </button>`
+                            : `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="GitHub 저장소에서 설치">
+                                <i class="fa-solid fa-download"></i> 설치
+                               </button>`}
                     </div>
                 </div>
+                ${installErr ? `
+                <div class="pm-tooltip pm-tooltip-error" role="tooltip">
+                    <div class="pm-tooltip-title"><i class="fa-solid fa-triangle-exclamation"></i> 설치 오류 상세</div>
+                    <pre>${escapeHtml(installErr)}</pre>
+                </div>` : ''}
             </div>
         `;
     }
@@ -366,7 +392,9 @@
                     showAlert(res.message || "'" + name + "' 플러그인이 설치되었습니다!");
                     loadPlugins();
                 } else {
+                    // 실패 시 목록 재조회 — 백엔드가 install_error를 저장하므로 카드가 설치 불가 상태로 전환됨
                     showAlert(res.error || '플러그인 설치 실패', true);
+                    loadPlugins();
                 }
             } catch(err) {
                 this.disabled = false;
