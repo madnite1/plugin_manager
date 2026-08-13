@@ -5,7 +5,9 @@ import ast
 import shutil
 import json
 import re
+import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime
 from urllib.request import Request, urlopen
@@ -19,6 +21,32 @@ logger = logging.getLogger(__name__)
 # GitHub 릴리즈 태그 조회 TTL 캐시 (releases/latest 리다이렉트는 요청마다 수행하면 느리므로 5분 캐시)
 _RELEASE_TAG_CACHE = {}
 _RELEASE_TAG_CACHE_TTL = 300  # 초
+
+# ── 플러그인 카탈로그 (GitHub 토픽 기반 자동 수집) ──────────────────────────
+# 백그라운드 갱신 스레드 1회 시작 보장 (gunicorn 1워커 전제)
+_CATALOG_THREAD_LOCK = threading.Lock()
+_CATALOG_THREAD_STARTED = False
+# 자체 save-config 라우트 1회 등록 보장 (멀티 워커/재호출 안전)
+_CATALOG_ROUTES_LOCK = threading.Lock()
+_CATALOG_ROUTES_REGISTERED = False
+# catalog.db(sqlite) 동시 접근 직렬화 (갱신 스레드 + 요청 처리)
+_CATALOG_DB_LOCK = threading.Lock()
+
+# plugin_sources.db(sqlite) — .git_source/.zip_source 파일 대체 메타 저장소
+_SOURCES_DB_LOCK = threading.Lock()
+# 레거시 .git_source/.zip_source 파일 → DB 1회 마이그레이션 보장 (gunicorn 1워커 전제)
+_SOURCES_MIGRATION_LOCK = threading.Lock()
+_SOURCES_MIGRATION_DONE = False
+
+_CATALOG_DEFAULT_TOPICS = ["bookoasis-plugin"]
+_CATALOG_DEFAULT_INTERVAL_HOURS = 6
+_CATALOG_MIN_INTERVAL_HOURS = 1
+_CATALOG_MAX_INTERVAL_HOURS = 24
+_CATALOG_MAX_TOPICS = 5  # GitHub 비인증 Search API 분당 10회 제한 (토픽 수 + VERSION 검증 합계 한도 보호)
+_CATALOG_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# VERSION 재검증 TTL: 저장소가 20개를 넘어가면 24시간 이내 검증 결과 재사용
+_CATALOG_VERIFY_MAX_REPOS = 20
+_CATALOG_VERIFY_TTL_SECONDS = 24 * 3600
 
 
 class PluginManagerMetadataProvider(BaseMetadataProvider):
@@ -42,7 +70,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         "enabled": True,
         "provider": "github-raw",
         "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
-        "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js"],
+        "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js", "settings.html", "settings.js"],
         "version_file": "VERSION",
         "version_key": "plugin version",
         "show_sample_update_button": False,
@@ -106,18 +134,29 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return False, "업데이트 확인할 플러그인 ID가 누락되었습니다."
             return self._check_update_action(plugin_id, db_type)
 
+        elif action == "catalog_refresh":
+            return self._catalog_manual_refresh(db_type)
+
+        elif action == "save_config":
+            return self._catalog_save_config(item_data, db_type)
+
         return False, f"지원하지 않는 액션입니다: {action}"
 
     def get_dashboard_data(self, db_type, limit=10):
         """
         플러그인 목록 조회 API
+        설치된 플러그인 + 카탈로그(미설치, GitHub 토픽 검색) 통합 목록 반환
         """
         try:
+            self._ensure_catalog_routes()
+            self._ensure_catalog_thread(db_type)
             plugins = self._list_plugins(db_type)
+            plugins, catalog_meta = self._merge_catalog_plugins(plugins, db_type)
             return {
                 "success": True,
                 "plugins": plugins,
                 "count": len(plugins),
+                "catalog_meta": catalog_meta,
             }
         except Exception as e:
             return {"success": False, "error": f"플러그인 목록 조회 실패: {str(e)}"}
@@ -202,10 +241,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 # 4. 업데이트 체크는 목록 응답에서 제외 (프론트가 check_update 액션으로 비동기 조회)
                 has_update, latest_version = False, version
 
-                # 4-1. Git 소스 메타 (설치 경로 표시용 — .git_source의 source_type == git_url)
+                # 4-1. Git 소스 메타 (설치 경로 표시용 — git_url 유무가 git 소스 판단 기준)
                 git_url = None
                 git_info = self._read_git_source_info(plugin_id)
-                if git_info and git_info.get("source_type") == "git_url":
+                if git_info:
                     git_url = str(git_info.get("git_url") or "").strip() or None
 
                 plugins.append({
@@ -222,6 +261,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
+                    "is_installed": True,
                 })
 
             return plugins
@@ -265,16 +305,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         }
 
     def _read_git_source_info(self, plugin_id):
-        """플러그인 설치 시 저장된 .git_source 메타 읽기 (없으면 None)"""
+        """플러그인 설치 시 저장된 소스 메타(sqlite plugin_sources) 읽기 (없으면 None).
+
+        최초 호출 시 레거시 .git_source/.zip_source 파일 → DB 1회 마이그레이션을 수행한다."""
         try:
-            pdir = os.path.join(self._get_plugins_base_dir(), plugin_id)
-            path = os.path.join(pdir, ".git_source")
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            self._sources_migrate_legacy_files()
         except Exception:
             pass
-        return None
+        return self._sources_get(plugin_id)
 
     def _parse_github_repo(self, git_url):
         """GitHub 저장소 URL에서 (owner, repo) 추출. GitHub가 아니면 None."""
@@ -331,8 +369,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return None
 
     def _ensure_git_source_from_raw_base_url(self, plugin_id, raw_base_url, manifest_files):
-        """.git_source 파일이 없을 때, raw_base_url에서 GitHub 정보를 추론하여
-        git 설치 시와 동일한 형태의 .git_source 파일을 생성한다.
+        """소스 메타가 없을 때, raw_base_url에서 GitHub 정보를 추론하여
+        git 설치 시와 동일한 형태로 sqlite plugin_sources 에 저장한다.
         단, 서브디렉토리 경로(monorepo 내 플러그인)는 릴리즈 태그 기준이 달라
         잘못된 태그를 참조하므로 생성하지 않는다."""
         try:
@@ -345,22 +383,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return None
             git_url = f"https://github.com/{owner}/{repo}"
             git_source_info = {
-                "source_type": "git_url",
                 "git_url": git_url,
                 "branch": branch,
                 "installed_at": datetime.now().isoformat(),
                 "manifest_files": manifest_files or [],
             }
-            pdir = os.path.join(self._get_plugins_base_dir(), plugin_id)
-            with open(os.path.join(pdir, ".git_source"), "w", encoding="utf-8") as f:
-                json.dump(git_source_info, f, indent=2, ensure_ascii=False)
+            self._sources_set(plugin_id, git_source_info)
             return git_source_info
         except Exception:
             return None
 
     def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None):
         """업데이트 소스 URL 결정: GitHub 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백.
-        .git_source 파일이 없으면 raw_base_url에서 추론하여 생성한 뒤 동일하게 처리."""
+        소스 메타가 없으면 raw_base_url에서 추론하여 저장한 뒤 동일하게 처리."""
         try:
             git_info = self._read_git_source_info(plugin_id)
             if not git_info:
@@ -573,14 +608,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 ignore=shutil.ignore_patterns(".git", ".github", "__pycache__", "*.pyc", "__MACOSX", ".DS_Store")
             )
 
-            # ZIP 소스 메타 정보 저장
-            zip_source_info = {
-                "source_type": "zip_upload",
-                "filename": filename or "plugin.zip",
-                "installed_at": datetime.now().isoformat()
-            }
-            with open(os.path.join(dest_dir, ".zip_source"), "w", encoding="utf-8") as f:
-                json.dump(zip_source_info, f, indent=2, ensure_ascii=False)
+            # 소스 메타 저장: 설치 방식과 무관하게 update_manifest의 raw_base_url을
+            # 검증해 판단한다 — 유효한 GitHub 루트면 git_url 저장(업데이트/배지 활성),
+            # 없거나 monorepo 서브디렉토리면 레코드 없음(로컬 플러그인 유지).
+            try:
+                files_clean, manifest = self._extract_update_manifest_files(dest_dir)
+                raw_base_url = str((manifest or {}).get("raw_base_url") or "").strip().rstrip("/")
+                if files_clean and raw_base_url:
+                    self._ensure_git_source_from_raw_base_url(plugin_id, raw_base_url, files_clean)
+            except Exception:
+                pass
 
             from services.plugin_service import PluginService
             PluginService.toggle_plugin_enabled('general', plugin_id, "1")
@@ -753,16 +790,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 shutil.rmtree(dest_dir)
             shutil.copytree(target_plugin_dir, dest_dir)
 
-            # 8. Git 소스 메타 정보 저장
+            # 8. Git 소스 메타 정보 저장 (sqlite plugin_sources — .git_source 파일 미생성)
             git_source_info = {
-                "source_type": "git_url",
                 "git_url": git_url,
                 "branch": branch,
                 "installed_at": datetime.now().isoformat(),
                 "manifest_files": manifest_files,
             }
-            with open(os.path.join(dest_dir, ".git_source"), "w", encoding="utf-8") as f:
-                json.dump(git_source_info, f, indent=2, ensure_ascii=False)
+            self._sources_set(plugin_id, git_source_info)
 
             # 9. 활성화 + 핫 리로드
             from services.plugin_service import PluginService
@@ -1437,6 +1472,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         try:
             shutil.rmtree(pdir)
+            self._sources_delete(plugin_id)  # 소스 메타(sqlite)도 함께 정리
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
             return True, f"플러그인 '{plugin_id}'가 성공적으로 삭제되었습니다."
@@ -1458,3 +1494,769 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return True, f"플러그인 '{plugin_id}' 상태가 '{status_text}'로 변경되었습니다."
         except Exception as e:
             return False, f"플러그인 토글 중 오류 발생: {str(e)}"
+
+    # ------------------------------------------------------------------
+    # Plugin Source Meta (sqlite plugin_sources.db)
+    # .git_source/.zip_source 파일 대신 소스 메타를 DB에 저장.
+    # 설치 후 최초 1회 레거시 파일 → DB 마이그레이션 수행.
+    # ------------------------------------------------------------------
+
+    def _get_sources_db_path(self):
+        """소스 메타 SQLite DB 경로 (플러그인 폴더 내 plugin_sources.db — git 저장소에 미포함)"""
+        return os.path.join(self._get_plugins_base_dir(), "plugin_manager", "plugin_sources.db")
+
+    def _sources_init_db(self):
+        """plugin_sources.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _SOURCES_DB_LOCK"""
+        db_path = self._get_sources_db_path()
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        except Exception:
+            pass
+        with _SOURCES_DB_LOCK:
+            conn = sqlite3.connect(db_path, timeout=10)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS plugin_sources (
+                        plugin_id      TEXT PRIMARY KEY,
+                        git_url        TEXT,
+                        branch         TEXT,
+                        manifest_files TEXT,
+                        installed_at   TEXT
+                    )
+                    """
+                )
+                # 구버전 스키마(source_type/filename 컬럼)에서 전환 — git_url 유무가
+                # 소스 메타 판단 기준이므로 불필요한 컬럼 제거 (sqlite 3.35+ DROP COLUMN)
+                try:
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
+                    for drop_col in ("source_type", "filename"):
+                        if drop_col in cols:
+                            conn.execute(f"ALTER TABLE plugin_sources DROP COLUMN {drop_col}")
+                except Exception:
+                    pass
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS meta (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _sources_db_query(self, sql, params=()):
+        """plugin_sources.db SELECT (락 내부, dict 리스트 반환)"""
+        self._sources_init_db()
+        with _SOURCES_DB_LOCK:
+            conn = sqlite3.connect(self._get_sources_db_path(), timeout=10)
+            try:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(sql, params)
+                rows = cur.fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+    def _sources_db_execute(self, sql, params=()):
+        """plugin_sources.db write (락 내부, commit)"""
+        self._sources_init_db()
+        with _SOURCES_DB_LOCK:
+            conn = sqlite3.connect(self._get_sources_db_path(), timeout=10)
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _sources_get(self, plugin_id):
+        """plugin_sources 레코드 → dict (git_url 없으면 None — 로컬 플러그인과 동치)"""
+        try:
+            rows = self._sources_db_query(
+                "SELECT git_url, branch, manifest_files, installed_at "
+                "FROM plugin_sources WHERE plugin_id = ?",
+                (str(plugin_id),),
+            )
+            if not rows:
+                return None
+            r = rows[0]
+            if not (r.get("git_url") or "").strip():
+                return None
+            info = {"git_url": r["git_url"]}
+            if r.get("branch"):
+                info["branch"] = r["branch"]
+            if r.get("manifest_files"):
+                try:
+                    info["manifest_files"] = json.loads(r["manifest_files"])
+                except Exception:
+                    info["manifest_files"] = []
+            if r.get("installed_at"):
+                info["installed_at"] = r["installed_at"]
+            return info
+        except Exception:
+            return None
+
+    def _sources_set(self, plugin_id, info):
+        """plugin_sources upsert — git_url이 있어야 저장.
+        설치 방식과 무관하게 git_url 유무가 소스 메타 판단 기준이므로,
+        git_url 없는 입력(zip 업로드 등)은 저장하지 않는다."""
+        if not isinstance(info, dict):
+            return
+        git_url = str(info.get("git_url") or "").strip()
+        if not git_url:
+            return
+        try:
+            mf = info.get("manifest_files")
+            mf_json = json.dumps(mf, ensure_ascii=False) if mf else None
+            self._sources_db_execute(
+                "INSERT OR REPLACE INTO plugin_sources "
+                "(plugin_id, git_url, branch, manifest_files, installed_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (
+                    str(plugin_id),
+                    git_url,
+                    str(info.get("branch") or "") or None,
+                    mf_json,
+                    str(info.get("installed_at") or "") or None,
+                ),
+            )
+        except Exception:
+            pass
+
+    def _sources_delete(self, plugin_id):
+        """plugin_sources 레코드 삭제 (플러그인 삭제 시 호출)"""
+        try:
+            self._sources_db_execute(
+                "DELETE FROM plugin_sources WHERE plugin_id = ?", (str(plugin_id),)
+            )
+        except Exception:
+            pass
+
+    def _sources_meta_get(self, key):
+        try:
+            rows = self._sources_db_query("SELECT value FROM meta WHERE key = ?", (key,))
+            return rows[0]["value"] if rows else None
+        except Exception:
+            return None
+
+    def _sources_meta_set(self, key, value):
+        try:
+            self._sources_db_execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, str(value))
+            )
+        except Exception:
+            pass
+
+    def _sources_migrate_legacy_files(self):
+        """설치 후 최초 1회: 레거시 .git_source/.zip_source 파일을 DB로 이동 후 파일 삭제,
+        소스 메타가 없는 수동 설치본은 update_manifest의 raw_base_url로 GitHub 소스를 추론해 백필.
+
+        1) .git_source/.zip_source 파일 → plugin_sources upsert + 파일 삭제
+        2) 소스 메타가 아직 없는 플러그인 + update_manifest(raw_base_url) 선언 → git_url 메타 백필
+           (monorepo 서브디렉토리는 릴리즈 태그 기준이 달라 제외 — _ensure_git_source_from_raw_base_url 참고)
+        완료 여부는 DB meta(legacy_migration_done)에 기록 — DB가 없어도 재시도 가능.
+        실패해도 조용히 스킵 (다음 호출 시 재시도)."""
+        global _SOURCES_MIGRATION_DONE
+        if _SOURCES_MIGRATION_DONE:
+            return
+        with _SOURCES_MIGRATION_LOCK:
+            if _SOURCES_MIGRATION_DONE:
+                return
+            try:
+                if self._sources_meta_get("legacy_migration_done") == "1":
+                    _SOURCES_MIGRATION_DONE = True
+                    return
+            except Exception:
+                pass
+            try:
+                base_dir = self._get_plugins_base_dir()
+                for entry in sorted(os.listdir(base_dir)):
+                    pdir = os.path.join(base_dir, entry)
+                    if not os.path.isdir(pdir):
+                        continue
+                    for meta_file in (".git_source", ".zip_source"):
+                        path = os.path.join(pdir, meta_file)
+                        if not os.path.isfile(path):
+                            continue
+                        try:
+                            with open(path, "r", encoding="utf-8") as f:
+                                info = json.load(f)
+                            # git_url 보유 파일만 DB로 이동 (source_type 무관 — git_url 유무가 판단 기준).
+                            # .zip_source는 git_url이 없어 저장되지 않고, 아래 백필에서
+                            # update_manifest 기준으로 재판단된다.
+                            if isinstance(info, dict) and str(info.get("git_url") or "").strip():
+                                self._sources_set(entry, info)
+                        except Exception:
+                            pass
+                        finally:
+                            # 파싱 실패(손상 파일)여도 DB 기반 전환 후 파일은 제거
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+                    # 2) update_manifest 기반 백필 — 소스 메타가 없는 수동 설치본
+                    if self._sources_get(entry) is None:
+                        try:
+                            files_clean, manifest = self._extract_update_manifest_files(pdir)
+                            raw_base_url = str((manifest or {}).get("raw_base_url") or "").strip().rstrip("/")
+                            if files_clean and raw_base_url:
+                                self._ensure_git_source_from_raw_base_url(entry, raw_base_url, files_clean)
+                        except Exception:
+                            pass
+                self._sources_meta_set("legacy_migration_done", "1")
+                _SOURCES_MIGRATION_DONE = True
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Plugin Catalog (GitHub 토픽 기반 자동 수집 — 미설치 플러그인 발견)
+    # 설정(간격/토픽)은 코어 DB(gateway → MariaDB), 조회 결과만 catalog.db(sqlite)
+    # ------------------------------------------------------------------
+
+    def _get_catalog_db_path(self):
+        """카탈로그 SQLite DB 경로 (플러그인 폴더 내 catalog.db)"""
+        return os.path.join(self._get_plugins_base_dir(), "plugin_manager", "catalog.db")
+
+    def _catalog_init_db(self):
+        """catalog.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _CATALOG_DB_LOCK"""
+        db_path = self._get_catalog_db_path()
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        except Exception:
+            pass
+        with _CATALOG_DB_LOCK:
+            conn = sqlite3.connect(db_path, timeout=10)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS repos (
+                        full_name      TEXT PRIMARY KEY,
+                        html_url       TEXT,
+                        description    TEXT,
+                        topics         TEXT,
+                        default_branch TEXT,
+                        pushed_at      TEXT,
+                        plugin_id      TEXT,
+                        plugin_name    TEXT,
+                        latest_version TEXT,
+                        is_valid       TEXT DEFAULT 'unknown',
+                        last_checked   TEXT
+                    )
+                    """
+                )
+                # 기존 DB(구버전 스키마)에 plugin_name 없으면 추가
+                repo_cols = {row[1] for row in conn.execute("PRAGMA table_info(repos)")}
+                if "plugin_name" not in repo_cols:
+                    conn.execute("ALTER TABLE repos ADD COLUMN plugin_name TEXT")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS meta (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _catalog_db_query(self, sql, params=()):
+        """catalog.db SELECT (락 내부, dict 리스트 반환)"""
+        with _CATALOG_DB_LOCK:
+            conn = sqlite3.connect(self._get_catalog_db_path(), timeout=10)
+            try:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(sql, params)
+                rows = cur.fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+    def _catalog_db_execute(self, sql, params=()):
+        """catalog.db write (락 내부, commit)"""
+        with _CATALOG_DB_LOCK:
+            conn = sqlite3.connect(self._get_catalog_db_path(), timeout=10)
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _catalog_read_meta(self):
+        """meta 테이블 전체 dict (없으면 빈 dict)"""
+        try:
+            rows = self._catalog_db_query("SELECT key, value FROM meta")
+            return {r["key"]: r["value"] for r in rows}
+        except Exception:
+            return {}
+
+    def _catalog_set_meta(self, key, value):
+        """meta 테이블 key/value upsert"""
+        self._catalog_db_execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, str(value))
+        )
+
+    # ---- 설정 (코어 DB — gateway → MariaDB) ----
+
+    def _catalog_clamp_interval(self, raw):
+        """갱신 간격 1~24 클램프 (파싱 불가/빈 값이면 기본 6)"""
+        try:
+            val = int(str(raw or "").strip())
+        except Exception:
+            return _CATALOG_DEFAULT_INTERVAL_HOURS
+        if val < _CATALOG_MIN_INTERVAL_HOURS:
+            return _CATALOG_MIN_INTERVAL_HOURS
+        if val > _CATALOG_MAX_INTERVAL_HOURS:
+            return _CATALOG_MAX_INTERVAL_HOURS
+        return val
+
+    def _catalog_get_interval_hours(self, db_type):
+        """PM_CATALOG_REFRESH_HOURS 조회 (클램프 재적용 — 외부 직접 수정 대비)"""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_CATALOG_REFRESH_HOURS", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            return self._catalog_clamp_interval(raw)
+        except Exception:
+            return _CATALOG_DEFAULT_INTERVAL_HOURS
+
+    def _catalog_normalize_topics(self, raw):
+        """
+        토픽 목록 정규화: 쉼표/줄바꿈/공백 분리 → 형식 검증(소문자 영숫자+하이픈) →
+        중복 제거 → 최대 _CATALOG_MAX_TOPICS개 → 빈 목록이면 기본값 복원
+        """
+        if raw is None:
+            return list(_CATALOG_DEFAULT_TOPICS)
+        if isinstance(raw, (list, tuple)):
+            parts = [str(t) for t in raw]
+        else:
+            parts = re.split(r"[\s,]+", str(raw))
+        seen = []
+        for part in parts:
+            topic = part.strip().lower()
+            if not topic:
+                continue
+            if not _CATALOG_TOPIC_RE.match(topic):
+                continue
+            if topic in seen:
+                continue
+            seen.append(topic)
+        if not seen:
+            return list(_CATALOG_DEFAULT_TOPICS)
+        return seen[:_CATALOG_MAX_TOPICS]
+
+    def _catalog_get_topics(self, db_type):
+        """PM_CATALOG_TOPICS 조회 (쉼표 구분 문자열 → 정규화된 리스트)"""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_CATALOG_TOPICS", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            return self._catalog_normalize_topics(raw)
+        except Exception:
+            return list(_CATALOG_DEFAULT_TOPICS)
+
+    # ---- GitHub 조회 ----
+
+    def _catalog_search_topic(self, topic):
+        """GitHub Search API topic 검색 (per_page=100). 응답 dict 반환 (예외 전파)."""
+        url = "https://api.github.com/search/repositories?q=topic:{0}&per_page=100".format(topic)
+        req = Request(url, headers={
+            "User-Agent": "BookOasis/1.0",
+            "Accept": "application/vnd.github+json",
+        })
+        with urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _catalog_parse_remote_version_meta(self, text):
+        """VERSION 텍스트 → (version, plugin_id, name). JSON dict의 id/plugin_id/name 키 최우선."""
+        version, plugin_id, name = None, None, None
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                for key in ("plugin version", "plugin_version", "version"):
+                    if data.get(key):
+                        version = str(data[key]).strip()
+                        break
+                pid = data.get("id") or data.get("plugin_id")
+                if pid:
+                    plugin_id = str(pid).strip()
+                pname = data.get("name") or data.get("plugin_name")
+                if pname:
+                    name = str(pname).strip()
+        except Exception:
+            pass
+        if not version:
+            version = self._parse_remote_version(text)
+        return version, plugin_id, name
+
+    def _catalog_fetch_plugin_name(self, full_name, branch, plugin_id):
+        """코드 raw 파일에서 BaseMetadataProvider name 클래스 속성 추출 (없으면 None)."""
+        try:
+            src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}.py".format(
+                full_name, branch, plugin_id
+            )
+            source = self._fetch_text(src_url, timeout=15)
+        except Exception:
+            return None
+        if not source:
+            return None
+        try:
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                for stmt in node.body:
+                    if not isinstance(stmt, ast.Assign):
+                        continue
+                    if not any(isinstance(t, ast.Name) and t.id == "name" for t in stmt.targets):
+                        continue
+                    try:
+                        val = ast.literal_eval(stmt.value)
+                    except Exception:
+                        continue
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        except Exception:
+            pass
+        return None
+
+    def _catalog_check_repo_version(self, full_name, default_branch):
+        """
+        raw VERSION 조회 → (is_valid, plugin_id, latest_version, plugin_name).
+        name은 VERSION JSON 키 → 없으면 코드 raw fetch 후 AST(name 클래스 속성) 추출.
+        404/비JSON/네트워크 오류 → invalid (다음 주기 재판정).
+        """
+        branch = str(default_branch or "main").strip() or "main"
+        url = "https://raw.githubusercontent.com/{0}/{1}/VERSION".format(full_name, branch)
+        try:
+            text = self._fetch_text(url, timeout=15)
+            version, plugin_id, name = self._catalog_parse_remote_version_meta(text)
+            if not version:
+                return "invalid", None, None, None
+            if not plugin_id:
+                plugin_id = str(full_name).split("/")[-1]
+            if not name:
+                name = self._catalog_fetch_plugin_name(full_name, branch, plugin_id)
+            return "valid", plugin_id, version, name
+        except Exception:
+            return "invalid", None, None, None
+
+    # ---- 갱신 로직 ----
+
+    def _catalog_refresh_once(self, db_type):
+        """
+        카탈로그 1회 갱신: 토픽별 Search API → repos upsert → VERSION 판별.
+        중복 실행 방지: meta refresh_state=running 이면 즉시 return.
+        실패 시 refresh_state=error 기록 후 예외 전파 (스레드 루프가 다음 주기 재시도).
+        """
+        self._catalog_init_db()
+        state_rows = self._catalog_db_query("SELECT value FROM meta WHERE key='refresh_state'")
+        if state_rows and state_rows[0]["value"] == "running":
+            return
+        self._catalog_set_meta("refresh_state", "running")
+        self._catalog_set_meta("refresh_error", "")
+
+        try:
+            topics = self._catalog_get_topics(db_type)
+            if not topics:
+                topics = list(_CATALOG_DEFAULT_TOPICS)
+
+            # 1. 토픽별 Search API → full_name 기준 합집합
+            merged = {}
+            for topic in topics:
+                data = self._catalog_search_topic(topic)
+                if not isinstance(data, dict) or "items" not in data:
+                    raise RuntimeError(
+                        "GitHub Search API 응답 오류 (rate limit 또는 일시 오류일 수 있음): topic={0}".format(topic)
+                    )
+                for it in data.get("items", []):
+                    full_name = str(it.get("full_name") or "").strip()
+                    if not full_name:
+                        continue
+                    merged[full_name] = {
+                        "html_url": str(it.get("html_url") or ""),
+                        "description": str(it.get("description") or "")[:500],
+                        "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
+                        "default_branch": str(it.get("default_branch") or "main"),
+                        "pushed_at": str(it.get("pushed_at") or ""),
+                    }
+
+            # 2. repos upsert (검색 메타만 — is_valid/last_checked는 보존)
+            for full_name, info in merged.items():
+                self._catalog_db_execute(
+                    """
+                    INSERT INTO repos
+                        (full_name, html_url, description, topics, default_branch, pushed_at, plugin_id, latest_version, is_valid, last_checked)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'unknown', NULL)
+                    ON CONFLICT(full_name) DO UPDATE SET
+                        html_url=excluded.html_url,
+                        description=excluded.description,
+                        topics=excluded.topics,
+                        default_branch=excluded.default_branch,
+                        pushed_at=excluded.pushed_at,
+                        plugin_id=excluded.plugin_id
+                    """,
+                    (
+                        full_name,
+                        info["html_url"],
+                        info["description"],
+                        info["topics"],
+                        info["default_branch"],
+                        info["pushed_at"],
+                        str(full_name).split("/")[-1],
+                    ),
+                )
+
+            # 3. 검색에서 더 이상 조회되지 않는 미설치 저장소 정리 (DB 제거)
+            #    설치된 플러그인은 검색과 무관하게 유지 (업데이트/정보 보존).
+            #    모든 토픽 검색이 성공한 시점에만 실행 — 부분 실패 시 위에서 raise 되어 도달 안 함.
+            removed = 0
+            base_dir = self._get_plugins_base_dir()
+            for r in self._catalog_db_query("SELECT full_name, plugin_id FROM repos"):
+                if r["full_name"] in merged:
+                    continue
+                plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
+                if os.path.isdir(os.path.join(base_dir, plugin_id)):
+                    continue
+                self._catalog_db_execute(
+                    "DELETE FROM repos WHERE full_name=?", (r["full_name"],)
+                )
+                removed += 1
+
+            # 4. VERSION 판별 (rate 보호: 저장소 20개 초과 시 24시간 내 검증 결과 재사용)
+            now = datetime.now().isoformat(timespec="seconds")
+            repo_rows = self._catalog_db_query(
+                "SELECT full_name, default_branch, is_valid, last_checked FROM repos"
+            )
+            rows_to_check = []
+            if len(repo_rows) > _CATALOG_VERIFY_MAX_REPOS:
+                for r in repo_rows:
+                    if not r.get("last_checked"):
+                        rows_to_check.append(r)
+                        continue
+                    try:
+                        parsed = datetime.fromisoformat(str(r["last_checked"]))
+                        if (datetime.now() - parsed).total_seconds() >= _CATALOG_VERIFY_TTL_SECONDS:
+                            rows_to_check.append(r)
+                    except Exception:
+                        rows_to_check.append(r)
+            else:
+                rows_to_check = repo_rows
+
+            for r in rows_to_check:
+                full_name = r["full_name"]
+                is_valid, plugin_id, version, plugin_name = self._catalog_check_repo_version(
+                    full_name, r.get("default_branch") or "main"
+                )
+                self._catalog_db_execute(
+                    "UPDATE repos SET is_valid=?, plugin_id=?, latest_version=?, plugin_name=?, last_checked=? WHERE full_name=?",
+                    (is_valid, plugin_id or str(full_name).split("/")[-1], version, plugin_name, now, full_name),
+                )
+
+            # 5. 완료 상태 기록
+            self._catalog_set_meta("last_refresh", now)
+            self._catalog_set_meta("refresh_state", "idle")
+            self._catalog_set_meta("refresh_error", "")
+            cleaned = ", 미설치 정리 {0}개".format(removed) if removed else ""
+            return True, "카탈로그가 갱신되었습니다. (토픽 {0}개, 저장소 {1}개{2})".format(
+                len(topics), len(merged), cleaned
+            )
+        except Exception as e:
+            try:
+                self._catalog_set_meta("refresh_state", "error")
+                self._catalog_set_meta("refresh_error", str(e)[:500])
+            except Exception:
+                pass
+            raise
+
+    def _catalog_manual_refresh(self, db_type):
+        """catalog_refresh 액션 — 백그라운드 스레드로 즉시 1회 갱신 (응답은 즉시)"""
+        try:
+            self._ensure_catalog_thread(db_type)
+            t = threading.Thread(
+                target=self._catalog_refresh_once, args=(db_type,),
+                daemon=True, name="pm-catalog-manual-refresh",
+            )
+            t.start()
+            return True, "카탈로그 갱신을 시작했습니다. (완료까지 수십 초 소요)"
+        except Exception as e:
+            return False, "카탈로그 갱신 시작 실패: {0}".format(e)
+
+    def _catalog_background_loop(self, db_type):
+        """백그라운드 갱신 루프 (daemon). 빈 DB면 즉시 1회, 이후 간격(설정 재조회)만큼 sleep 후 갱신."""
+        try:
+            self._catalog_init_db()
+            rows = self._catalog_db_query("SELECT COUNT(*) AS c FROM repos")
+            if not rows or int(rows[0]["c"] or 0) == 0:
+                self._catalog_refresh_once(db_type)
+        except Exception:
+            pass
+        while True:
+            try:
+                interval = self._catalog_get_interval_hours(db_type)
+            except Exception:
+                interval = _CATALOG_DEFAULT_INTERVAL_HOURS
+            time.sleep(max(60, interval * 3600))
+            try:
+                self._catalog_refresh_once(db_type)
+            except Exception:
+                pass  # refresh_once가 error 상태 기록, 다음 주기 재시도
+
+    def _ensure_catalog_thread(self, db_type):
+        """첫 get_dashboard_data 호출 시 1회 시작 (모듈 레벨 플래그 + Lock — gunicorn 1워커 전제)"""
+        global _CATALOG_THREAD_STARTED
+        with _CATALOG_THREAD_LOCK:
+            if _CATALOG_THREAD_STARTED:
+                return
+            _CATALOG_THREAD_STARTED = True
+        try:
+            t = threading.Thread(
+                target=self._catalog_background_loop, args=(db_type,),
+                daemon=True, name="pm-catalog-refresh",
+            )
+            t.start()
+        except Exception:
+            _CATALOG_THREAD_STARTED = False
+
+    # ---- 응답 병합 ----
+
+    def _catalog_meta_dict(self, db_type):
+        """catalog_meta 응답 — 설정은 MariaDB에서, 상태는 catalog.db meta에서"""
+        meta = self._catalog_read_meta()
+        return {
+            "last_refresh": meta.get("last_refresh"),
+            "refresh_interval_hours": self._catalog_get_interval_hours(db_type),
+            "topics": self._catalog_get_topics(db_type),
+            "refresh_state": meta.get("refresh_state", "idle"),
+            "refresh_error": meta.get("refresh_error") or None,
+        }
+
+    def _catalog_list_valid_repos(self):
+        """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순)"""
+        try:
+            return self._catalog_db_query(
+                "SELECT full_name, html_url, description, topics, default_branch, pushed_at, "
+                "plugin_id, plugin_name, latest_version, last_checked FROM repos "
+                "WHERE is_valid='valid' ORDER BY COALESCE(pushed_at, '') DESC"
+            )
+        except Exception:
+            return []
+
+    @staticmethod
+    def _catalog_parse_topics_json(raw):
+        try:
+            data = json.loads(raw or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _merge_catalog_plugins(self, plugins, db_type):
+        """
+        설치된 플러그인 목록에 미설치 카탈로그 항목(valid만) 병합.
+        설치 여부는 응답 시점에 폴더+id 기준 동적 판정 (DB에 저장 안 함 — 설치/삭제 즉시 반영).
+        invalid 저장소는 목록/count에서 제외.
+        """
+        installed_ids = {p.get("id") for p in plugins if p.get("id")}
+        catalog_rows = self._catalog_list_valid_repos()
+        merged = list(plugins)
+        for r in catalog_rows:
+            plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
+            if plugin_id in installed_ids:
+                continue  # 이미 설치됨
+            git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            merged.append({
+                "id": plugin_id,
+                "name": str(r.get("plugin_name") or "").strip() or plugin_id,
+                "version": None,
+                "latest_version": r.get("latest_version"),
+                "has_update": False,
+                "enabled": False,
+                "is_searchable": False,
+                "is_category": False,
+                "is_widget": False,
+                "has_update_manifest": False,
+                "has_config": False,
+                "is_system": False,
+                "is_installed": False,
+                "git_url": git_url,
+                "catalog": {
+                    "full_name": r["full_name"],
+                    "html_url": r.get("html_url"),
+                    "description": r.get("description"),
+                    "topics": self._catalog_parse_topics_json(r.get("topics")),
+                    "default_branch": r.get("default_branch"),
+                    "last_checked": r.get("last_checked"),
+                },
+            })
+        return merged, self._catalog_meta_dict(db_type)
+
+    # ---- 설정 저장 (자체 save-config API — 코어 .plugin-config-form 우회) ----
+
+    def _catalog_save_config(self, item_data, db_type):
+        """
+        save_config — 간격(1~24 클램프)/토픽(정규화) 검증 후 gateway.set_setting → MariaDB.
+        catalog.db에는 저장하지 않음 (설정과 조회 결과 저장소 분리).
+        """
+        try:
+            item_data = item_data or {}
+            gateway = self.get_db_gateway(db_type)
+
+            interval_raw = item_data.get("refresh_interval_hours")
+            if interval_raw is None or str(interval_raw).strip() == "":
+                interval = _CATALOG_DEFAULT_INTERVAL_HOURS
+            else:
+                interval = self._catalog_clamp_interval(interval_raw)
+            gateway.set_setting("PM_CATALOG_REFRESH_HOURS", str(interval))
+
+            topics = self._catalog_normalize_topics(item_data.get("topics"))
+            gateway.set_setting("PM_CATALOG_TOPICS", ",".join(topics))
+
+            return True, (
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개 — 다음 갱신 주기부터 적용)"
+            ).format(interval, len(topics))
+        except Exception as e:
+            return False, "설정 저장 실패: {0}".format(e)
+
+    def _save_config_route(self):
+        """POST /api/media/dashboard/widgets/plugin_manager/save-config (url_map.add 직접 등록)"""
+        from flask import jsonify, request
+        try:
+            payload = request.get_json(silent=True) or {}
+            db_type = str(payload.get("type") or "general").strip() or "general"
+            ok, msg = self._catalog_save_config(payload, db_type)
+            if not ok:
+                return jsonify({"success": False, "error": msg})
+            return jsonify({
+                "success": True,
+                "message": msg,
+                "catalog_meta": self._catalog_meta_dict(db_type),
+            })
+        except Exception as e:
+            return jsonify({"success": False, "error": "설정 저장 실패: {0}".format(e)})
+
+    def _ensure_catalog_routes(self):
+        """save-config 자체 라우트 1회 등록 (함정 2: add_url_rule 대신 url_map.add 직접 등록)"""
+        global _CATALOG_ROUTES_REGISTERED
+        with _CATALOG_ROUTES_LOCK:
+            if _CATALOG_ROUTES_REGISTERED:
+                return
+            try:
+                from flask import current_app
+                from werkzeug.routing import Rule
+                app = current_app._get_current_object()
+                endpoint = "plugin_manager_save_config"
+                if endpoint not in app.view_functions:
+                    app.url_map.add(Rule(
+                        "/api/media/dashboard/widgets/plugin_manager/save-config",
+                        endpoint=endpoint, methods=["POST"],
+                    ))
+                    app.view_functions[endpoint] = self._save_config_route
+                _CATALOG_ROUTES_REGISTERED = True
+            except Exception:
+                pass  # 첫 요청 이전 컨텍스트 부재 등 — 다음 호출에서 재시도

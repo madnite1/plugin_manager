@@ -15,7 +15,8 @@
                 </div>
             </div>
             <div class="pm-header-actions">
-                <button id="pm-btn-refresh" class="pm-btn pm-btn-secondary" title="목록 새로고침">
+                <span id="pm-catalog-status" class="pm-catalog-status" style="display: none;"></span>
+                <button id="pm-btn-refresh" class="pm-btn pm-btn-secondary" title="목록 새로고침 + 카탈로그 갱신">
                     <i class="fa-solid fa-rotate-right"></i> 새로고침
                 </button>
             </div>
@@ -85,6 +86,8 @@
             <button class="pm-tab-btn active" data-filter="all">전체 <span id="pm-count-all" class="pm-count-badge">0</span></button>
             <button class="pm-tab-btn" data-filter="enabled">활성화 <span id="pm-count-enabled" class="pm-count-badge">0</span></button>
             <button class="pm-tab-btn" data-filter="disabled">비활성화 <span id="pm-count-disabled" class="pm-count-badge">0</span></button>
+            <button class="pm-tab-btn" data-filter="installed">설치됨 <span id="pm-count-installed" class="pm-count-badge">0</span></button>
+            <button class="pm-tab-btn" data-filter="uninstalled">미설치 <span id="pm-count-uninstalled" class="pm-count-badge">0</span></button>
             <button class="pm-tab-btn" data-filter="category">카테고리 뷰</button>
             <button class="pm-tab-btn" data-filter="widget">대시보드 위젯</button>
         </div>

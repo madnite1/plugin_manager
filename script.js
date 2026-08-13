@@ -6,6 +6,7 @@
     let currentFilter = 'all';
     let currentSearch = '';
     let pendingDeletePluginId = null;
+    let catalogMeta = null; // {last_refresh, refresh_interval_hours, topics, refresh_state, refresh_error}
 
     // 🎨 테마 감지 (MutationObserver - 가이드 규격)
     function getCurrentTheme() {
@@ -69,7 +70,9 @@
             .then(data => {
                 if (data.success && Array.isArray(data.plugins)) {
                     allPlugins = data.plugins;
+                    catalogMeta = data.catalog_meta || null;
                     updateCounts();
+                    updateCatalogStatus();
                     renderPlugins();
                     checkUpdatesAsync();
                 } else {
@@ -79,6 +82,84 @@
             .catch(err => {
                 showAlert('플러그인 목록 통신 오류: ' + err.message, true);
             });
+    }
+
+    // 카탈로그 갱신 상태 폴링 — 백엔드 스레드 완료(running→idle/error) 감지
+    // 새로고침은 스레드 시작만 확인하고 즉시 응답하므로, UI는 완료를 직접 조회해야 함
+    let catalogPollTimer = null;
+    let catalogPollTicks = 0;
+    const CATALOG_POLL_INTERVAL_MS = 3000;
+    const CATALOG_POLL_MAX_TICKS = 60; // 3분 방어적 상한 (백엔드가 상태를 바꾸지 못해도 중단)
+
+    function stopCatalogPolling() {
+        if (catalogPollTimer) {
+            clearInterval(catalogPollTimer);
+            catalogPollTimer = null;
+        }
+        catalogPollTicks = 0;
+    }
+
+    function startCatalogPolling() {
+        stopCatalogPolling();
+        catalogPollTimer = setInterval(() => {
+            catalogPollTicks += 1;
+            if (catalogPollTicks > CATALOG_POLL_MAX_TICKS) {
+                stopCatalogPolling();
+                return;
+            }
+            fetch('/api/media/dashboard/widgets/plugin_manager/data?type=general')
+                .then(res => res.json())
+                .then(data => {
+                    if (!data.success || !data.catalog_meta) return;
+                    catalogMeta = data.catalog_meta;
+                    updateCatalogStatus();
+                    if (data.catalog_meta.refresh_state !== 'running') {
+                        stopCatalogPolling();
+                        loadPlugins(); // 완료 상태 최종 반영 (목록 재조회)
+                    }
+                })
+                .catch(() => { /* 일시 오류 — 다음 틱 재시도 */ });
+        }, CATALOG_POLL_INTERVAL_MS);
+    }
+
+    // 카탈로그 상태 표시 (헤더 인디케이터)
+    function formatTime(iso) {
+        if (!iso) return '없음';
+        try {
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return String(iso);
+            return d.toLocaleString('ko-KR', {
+                month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            });
+        } catch(e) { return String(iso); }
+    }
+
+    function updateCatalogStatus() {
+        const el = document.getElementById('pm-catalog-status');
+        if (!el) return;
+        if (!catalogMeta) {
+            el.style.display = 'none';
+            return;
+        }
+        el.style.display = 'inline-flex';
+        const state = catalogMeta.refresh_state;
+        if (state === 'running') {
+            el.className = 'pm-catalog-status pm-catalog-status-running';
+            el.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 카탈로그 갱신 중...';
+        } else if (state === 'error') {
+            el.className = 'pm-catalog-status pm-catalog-status-error';
+            const err = String(catalogMeta.refresh_error || '알 수 없는 오류');
+            const short = err.length > 36 ? err.slice(0, 36) + '…' : err;
+            el.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> 카탈로그 갱신 실패' +
+                '<span class="pm-catalog-status-err" title="' + escapeHtml(err) + '">' + escapeHtml(short) + '</span>';
+        } else {
+            el.className = 'pm-catalog-status pm-catalog-status-idle';
+            const interval = catalogMeta.refresh_interval_hours || 6;
+            const topics = Array.isArray(catalogMeta.topics) ? catalogMeta.topics : [];
+            const topicText = topics.length ? '#' + topics.join(' #') : '';
+            el.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> 카탈로그 ' + escapeHtml(formatTime(catalogMeta.last_refresh)) +
+                ' <span class="pm-catalog-status-meta" title="' + escapeHtml(topicText) + '">(' + interval + 'h' + (topicText ? ' · ' + escapeHtml(topicText) : '') + ')</span>';
+        }
     }
 
     // 업데이트 버튼 이벤트 바인딩 (renderPlugins + patchCardUpdate 공용)
@@ -193,10 +274,106 @@
         const countAll = document.getElementById('pm-count-all');
         const countEnabled = document.getElementById('pm-count-enabled');
         const countDisabled = document.getElementById('pm-count-disabled');
+        const countInstalled = document.getElementById('pm-count-installed');
+        const countUninstalled = document.getElementById('pm-count-uninstalled');
 
         if (countAll) countAll.textContent = allPlugins.length;
         if (countEnabled) countEnabled.textContent = allPlugins.filter(p => p.enabled).length;
         if (countDisabled) countDisabled.textContent = allPlugins.filter(p => !p.enabled).length;
+        if (countInstalled) countInstalled.textContent = allPlugins.filter(p => p.is_installed).length;
+        if (countUninstalled) countUninstalled.textContent = allPlugins.filter(p => !p.is_installed).length;
+    }
+
+    // 미설치(카탈로그) 카드 렌더 — GitHub 토픽 검색으로 발견된 저장소
+    function renderCatalogCard(p) {
+        const cat = p.catalog || {};
+        const fullName = cat.full_name || p.git_url || p.id;
+        // 수집된 플러그인 이름 우선, 없으면 owner/repo 표시
+        const displayName = (p.name && p.name !== p.id) ? p.name : fullName;
+        const topics = Array.isArray(cat.topics) ? cat.topics : [];
+        const topicBadges = topics.map(t =>
+            '<span class="pm-badge pm-badge-topic">#' + escapeHtml(t) + '</span>'
+        ).join('');
+        const versionBadge = p.latest_version
+            ? '<span class="pm-badge pm-badge-version" title="최신 버전"><i class="fa-solid fa-tag"></i> v' + escapeHtml(p.latest_version) + '</span>'
+            : '';
+        const desc = cat.description
+            ? '<p class="pm-catalog-desc">' + escapeHtml(cat.description) + '</p>'
+            : '';
+
+        return `
+            <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}">
+                <div>
+                    <div class="pm-plugin-top">
+                        <div class="pm-plugin-icon-title">
+                            <div class="pm-plugin-avatar pm-catalog-avatar">
+                                <i class="fa-brands fa-github"></i>
+                            </div>
+                            <div>
+                                <h4 class="pm-plugin-name">${escapeHtml(displayName)}</h4>
+                                <span class="pm-plugin-id">${escapeHtml(p.id)} • 미설치</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="pm-badges-row">
+                        <span class="pm-badge pm-badge-uninstalled"><i class="fa-solid fa-circle-down"></i> 미설치</span>
+                        ${versionBadge}
+                        ${topicBadges}
+                    </div>
+                    ${desc}
+                </div>
+
+                <div class="pm-plugin-footer">
+                    <div class="pm-catalog-meta">
+                        <a href="${escapeHtml(p.git_url || '')}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(p.git_url || '')}" onclick="event.stopPropagation();">
+                            <i class="fa-brands fa-github"></i> 저장소 보기
+                        </a>
+                    </div>
+                    <div class="pm-card-action-btns">
+                        <button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="GitHub 저장소에서 설치">
+                            <i class="fa-solid fa-download"></i> 설치
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    // 미설치 카드 설치 버튼 — 기존 install_git 경로 재사용
+    function bindInstallButton(btn) {
+        btn.addEventListener('click', async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const gitUrl = this.getAttribute('data-git-url');
+            const name = this.getAttribute('data-name') || gitUrl;
+            if (!gitUrl) {
+                showAlert('설치할 저장소 URL이 없습니다.', true);
+                return;
+            }
+            if (!window.confirm('"' + name + '" 플러그인을 설치하시겠습니까?')) return;
+
+            const origHtml = this.innerHTML;
+            this.disabled = true;
+            this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 설치 중...';
+
+            try {
+                const res = await callPluginAction({ action: 'install_git', git_url: gitUrl });
+                this.disabled = false;
+                this.innerHTML = origHtml;
+                if (res.success) {
+                    showAlert(res.message || "'" + name + "' 플러그인이 설치되었습니다!");
+                    loadPlugins();
+                } else {
+                    showAlert(res.error || '플러그인 설치 실패', true);
+                }
+            } catch(err) {
+                this.disabled = false;
+                this.innerHTML = origHtml;
+                showAlert('설치 중 통신 오류가 발생했습니다: ' + err.message, true);
+            }
+        });
     }
 
     // 카드 렌더링
@@ -208,6 +385,8 @@
             // Tab filter
             if (currentFilter === 'enabled' && !p.enabled) return false;
             if (currentFilter === 'disabled' && p.enabled) return false;
+            if (currentFilter === 'installed' && !p.is_installed) return false;
+            if (currentFilter === 'uninstalled' && p.is_installed) return false;
             if (currentFilter === 'category' && !p.is_category) return false;
             if (currentFilter === 'widget' && !p.is_widget) return false;
 
@@ -234,6 +413,12 @@
 
         let html = '';
         filtered.forEach(p => {
+            // 미설치(카탈로그) 카드 — 별도 템플릿
+            if (!p.is_installed) {
+                html += renderCatalogCard(p);
+                return;
+            }
+
             const systemBadge = p.is_system
                 ? '<span class="pm-badge pm-badge-system">SYSTEM</span>'
                 : '';
@@ -355,6 +540,9 @@
 
         // Update Button
         document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
+
+        // Catalog Install Button (미설치 카드)
+        document.querySelectorAll('.pm-btn-install').forEach(bindInstallButton);
 
         // Settings Button (카드 우상단 톱니바퀴)
         document.querySelectorAll('.pm-btn-settings').forEach(btn => {
@@ -554,6 +742,66 @@
         if (modal) modal.style.display = 'none';
     }
 
+    // 카탈로그 설정 저장 — 공용 "설정 저장" 버튼에서 호출 (plugin_manager 분기)
+    // 코어 save-config(플러그인 config) 대신 자체 save-config API(gateway.set_setting → MariaDB) 사용
+    async function saveCatalogSettings() {
+        const saveBtn = document.getElementById('pm-settings-modal-save-btn');
+        const origHtml = saveBtn ? saveBtn.innerHTML : '';
+        if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 저장 중...';
+        }
+
+        const intervalInput = document.getElementById('pm-catalog-interval');
+        const topicsInput = document.getElementById('pm-catalog-topics');
+
+        // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
+        const rawTopics = topicsInput ? topicsInput.value : '';
+        const parsedTopics = rawTopics
+            .split(/[\n,]/)
+            .map(t => t.trim().toLowerCase())
+            .filter(t => /^[a-z0-9][a-z0-9-]*$/.test(t));
+        const uniqueTopics = [...new Set(parsedTopics)];
+        if (uniqueTopics.length > 5) {
+            if (saveBtn) {
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = origHtml;
+            }
+            showAlert('토픽은 최대 5개까지 등록할 수 있습니다. (현재 ' + uniqueTopics.length + '개) — GitHub 비인증 검색은 분당 10회 제한입니다.', true);
+            return;
+        }
+
+        try {
+            const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    type: 'general',
+                    refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
+                    topics: topicsInput ? topicsInput.value.trim() : ''
+                })
+            });
+            const data = await res.json();
+            if (saveBtn) {
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = origHtml;
+            }
+            if (data.success) {
+                showAlert(data.message || '카탈로그 설정이 저장되었습니다.');
+                closeSettingsModal();
+                loadPlugins();
+            } else {
+                showAlert(data.error || '설정 저장 실패', true);
+            }
+        } catch (err) {
+            if (saveBtn) {
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = origHtml;
+            }
+            showAlert('통신 오류: ' + err.message, true);
+        }
+    }
+
     async function saveSettingsModal() {
         const form = document.getElementById('pm-settings-form');
         if (!form) {
@@ -562,6 +810,12 @@
         }
 
         const pluginId = form.dataset.pluginId;
+
+        // 카탈로그 설정 — 공용 버튼 유지, 저장 경로만 자체 save-config로
+        if (pluginId === 'plugin_manager') {
+            return saveCatalogSettings();
+        }
+
         const configData = {};
         const inputs = form.querySelectorAll('input, select');
         inputs.forEach(inp => {
@@ -629,10 +883,30 @@
 
     // Event Listeners Setup
     function initEvents() {
-        // Refresh Button
+        // Refresh Button — 목록 재로드 + 카탈로그 수동 갱신 (백그라운드, 응답 즉시)
         const refreshBtn = document.getElementById('pm-btn-refresh');
         if (refreshBtn) {
-            refreshBtn.addEventListener('click', () => loadPlugins());
+            refreshBtn.addEventListener('click', () => {
+                refreshBtn.disabled = true;
+                const origHtml = refreshBtn.innerHTML;
+                refreshBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 갱신 중...';
+                callPluginAction({ action: 'catalog_refresh' })
+                    .then(res => {
+                        if (res && !res.success) {
+                            showAlert(res.error || '카탈로그 갱신 시작 실패', true);
+                        } else {
+                            startCatalogPolling(); // running → idle/error 전환 감지
+                        }
+                    })
+                    .catch(err => {
+                        showAlert('카탈로그 갱신 요청 오류: ' + err.message, true);
+                    })
+                    .finally(() => {
+                        refreshBtn.disabled = false;
+                        refreshBtn.innerHTML = origHtml;
+                        loadPlugins();
+                    });
+            });
         }
 
         // ZIP Install Button & File Selector

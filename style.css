@@ -820,3 +820,107 @@ input:checked + .pm-slider:before {
         word-break: break-all;
     }
 }
+
+/* ── 카탈로그 (GitHub 토픽 기반 자동 수집) ─────────────────────────────── */
+
+.pm-catalog-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.76rem;
+    padding: 0.35rem 0.7rem;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(15, 23, 42, 0.5);
+    color: var(--app-text-secondary, #cbd5e1);
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+}
+
+.pm-catalog-status-running {
+    color: #818cf8;
+    border-color: rgba(129, 140, 248, 0.4);
+    background: rgba(99, 102, 241, 0.12);
+}
+
+.pm-catalog-status-error {
+    color: #f87171;
+    border-color: rgba(248, 113, 113, 0.4);
+    background: rgba(239, 68, 68, 0.1);
+    cursor: pointer;
+}
+
+.pm-catalog-status-err {
+    opacity: 0.75;
+    font-size: 0.7rem;
+}
+
+.pm-catalog-status-meta {
+    opacity: 0.7;
+    font-size: 0.7rem;
+}
+
+/* 미설치 카드 */
+.pm-catalog-card {
+    border-style: dashed;
+    border-color: rgba(139, 92, 246, 0.35);
+    background: rgba(15, 23, 42, 0.45);
+}
+
+.pm-catalog-card:hover {
+    border-color: rgba(139, 92, 246, 0.7);
+}
+
+.pm-catalog-avatar {
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.25), rgba(99, 102, 241, 0.15));
+    border: 1px solid rgba(139, 92, 246, 0.35);
+}
+
+.pm-badge-uninstalled {
+    background: rgba(139, 92, 246, 0.18);
+    color: #a78bfa;
+    border: 1px solid rgba(139, 92, 246, 0.4);
+}
+
+.pm-badge-topic {
+    background: rgba(56, 189, 248, 0.1);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+.pm-badge-version {
+    background: rgba(74, 222, 128, 0.1);
+    color: #4ade80;
+    border: 1px solid rgba(74, 222, 128, 0.25);
+}
+
+.pm-catalog-desc {
+    margin: 0.4rem 0 0 0;
+    font-size: 0.8rem;
+    color: var(--app-text-muted, #94a3b8);
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.pm-catalog-meta {
+    font-size: 0.76rem;
+    color: var(--app-text-muted, #94a3b8);
+    display: flex;
+    align-items: center;
+}
+
+.pm-catalog-meta a {
+    color: #a78bfa;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.pm-catalog-meta a:hover {
+    text-decoration: underline;
+}

@@ -33,6 +33,47 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 - **삭제** — 플러그인 디렉토리 영구 삭제 (시스템 플러그인 `plugin_manager` 자신은 삭제 불가)
 - **설정 모달** — 플러그인 `config_schema` 또는 커스텀 `settings_ui.html` 렌더링 후 저장
 - **자동 업데이트 감지** — GitHub 소스 플러그인은 `/releases/latest` 리다이렉트로 최신 릴리즈 태그 감지 (API 키 불필요), 태그 없으면 GitHub raw `VERSION` 브랜치 체크
+- **플러그인 카탈로그** — 설정된 GitHub 토픽(기본 `bookoasis-plugin`) 검색으로 공개 BookOasis 플러그인을 자동 수집, 설정된 간격(1~24시간, 기본 6시간)으로 백그라운드 갱신. 설치/미설치 통합 목록 + 필터 탭, 미설치 카드의 **설치** 버튼으로 원클릭 설치 (기존 `install_git` 재사용). 조회 결과는 `catalog.db`(SQLite), 설정(간격/토픽)은 코어 DB(MariaDB)에 저장
+
+---
+
+## 플러그인 토픽 등록 (자동 발견)
+
+BookOasis 호환 플러그인 저장소는 **GitHub 토픽**을 달아두면 자동으로 발견됩니다.
+플러그인 매니저 카탈로그는 기본적으로 `topic:bookoasis-plugin` 검색으로
+BookOasis 플러그인 목록을 수집하므로, **공개 배포하는 모든 플러그인 저장소**에
+아래 토픽을 등록해 주세요. (등록 토픽은 플러그인 매니저 ⚙ 설정에서 추가/변경 가능)
+
+| 토픽 | 용도 |
+| :--- | :--- |
+| `bookoasis` | BookOasis 플러그인 여부 (필수) |
+| `bookoasis-plugin` | 플러그인 유형 명시 (권장) |
+
+### 웹 UI로 등록
+
+1. 저장소 페이지(예: `github.com/<owner>/<repo>`)의 오른쪽 사이드바 **About** 섹션에서 톱니바퀴(⚙) 클릭
+2. **Topics** 칸에 `bookoasis` 입력 후 Enter → 이어서 `bookoasis-plugin` 입력 후 Enter
+3. **Save changes** 클릭
+
+등록 직후 반영되며, 몇 분 내로 검색 인덱스에도 반영됩니다:
+
+```text
+https://github.com/search?q=topic%3Abookoasis&type=repositories
+```
+
+### API / CLI로 등록 (참고)
+
+```bash
+# GitHub API (PAT 필요)
+curl -X PATCH https://api.github.com/repos/{owner}/{repo} \
+  -H "Authorization: Bearer ***" \
+  -d '{"topics":["bookoasis","bookoasis-plugin"]}'
+
+# GitHub CLI (gh auth login 필요)
+gh repo edit <owner>/<repo> --add-topic bookoasis --add-topic bookoasis-plugin
+```
+
+> 토픽 등록은 플러그인 코드와 무관한 저장소 설정이라 코드 변경/릴리즈가 필요 없습니다.
 
 ---
 
@@ -115,9 +156,15 @@ GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
 1. 위 후보 순서대로 소스 ZIP 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
 2. 저장소 루트에서 `update_manifest` 를 AST 로 추출 (없으면 설치 거부)
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
-4. `plugins/metadata/<plugin_id>` 로 복사 → `.git_source` 메타 저장 → 활성화 + hot reload
+4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
 
-설치 시 `.git_source` 파일이 생성되어 `source_type` / `git_url` / `branch`(릴리즈 태그 설치 시 태그명) / `manifest_files` 이력이 남습니다.
+설치 시 소스 메타가 `plugin_manager/plugin_sources.db`(sqlite)에 저장됩니다. 설치는 zip/git
+어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다 — 유효한 GitHub 루트
+주소면 `git_url` / `branch`(릴리즈 태그 설치 시 태그명) / `manifest_files` 이력이 남아 자동
+업데이트·GitHub 배지가 활성화되고, manifest가 없거나 monorepo 서브디렉토리면 레코드가 없어
+로컬 플러그인으로 유지됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
+자동으로 DB에 마이그레이션됩니다 — `.zip_source`처럼 git_url이 없는 파일은 삭제 후
+`update_manifest` 기준으로 재판단).
 설치와 업데이트가 같은 소스(릴리즈 태그 우선, 브랜치 폴백)를 바라보므로 버전 불일치가 없습니다.
 
 ---
@@ -131,7 +178,7 @@ update_manifest = {
     "enabled": True,
     "provider": "github-raw",
     "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
-    "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js"],
+    "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js", "settings.html", "settings.js"],
     "version_file": "VERSION",
     "version_key": "plugin version",
     "show_sample_update_button": False,
@@ -140,7 +187,7 @@ update_manifest = {
 
 ### 우선순위 (자체 업데이트 엔진, 코어 PluginService 미사용)
 
-1. **릴리즈 태그 (우선)** — 설치 시 저장된 `.git_source`의 `git_url`이 GitHub 소스이면
+1. **릴리즈 태그 (우선)** — 설치 시 저장된 소스 메타(`plugin_sources.db`)의 `git_url`이 GitHub 소스이면
    `/releases/latest` 리다이렉트로 최신 릴리즈 태그를 추출(API 키 불필요, 5분 TTL 캐시)하고
    해당 태그의 raw URL에서 `VERSION` 비교 → 파일 다운로드/교체 → hot reload.
    릴리즈를 안 만든 커밋의 VERSION bump는 무시되므로 개발 중 실수 감지를 방지.
