@@ -374,7 +374,42 @@ except FileNotFoundError:
     check(".gitignore *.db 매칭 (plugin_sources.db)", False, "git 없음")
 
 # =================================================================
-section("K. update_manifest.files 정합성 — 배포 파일 누락 금지")
+section("K. _parse_raw_base_url — refs/heads 전체 브랜치 표기")
+# .../owner/repo/refs/heads/<branch>[/subpath] 형태는 branch를 <branch>로 파싱해야
+# 서브디렉토리(monorepo)로 오판되어 백필이 누락되지 않는다.
+_parse_cases = [
+    ("https://raw.githubusercontent.com/yume-script/plugin_board/refs/heads/main",
+     ("yume-script", "plugin_board", "main", "")),
+    ("https://raw.githubusercontent.com/yume-script/unified_book/refs/heads/main/",
+     ("yume-script", "unified_book", "main", "")),
+    ("https://raw.githubusercontent.com/yume-script/unified_book/refs/heads/dev/sub/dir",
+     ("yume-script", "unified_book", "dev", "sub/dir")),
+    # 기존 표기 회귀
+    ("https://raw.githubusercontent.com/madnite1/plugin_manager/main",
+     ("madnite1", "plugin_manager", "main", "")),
+    ("https://raw.githubusercontent.com/grandfoxx/my_reading_summary/master",
+     ("grandfoxx", "my_reading_summary", "master", "")),
+    ("https://raw.githubusercontent.com/leeyj/BookOasis_stable/main/plugins/metadata/stats_dashboard",
+     ("leeyj", "BookOasis_stable", "main", "plugins/metadata/stats_dashboard")),
+]
+for _url, _exp in _parse_cases:
+    _got = P._parse_raw_base_url(_url)
+    check(f"parse {_url}", _got == _exp, f"got {_got}")
+
+# refs/heads 표기 raw_base_url → 소스 메타 백필 통합 검증
+_refs_info = P._ensure_git_source_from_raw_base_url(
+    "refsplug",
+    "https://raw.githubusercontent.com/yume-script/plugin_board/refs/heads/main",
+    ["plugin_board.py", "__init__.py"],
+)
+check("refs/heads 백필 git_url", _refs_info and _refs_info.get("git_url")
+      == "https://github.com/yume-script/plugin_board", f"got {_refs_info}")
+check("refs/heads 백필 branch", _refs_info and _refs_info.get("branch") == "main",
+      f"got {_refs_info}")
+check("refs/heads 백필 DB 저장", P._sources_get("refsplug") is not None)
+
+# =================================================================
+section("L. update_manifest.files 정합성 — 배포 파일 누락 금지")
 # manifest.files에 빠진 배포 파일이 있으면 설치/업데이트 시 _prune_plugin_dir이
 # 해당 파일을 삭제하므로, 실제 존재 파일과 목록이 반드시 일치해야 한다.
 try:

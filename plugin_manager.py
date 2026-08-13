@@ -358,14 +358,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         subpath: branch 이후의 서브디렉토리 경로 (없으면 '').
         e.g. .../madnite1/plugin_manager/main → ('madnite1', 'plugin_manager', 'main', '')
              .../leeyj/BookOasis_stable/main/plugins/metadata/stats_dashboard → ('leeyj', 'BookOasis_stable', 'main', 'plugins/metadata/stats_dashboard')
+             .../yume-script/plugin_board/refs/heads/main → ('yume-script', 'plugin_board', 'main', '')
         """
         url = str(raw_base_url or "").strip().rstrip("/")
         m = re.match(
             r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)(/.*)?$", url
         )
         if m:
-            subpath = (m.group(4) or "").strip("/")
-            return m.group(1), m.group(2), m.group(3), subpath
+            owner, repo, seg3, rest = m.group(1), m.group(2), m.group(3), (m.group(4) or "")
+            # refs/heads/<branch> 전체 브랜치 표기 대응 (seg3='refs', rest='/heads/<branch>[/subpath]')
+            if seg3 == "refs" and rest.startswith("/heads/"):
+                parts = rest.split("/")
+                # parts = ['', 'heads', '<branch>', ...]
+                if len(parts) >= 3:
+                    return owner, repo, parts[2], "/".join(parts[3:]).strip("/")
+            subpath = rest.strip("/")
+            return owner, repo, seg3, subpath
         return None
 
     def _ensure_git_source_from_raw_base_url(self, plugin_id, raw_base_url, manifest_files):
