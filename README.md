@@ -46,19 +46,18 @@ BookOasis 플러그인 목록을 수집하므로, **공개 배포하는 모든 �
 
 | 토픽 | 용도 |
 | :--- | :--- |
-| `bookoasis` | BookOasis 플러그인 여부 (필수) |
-| `bookoasis-plugin` | 플러그인 유형 명시 (권장) |
+| `bookoasis-plugin` | BookOasis 플러그인 여부/유형 (필수) |
 
 ### 웹 UI로 등록
 
 1. 저장소 페이지(예: `github.com/<owner>/<repo>`)의 오른쪽 사이드바 **About** 섹션에서 톱니바퀴(⚙) 클릭
-2. **Topics** 칸에 `bookoasis` 입력 후 Enter → 이어서 `bookoasis-plugin` 입력 후 Enter
+2. **Topics** 칸에 `bookoasis-plugin` 입력 후 Enter
 3. **Save changes** 클릭
 
 등록 직후 반영되며, 몇 분 내로 검색 인덱스에도 반영됩니다:
 
 ```text
-https://github.com/search?q=topic%3Abookoasis&type=repositories
+https://github.com/search?q=topic%3Abookoasis-plugin&type=repositories
 ```
 
 ### API / CLI로 등록 (참고)
@@ -67,10 +66,10 @@ https://github.com/search?q=topic%3Abookoasis&type=repositories
 # GitHub API (PAT 필요)
 curl -X PATCH https://api.github.com/repos/{owner}/{repo} \
   -H "Authorization: Bearer ***" \
-  -d '{"topics":["bookoasis","bookoasis-plugin"]}'
+  -d '{"topics":["bookoasis-plugin"]}'
 
 # GitHub CLI (gh auth login 필요)
-gh repo edit <owner>/<repo> --add-topic bookoasis --add-topic bookoasis-plugin
+gh repo edit <owner>/<repo> --add-topic bookoasis-plugin
 ```
 
 > 토픽 등록은 플러그인 코드와 무관한 저장소 설정이라 코드 변경/릴리즈가 필요 없습니다.
