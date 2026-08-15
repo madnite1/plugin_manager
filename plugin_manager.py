@@ -1017,11 +1017,30 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             for f in os.listdir(dpath):
                 if f.endswith(".py") and f not in ("base.py", "__init__.py"):
                     fpath = os.path.join(dpath, f)
-                    if os.path.isfile(fpath):
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
                         with open(fpath, "r", encoding="utf-8", errors="replace") as py_f:
-                            content = py_f.read()
-                            if "BaseMetadataProvider" in content or "id =" in content or "id=" in content:
-                                return True
+                            tree = ast.parse(py_f.read(), filename=fpath)
+                    except SyntaxError:
+                        continue
+                    for node in ast.walk(tree):
+                        if not isinstance(node, ast.ClassDef):
+                            continue
+                        # BaseMetadataProvider 상속 클래스 또는 id 속성을 가진 클래스 = 플러그인 후보
+                        is_provider = any("BaseMetadataProvider" in ast.unparse(b)
+                                          for b in node.bases)
+                        has_id_attr = any(
+                            (isinstance(stmt, ast.Assign) and any(
+                                isinstance(t, ast.Name) and t.id == "id"
+                                for t in stmt.targets))
+                            or (isinstance(stmt, ast.AnnAssign)
+                                and isinstance(stmt.target, ast.Name)
+                                and stmt.target.id == "id")
+                            for stmt in node.body
+                        )
+                        if is_provider or has_id_attr:
+                            return True
         except Exception:
             pass
 
@@ -1041,17 +1060,44 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception:
                 pass
 
-        # 2. Python 코드에서 id = "..." 검색
+        # 2. Python 코드에서 id = "..." 검색 (AST 기반 — docstring/주석/문자열 내
+        #    `id="..."` 패턴(예: HTML script 태그, JSON 예시)을 실제 클래스 속성으로
+        #    오인하지 않도록 실제 클래스 본문의 id 속성만 추출)
         try:
             for fname in os.listdir(plugin_dir):
                 if fname.endswith(".py") and fname not in ("__init__.py", "base.py"):
                     fpath = os.path.join(plugin_dir, fname)
-                    if os.path.isfile(fpath):
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
                         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read()
-                            match = re.search(r'id\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', content)
-                            if match:
-                                return match.group(1).strip()
+                            tree = ast.parse(f.read(), filename=fpath)
+                    except SyntaxError:
+                        continue
+                    for node in ast.walk(tree):
+                        if not isinstance(node, ast.ClassDef):
+                            continue
+                        for stmt in node.body:
+                            value_node = None
+                            if isinstance(stmt, ast.Assign):
+                                for target in stmt.targets:
+                                    if isinstance(target, ast.Name) and target.id == "id":
+                                        value_node = stmt.value
+                                        break
+                            elif (isinstance(stmt, ast.AnnAssign)
+                                  and isinstance(stmt.target, ast.Name)
+                                  and stmt.target.id == "id"):
+                                value_node = stmt.value
+                            if value_node is None:
+                                continue
+                            try:
+                                value = ast.literal_eval(value_node)
+                            except Exception:
+                                continue
+                            if isinstance(value, str):
+                                p_id = value.strip()
+                                if p_id and re.match(r'^[a-zA-Z0-9_-]+$', p_id):
+                                    return p_id
         except Exception:
             pass
 
