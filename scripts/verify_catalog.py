@@ -92,6 +92,7 @@ sys.modules["services"] = fake_services
 sys.modules["services.metadata_factory"] = fake_metadata_factory
 
 spec = {}
+spec["_PM_SKIP_AUTO_START"] = True  # 모듈 끝 자동 스레드 시작 차단 (하네스 실행 환경)
 with open(SRC, "r", encoding="utf-8") as f:
     exec(compile(f.read(), SRC, "exec"), spec)
 PluginManager = spec["PluginManagerMetadataProvider"]

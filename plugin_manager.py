@@ -2316,3 +2316,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 _CATALOG_ROUTES_REGISTERED = True
             except Exception:
                 pass  # 첫 요청 이전 컨텍스트 부재 등 — 다음 호출에서 재시도
+
+# ── 플러그인 로드 시 백그라운드 카탈로그 갱신 스레드 자동 시작 (2026-08-14) ──
+# 코어는 플러그인을 lazy import — 첫 요청이 오면 모듈이 로드되는데, 그 시점에 스레드를
+# 시작하면 카탈로그 화면을 직접 열지 않아도 주기 갱신이 보장된다. 기존 get_dashboard_data의
+# _ensure_catalog_thread 호출은 _CATALOG_THREAD_STARTED 플래그 때문에 no-op — 중복 시작 없음.
+# 테스트 하네스(verify_catalog/verify_sources_db)는 exec로 실행하므로 _PM_SKIP_AUTO_START로 건너뜀.
+if not globals().get("_PM_SKIP_AUTO_START", False):
+    try:
+        PluginManagerMetadataProvider()._ensure_catalog_thread("general")
+    except Exception:
+        pass  # import 실패로 플러그인 로드 전체가 죽는 것 방지

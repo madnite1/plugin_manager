@@ -91,6 +91,7 @@ sys.modules["services.plugin_service"] = fake_plugin_service
 sys.modules["services.metadata_factory"] = fake_metadata_factory
 
 spec = {}
+spec["_PM_SKIP_AUTO_START"] = True  # 모듈 끝 자동 스레드 시작 차단 (하네스 실행 환경)
 stub_root = make_stub_base()
 sys.path.insert(0, stub_root)
 with open(SRC, "r", encoding="utf-8") as f:
