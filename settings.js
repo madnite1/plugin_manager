@@ -12,6 +12,7 @@
 
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
+    const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
 
     // 초기값 로드 — /data 응답의 catalog_meta (간격/토픽은 MariaDB 설정)
     async function loadInitial() {
@@ -25,6 +26,9 @@
             }
             if (topicsInput && Array.isArray(meta.topics)) {
                 topicsInput.value = meta.topics.join('\n');
+            }
+            if (allowInvalidInput) {
+                allowInvalidInput.checked = !!meta.allow_invalid_install;
             }
         } catch(e) {
             // 초기값 로드 실패 — 기본값 유지

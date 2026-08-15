@@ -4,15 +4,15 @@
 
         <!-- 1. 갱신 간격 -->
         <div>
-            <label style="font-weight: 700; color: #fff; font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
-                <i class="fa-solid fa-clock-rotate-left" style="color: #8b5cf6; margin-right: 0.3rem;"></i> 카탈로그 갱신 간격
+            <label style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
+                <i class="fa-solid fa-clock-rotate-left" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> 카탈로그 갱신 간격
             </label>
             <div style="display: flex; align-items: center; gap: 0.6rem;">
                 <input type="number" id="pm-catalog-interval" class="pm-catalog-input" min="1" max="24" step="1" value="6"
-                       style="width: 110px; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.15); color: #fff; padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem;" />
-                <span style="color: #94a3b8; font-size: 0.85rem;">시간 (최소 1, 최대 24 — 기본 6)</span>
+                       style="width: 110px; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem;" />
+                <span style="color: var(--app-text-muted, #94a3b8); font-size: 0.85rem;">시간 (최소 1, 최대 24 — 기본 6)</span>
             </div>
-            <p style="font-size: 0.76rem; color: #94a3b8; margin: 0.45rem 0 0 0;">
+            <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.45rem 0 0 0;">
                 백그라운드에서 지정된 간격으로 GitHub 토픽 검색을 수행해 카탈로그를 자동 갱신합니다.
                 변경 사항은 다음 갱신 주기부터 적용됩니다.
             </p>
@@ -20,20 +20,37 @@
 
         <!-- 2. 조회 토픽 -->
         <div>
-            <label style="font-weight: 700; color: #fff; font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
-                <i class="fa-solid fa-tags" style="color: #8b5cf6; margin-right: 0.3rem;"></i> 조회 토픽
+            <label style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
+                <i class="fa-solid fa-tags" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> 조회 토픽
             </label>
             <textarea id="pm-catalog-topics" class="pm-catalog-input" rows="4" placeholder="bookoasis-plugin"
-                      style="width: 100%; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.15); color: #fff; padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem; resize: vertical; box-sizing: border-box;"></textarea>
-            <p style="font-size: 0.76rem; color: #94a3b8; margin: 0.45rem 0 0 0;">
+                      style="width: 100%; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem; resize: vertical; box-sizing: border-box;"></textarea>
+            <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.45rem 0 0 0;">
                 한 줄에 하나씩 또는 쉼표로 구분해 입력하세요. 형식: 소문자 영문/숫자/하이픈 (예:
                 <code style="background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 4px;">bookoasis-plugin</code>).
                 빈 목록이면 기본값(<code style="background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 4px;">bookoasis-plugin</code>)으로 복원됩니다.
             </p>
-            <p style="font-size: 0.76rem; color: #f59e0b; margin: 0.35rem 0 0 0;">
-                <i class="fa-solid fa-triangle-exclamation"></i> GitHub 비인증 검색은 분당 10회 제한 — 토픽 수 + 버전 검증 요청 합계가 한도 내여야 합니다. <strong style="color:#f43f5e;">최대 5개</strong>까지 등록할 수 있습니다 (초과분은 저장되지 않습니다).
+            <p style="font-size: 0.76rem; color: var(--app-accent, #f59e0b); margin: 0.35rem 0 0 0;">
+                <i class="fa-solid fa-triangle-exclamation"></i> GitHub 비인증 검색은 분당 10회 제한 — 토픽 수 + 버전 검증 요청 합계가 한도 내여야 합니다. <strong style="color: var(--app-accent-hover, #f43f5e);">최대 5개</strong>까지 등록할 수 있습니다 (초과분은 저장되지 않습니다).
             </p>
         </div>
 
     </div>
+
+        <!-- 3. 검증 실패시 설치 허용 -->
+        <div style="display: flex; align-items: flex-start; gap: 0.6rem; margin-top: 0.4rem;">
+            <input type="checkbox" id="pm-allow-invalid-install" class="pm-catalog-input"
+                   style="width: 18px; height: 18px; margin-top: 0.15rem; accent-color: var(--app-accent, #8b5cf6); cursor: pointer;" />
+            <div>
+                <label for="pm-allow-invalid-install" style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; cursor: pointer;">
+                    <i class="fa-solid fa-shield-halved" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> 검증 실패시 설치 가능
+                </label>
+                <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.3rem 0 0 0;">
+                    소스 검증(가이드 §2/§3 규정)에 실패한 플러그인도 설치할 수 있게 합니다.
+                    <strong style="color: var(--app-accent-hover, #f43f5e);">기본 OFF</strong> — 켜면 위험(코어 라이브러리 덮어쓰기, 심볼릭 링크 등)을 감수하고 설치합니다.
+                    켠 상태에서도 설치 시 <strong style="color: var(--app-accent-hover, #f43f5e);">가이드 위반 항목을 안내하고 계속 여부를 확인</strong>합니다.
+                </p>
+            </div>
+        </div>
+
 </div>

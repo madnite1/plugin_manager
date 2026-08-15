@@ -23,9 +23,10 @@ _RELEASE_TAG_CACHE = {}
 _RELEASE_TAG_CACHE_TTL = 300  # 초
 
 # ── 플러그인 카탈로그 (GitHub 토픽 기반 자동 수집) ──────────────────────────
-# 백그라운드 갱신 스레드 1회 시작 보장 (gunicorn 1워커 전제)
+# 백그라운드 갱신 스레드 보장 (gunicorn 1워커 전제 — is_alive()로 사망 감지 후 재시작)
 _CATALOG_THREAD_LOCK = threading.Lock()
-_CATALOG_THREAD_STARTED = False
+_CATALOG_THREAD = None          # 실행 중인 백그라운드 스레드 참조
+_CATALOG_THREAD_ALIVE = False   # 스레드 시작 시도 플래그 (사망 시 루프가 리셋)
 # 자체 save-config 라우트 1회 등록 보장 (멀티 워커/재호출 안전)
 _CATALOG_ROUTES_LOCK = threading.Lock()
 _CATALOG_ROUTES_REGISTERED = False
@@ -96,15 +97,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if action == "install_zip":
             zip_data = str(item_data.get("zip_data", "")).strip()
             filename = str(item_data.get("filename", "")).strip()
+            force = item_data.get("force") in (True, 1, "1", "true", "True")
             if not zip_data:
                 return False, "ZIP 압축 파일 데이터가 누락되었습니다."
-            return self._install_from_zip(zip_data, filename, db_type)
+            return self._install_from_zip(zip_data, filename, db_type, force=force)
 
         elif action == "install_git":
             git_url = str(item_data.get("git_url", "")).strip()
+            force = item_data.get("force") in (True, 1, "1", "true", "True")
             if not git_url:
                 return False, "Git 저장소 URL이 누락되었습니다."
-            ok, msg = self._install_from_git(git_url, db_type)
+            ok, msg = self._install_from_git(git_url, db_type, force=force)
             # 카탈로그 저장소라면 설치 결과를 install_error에 기록 (프론트 카드 상태 반영)
             if ok:
                 self._catalog_clear_install_error(git_url)
@@ -558,8 +561,52 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         return has_update, latest_version
 
-    def _install_from_zip(self, zip_data_b64, filename, db_type):
-        """Zip 압축 파일 업로드를 통한 플러그인 설치"""
+    def _validation_fail_response(self, source_checks, db_type, allow_invalid=None):
+        """검증 실패 시 안내 메시지 + 프론트용 구조화 마커 생성 (2-튜플 유지, 코어 변경 불필요)
+        allow_invalid=True  → 설정으로 허용됨: 프론트에서 위반 항목 확인 후 계속 여부 confirm (force 재시도)
+        allow_invalid=False → 설정으로 차단됨: 즉시 중단, 설정에서 켜야 설치 가능
+        """
+        if allow_invalid is None:
+            allow_invalid = self._catalog_get_allow_invalid_install(db_type)
+        failed_items = [f"- {c['name']}: {c['detail']}" for c in source_checks if not c.get("ok")]
+        guide_refs = []
+        for c in source_checks:
+            if not c.get("ok") and c.get("guide_ref"):
+                ref = c["guide_ref"]
+                if ref not in guide_refs:
+                    guide_refs.append(ref)
+        import json as _json
+        payload = {
+            "validation_failed": True,
+            "allow_invalid_install": bool(allow_invalid),
+            "checks": [
+                {"name": c["name"], "ok": c.get("ok"), "detail": c.get("detail"),
+                 "guide_ref": c.get("guide_ref")}
+                for c in source_checks if not c.get("ok")
+            ],
+            "guide_refs": guide_refs,
+        }
+        if allow_invalid:
+            msg = (
+                "플러그인 검증 실패 — 아래 가이드 규정 위반 항목을 확인하세요 (설정에서 '검증 실패시 설치 가능'이 켜져 있습니다):\n"
+                + "\n".join(failed_items)
+                + ("\n참조: " + "\n".join(guide_refs) if guide_refs else "")
+                + "\n계속 설치하려면 아래 확인 버튼을 누르세요. (위험)"
+                + "\n__VALIDATION_FAILED__" + _json.dumps(payload, ensure_ascii=False)
+            )
+        else:
+            msg = (
+                "플러그인 검증 실패 — 설치를 중단했습니다 (기존 폴더는 변경되지 않음):\n"
+                + "\n".join(failed_items)
+                + ("\n참조: " + "\n".join(guide_refs) if guide_refs else "")
+                + "\n설치하려면 플러그인 매니저 설정에서 '검증 실패시 설치 가능'을 켠 후 다시 시도하세요."
+            )
+        return False, msg
+
+    def _install_from_zip(self, zip_data_b64, filename, db_type, force=False):
+        """Zip 압축 파일 업로드를 통한 플러그인 설치
+        force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
+        """
         if not zip_data_b64:
             return False, "압축 파일 데이터가 누락되었습니다."
 
@@ -600,12 +647,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             # 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔)
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
-            if not source_ok:
-                failed_items = [f"- {c['name']}: {c['detail']}" for c in source_checks if not c.get("ok")]
-                return False, (
-                    "플러그인 검증 실패 — 설치를 중단했습니다 (기존 폴더는 변경되지 않음):\n"
-                    + "\n".join(failed_items)
-                )
+            if not source_ok and not force:
+                return self._validation_fail_response(source_checks, db_type)
 
             dest_dir, err = self._validate_plugin_path(plugin_id)
             if err or not dest_dir:
@@ -662,6 +705,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"ZIP 압축 파일을 통해 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
                 f"(검증 통과: {', '.join(passed)})"
             )
+            if force:
+                result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
             return True, result_msg
@@ -674,9 +719,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _install_from_git(self, git_url, db_type):
+    def _install_from_git(self, git_url, db_type, force=False):
         """
         GitHub/Gitea 저장소 URL 을 통한 플러그인 설치 (git 바이너리 불필요).
+        force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
 
         절차:
           1. 저장소 소스를 HTTP ZIP 으로 다운로드 (urllib 표준 라이브러리만 사용)
@@ -786,12 +832,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 5-1. 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔, zip 설치와 동일 기준)
             #      prune 전에 수행해야 UI 번들/VERSION/symlink 등 전체 파일 기준 검사 가능
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
-            if not source_ok:
-                failed_items = [f"- {c['name']}: {c['detail']}" for c in source_checks if not c.get("ok")]
-                return False, (
-                    "플러그인 검증 실패 — 설치를 중단했습니다 (기존 폴더는 변경되지 않음):\n"
-                    + "\n".join(failed_items)
-                )
+            if not source_ok and not force:
+                return self._validation_fail_response(source_checks, db_type)
 
             # 6. manifest 목록 외 전부 삭제 (.git 등 포함 안전 처리)
             try:
@@ -847,6 +889,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
                 f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지, 검증 통과: {', '.join(passed)})"
             )
+            if force:
+                result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
             return True, result_msg
@@ -1166,15 +1210,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         if manifest_files:
             if vfile_ok:
-                checks.append({"name": "VERSION", "ok": True, "detail": vdetail})
+                checks.append({"name": "VERSION", "ok": True, "detail": vdetail,
+                               "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
             else:
                 checks.append({"name": "VERSION", "ok": False,
-                               "detail": "update_manifest 선언 시 VERSION 필수 — " + vdetail})
+                               "detail": "update_manifest 선언 시 VERSION 필수 — " + vdetail,
+                               "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
         elif vfile_ok:
-            checks.append({"name": "VERSION", "ok": True, "detail": vdetail})
+            checks.append({"name": "VERSION", "ok": True, "detail": vdetail,
+                           "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
         else:
             checks.append({"name": "VERSION", "ok": True, "warn": True,
-                           "detail": "경고: " + vdetail + " (업데이트 체크 불가)"})
+                           "detail": "경고: " + vdetail + " (업데이트 체크 불가)",
+                           "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
 
         # 2~6. 파이썬 소스 AST 분석
         py_files = []
@@ -1285,25 +1333,32 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         has_apply = True
 
         if not py_files:
-            checks.append({"name": "소스", "ok": False, "detail": "메인 .py 파일이 없습니다"})
+            checks.append({"name": "소스", "ok": False, "detail": "메인 .py 파일이 없습니다",
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (BaseMetadataProvider 상속)"})
         elif not provider_found:
             checks.append({"name": "소스", "ok": False,
-                           "detail": "BaseMetadataProvider 상속 클래스를 찾을 수 없습니다"})
+                           "detail": "BaseMetadataProvider 상속 클래스를 찾을 수 없습니다",
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (BaseMetadataProvider 상속)"})
         else:
-            checks.append({"name": "소스", "ok": True, "detail": "%d개 .py 파일, BaseMetadataProvider 클래스 발견" % len(py_files)})
+            checks.append({"name": "소스", "ok": True, "detail": "%d개 .py 파일, BaseMetadataProvider 클래스 발견" % len(py_files),
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (BaseMetadataProvider 상속)"})
 
         # 3. 클래스 id 일치 검사 (폴더명/감지 id와 일치해야 목록 표시)
         if class_id is not None:
             if str(class_id).strip() == str(detected_id).strip():
-                checks.append({"name": "클래스 id", "ok": True, "detail": class_id})
+                checks.append({"name": "클래스 id", "ok": True, "detail": class_id,
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (id 필드)"})
             else:
                 checks.append({"name": "클래스 id", "ok": False,
-                               "detail": f"코드 내 id='{class_id}' ≠ 감지된 id='{detected_id}' — 설치 후 목록에 표시되지 않을 수 있습니다"})
+                               "detail": f"코드 내 id='{class_id}' ≠ 감지된 id='{detected_id}' — 설치 후 목록에 표시되지 않을 수 있습니다",
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (id 필드)"})
         elif provider_found:
             checks.append({"name": "클래스 id", "ok": False,
-                           "detail": "플러그인 클래스에 id 속성이 없습니다"})
+                           "detail": "플러그인 클래스에 id 속성이 없습니다",
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (id 필드)"})
         else:
-            checks.append({"name": "클래스 id", "ok": False, "detail": "클래스를 찾을 수 없어 검사 불가"})
+            checks.append({"name": "클래스 id", "ok": False, "detail": "클래스를 찾을 수 없어 검사 불가",
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (id 필드)"})
 
         # 4. 필수 클래스 필드 검사 (가이드: id/name/is_searchable/config_schema)
         if provider_found:
@@ -1311,10 +1366,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                               if f not in cls_attrs]
             if missing_fields:
                 checks.append({"name": "필수 필드", "ok": False,
-                               "detail": "클래스에 없음: " + ", ".join(missing_fields)})
+                               "detail": "클래스에 없음: " + ", ".join(missing_fields),
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (필수/권장 필드)"})
             else:
                 checks.append({"name": "필수 필드", "ok": True,
-                               "detail": "name/is_searchable/config_schema 확인"})
+                               "detail": "name/is_searchable/config_schema 확인",
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (필수/권장 필드)"})
         else:
             checks.append({"name": "필수 필드", "ok": False, "detail": "클래스 없음"})
 
@@ -1327,25 +1384,32 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 missing.append("apply")
             if missing:
                 checks.append({"name": "필수 메서드", "ok": False,
-                               "detail": "구현 안 됨: " + ", ".join(missing)})
+                               "detail": "구현 안 됨: " + ", ".join(missing),
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (search/apply 메서드)"})
             else:
-                checks.append({"name": "필수 메서드", "ok": True, "detail": "search/apply 확인"})
+                checks.append({"name": "필수 메서드", "ok": True, "detail": "search/apply 확인",
+                               "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (search/apply 메서드)"})
         else:
-            checks.append({"name": "필수 메서드", "ok": False, "detail": "클래스 없음"})
+            checks.append({"name": "필수 메서드", "ok": False, "detail": "클래스 없음",
+                           "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (search/apply 메서드)"})
 
         # 6. 금지 패턴 검사
         if forbidden_hits:
             checks.append({"name": "금지 패턴", "ok": False,
-                           "detail": "; ".join(forbidden_hits[:3])})
+                           "detail": "; ".join(forbidden_hits[:3]),
+                           "guide_ref": "가이드 §1 핵심 원칙 + §2.1 보안 제약 (코드 실행 패턴 금지)"})
         else:
-            checks.append({"name": "금지 패턴", "ok": True, "detail": "eval/exec/subprocess 없음"})
+            checks.append({"name": "금지 패턴", "ok": True, "detail": "eval/exec/subprocess 없음",
+                           "guide_ref": "가이드 §1 핵심 원칙 + §2.1 보안 제약 (코드 실행 패턴 금지)"})
 
         # __init__.py 존재 여부 (없으면 폴백 로드 — 경고만)
         if os.path.isfile(os.path.join(plugin_dir, "__init__.py")):
-            checks.append({"name": "__init__.py", "ok": True, "detail": "확인"})
+            checks.append({"name": "__init__.py", "ok": True, "detail": "확인",
+                           "guide_ref": "가이드 §2 디렉토리 구조 (__init__.py)"})
         else:
             checks.append({"name": "__init__.py", "ok": True, "warn": True,
-                           "detail": "경고: __init__.py 없음 (폴백 로드 사용)"})
+                           "detail": "경고: __init__.py 없음 (폴백 로드 사용)",
+                           "guide_ref": "가이드 §2 디렉토리 구조 (__init__.py)"})
 
         # 7. 심볼릭 링크 검사 (가이드 보안 규정 — 외부 경로 접근 차단)
         symlinks = []
@@ -1359,9 +1423,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             pass
         if symlinks:
             checks.append({"name": "심볼릭 링크", "ok": False,
-                           "detail": "플러그인 폴더 내 심볼릭 링크 금지: " + ", ".join(symlinks[:3])})
+                           "detail": "플러그인 폴더 내 심볼릭 링크 금지: " + ", ".join(symlinks[:3]),
+                           "guide_ref": "가이드 §2.1 보안 제약 (외부 심볼릭 링크 접근 차단)"})
         else:
-            checks.append({"name": "심볼릭 링크", "ok": True, "detail": "없음"})
+            checks.append({"name": "심볼릭 링크", "ok": True, "detail": "없음",
+                           "guide_ref": "가이드 §2.1 보안 제약 (외부 심볼릭 링크 접근 차단)"})
 
         # 8. update_manifest 규격 검사 (선언된 경우에만)
         if manifest_files:
@@ -1371,8 +1437,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 problems.append("provider='%s' (github-raw만 지원)" % (m_provider or "없음"))
             if not str(manifest.get("version_file") or "").strip():
                 problems.append("version_file 없음")
-            if not str(manifest.get("version_key") or "").strip():
-                problems.append("version_key 없음")
+            # 가이드 272행: version_key는 "권장" — 누락 시 경고로 처리
+            m_version_key_missing = not str(manifest.get("version_key") or "").strip()
             missing_files = [rel for rel in manifest_files
                              if not os.path.isfile(os.path.join(plugin_dir, rel))]
             if missing_files:
@@ -1381,13 +1447,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 problems.append("raw_base_url이 비어 있음")
             if problems:
                 checks.append({"name": "update_manifest", "ok": False,
-                               "detail": "; ".join(problems[:4])})
+                               "detail": "; ".join(problems[:4]),
+                               "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
+            elif m_version_key_missing:
+                checks.append({"name": "update_manifest", "ok": True, "warn": True,
+                               "detail": "provider/files %d개/raw_base_url/version_file 확인 — version_key 미선언 (권장)" % len(manifest_files),
+                               "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
             else:
                 checks.append({"name": "update_manifest", "ok": True,
-                               "detail": "provider/files %d개/raw_base_url/version_file/version_key 확인" % len(manifest_files)})
+                               "detail": "provider/files %d개/raw_base_url/version_file/version_key 확인" % len(manifest_files),
+                               "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
         else:
             checks.append({"name": "update_manifest", "ok": True,
-                           "detail": "미선언 (업데이트 미지원)"})
+                           "detail": "미선언 (업데이트 미지원)",
+                           "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
 
         # 9. UI 번들 검사 (category_tab 선언 시 index.html/script.js/style.css 필수)
         ui_files = {f: os.path.isfile(os.path.join(plugin_dir, f))
@@ -1396,18 +1469,56 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             missing_ui = [f for f, ok in ui_files.items() if not ok]
             if missing_ui:
                 checks.append({"name": "UI 번들", "ok": False,
-                               "detail": "category_tab 선언 시 필수: " + ", ".join(missing_ui)})
+                               "detail": "category_tab 선언 시 필수: " + ", ".join(missing_ui),
+                               "guide_ref": "가이드 §2 디렉토리 구조 (index.html/script.js/style.css)"})
             else:
-                checks.append({"name": "UI 번들", "ok": True, "detail": "index/script/style 확인"})
+                checks.append({"name": "UI 번들", "ok": True, "detail": "index/script/style 확인",
+                               "guide_ref": "가이드 §2 디렉토리 구조 (index.html/script.js/style.css)"})
         else:
             present_ui = [f for f, ok in ui_files.items() if ok]
             if present_ui and len(present_ui) < 3:
                 checks.append({"name": "UI 번들", "ok": True, "warn": True,
-                               "detail": "경고: UI 파일 일부만 존재 (" + ", ".join(present_ui) + ")"})
+                               "detail": "경고: UI 파일 일부만 존재 (" + ", ".join(present_ui) + ")",
+                               "guide_ref": "가이드 §2 디렉토리 구조 (index.html/script.js/style.css)"})
             elif present_ui:
-                checks.append({"name": "UI 번들", "ok": True, "detail": "UI 번들 확인"})
+                checks.append({"name": "UI 번들", "ok": True, "detail": "UI 번들 확인",
+                               "guide_ref": "가이드 §2 디렉토리 구조 (index.html/script.js/style.css)"})
             else:
-                checks.append({"name": "UI 번들", "ok": True, "detail": "미선언"})
+                checks.append({"name": "UI 번들", "ok": True, "detail": "미선언",
+                               "guide_ref": "가이드 §2 디렉토리 구조 (index.html/script.js/style.css)"})
+
+        # 10. requirements.txt 격리 규정 검사 (가이드 2장 60~61행: libs/ 격리 + 코어 라이브러리 보호)
+        req_path = os.path.join(plugin_dir, "requirements.txt")
+        req_danger = []
+        req_lines = []
+        if os.path.isfile(req_path):
+            try:
+                with open(req_path, "r", encoding="utf-8", errors="replace") as f:
+                    req_lines = [ln.strip() for ln in f
+                                 if ln.strip() and not ln.strip().startswith("#")]
+                core_protected = ("flask", "pymupdf", "fitz", "pillow", "pil",
+                                  "sqlalchemy", "werkzeug", "jinja2")
+                for ln in req_lines:
+                    # 패키지명 추출 (==, >=, <=, ~=, !=, 공백 구분자)
+                    pkg = ln.split("=")[0].split(">")[0].split("<")[0].split("~")[0].split("!")[0].strip()
+                    pkg_l = pkg.lower().replace("_", "-").replace(".", "-")
+                    if pkg_l in core_protected or pkg_l.split("-")[0] in core_protected:
+                        req_danger.append(pkg or ln)
+            except Exception:
+                req_danger = []
+            if req_danger:
+                checks.append({"name": "requirements.txt 격리", "ok": False,
+                               "detail": "코어 보호 패키지 덮어쓰기 위험: "
+                                         + ", ".join(sorted(set(req_danger))[:4]),
+                               "guide_ref": "가이드 §2.1 보안 제약 (패키지 격리 — 코어 라이브러리 보호)"})
+            else:
+                checks.append({"name": "requirements.txt 격리", "ok": True,
+                               "detail": "코어 보호 패키지 충돌 없음 (%d개 패키지)" % len(req_lines),
+                               "guide_ref": "가이드 §2.1 보안 제약 (패키지 격리 — 코어 라이브러리 보호)"})
+        else:
+            checks.append({"name": "requirements.txt 격리", "ok": True,
+                           "detail": "미존재 (격리 대상 없음)",
+                           "guide_ref": "가이드 §2.1 보안 제약 (패키지 격리 — 코어 라이브러리 보호)"})
 
         all_ok = all(c.get("ok") for c in checks)
         return all_ok, checks
@@ -2190,7 +2301,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "카탈로그 갱신 시작 실패: {0}".format(e)
 
     def _catalog_background_loop(self, db_type):
-        """백그라운드 갱신 루프 (daemon). 빈 DB면 즉시 1회, 이후 간격(설정 재조회)만큼 sleep 후 갱신."""
+        """백그라운드 갱신 루프 (daemon). 빈 DB면 즉시 1회, 이후 간격(설정 재조회)만큼 sleep 후 갱신.
+        사망 복구: 루프가 어떤 예외로든 종료되면 _CATALOG_THREAD_ALIVE를 False로 리셋 —
+        다음 _ensure_catalog_thread 호출에서 is_alive()가 False임을 확인하고 재시작한다.
+        """
+        global _CATALOG_THREAD_ALIVE
         try:
             self._catalog_init_db()
             rows = self._catalog_db_query("SELECT COUNT(*) AS c FROM repos")
@@ -2198,32 +2313,44 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 self._catalog_refresh_once(db_type)
         except Exception:
             pass
-        while True:
-            try:
-                interval = self._catalog_get_interval_hours(db_type)
-            except Exception:
-                interval = _CATALOG_DEFAULT_INTERVAL_HOURS
-            time.sleep(max(60, interval * 3600))
-            try:
-                self._catalog_refresh_once(db_type)
-            except Exception:
-                pass  # refresh_once가 error 상태 기록, 다음 주기 재시도
+        try:
+            while True:
+                try:
+                    interval = self._catalog_get_interval_hours(db_type)
+                except Exception:
+                    interval = _CATALOG_DEFAULT_INTERVAL_HOURS
+                time.sleep(max(60, interval * 3600))
+                try:
+                    self._catalog_refresh_once(db_type)
+                except Exception:
+                    pass  # refresh_once가 error 상태 기록, 다음 주기 재시도
+        finally:
+            _CATALOG_THREAD_ALIVE = False  # 루프 종료(사망) 시 재시작 가능하도록 리셋
+
+    def _catalog_thread_is_alive(self):
+        """백그라운드 스레드 실제 생존 여부 (전역 참조 스레드의 is_alive)"""
+        global _CATALOG_THREAD
+        t = _CATALOG_THREAD
+        return bool(t is not None and t.is_alive())
 
     def _ensure_catalog_thread(self, db_type):
-        """첫 get_dashboard_data 호출 시 1회 시작 (모듈 레벨 플래그 + Lock — gunicorn 1워커 전제)"""
-        global _CATALOG_THREAD_STARTED
+        """백그라운드 갱신 스레드 보장 — 살아있으면 no-op, 죽었으면(사망/미기동) 재시작.
+        사망 시 _CATALOG_THREAD_ALIVE=False 리셋으로 재시작 가능 (플래그 잔존 버그 제거).
+        """
+        global _CATALOG_THREAD, _CATALOG_THREAD_ALIVE
         with _CATALOG_THREAD_LOCK:
-            if _CATALOG_THREAD_STARTED:
+            if self._catalog_thread_is_alive():
                 return
-            _CATALOG_THREAD_STARTED = True
+            _CATALOG_THREAD_ALIVE = True
         try:
             t = threading.Thread(
                 target=self._catalog_background_loop, args=(db_type,),
                 daemon=True, name="pm-catalog-refresh",
             )
+            _CATALOG_THREAD = t
             t.start()
         except Exception:
-            _CATALOG_THREAD_STARTED = False
+            _CATALOG_THREAD_ALIVE = False
 
     # ---- 응답 병합 ----
 
@@ -2236,7 +2363,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "topics": self._catalog_get_topics(db_type),
             "refresh_state": meta.get("refresh_state", "idle"),
             "refresh_error": meta.get("refresh_error") or None,
+            "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
         }
+
+    def _catalog_get_allow_invalid_install(self, db_type):
+        """검증 실패 플러그인 설치 허용 설정 (기본 OFF — 미설정이면 안전 기본값)"""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_ALLOW_INVALID_INSTALL", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            return False
 
     def _catalog_list_valid_repos(self):
         """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순)"""
@@ -2319,9 +2458,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             topics = self._catalog_normalize_topics(item_data.get("topics"))
             gateway.set_setting("PM_CATALOG_TOPICS", ",".join(topics))
 
+            allow_raw = item_data.get("allow_invalid_install")
+            if allow_raw is None or str(allow_raw).strip() == "":
+                allow_val = self._catalog_get_allow_invalid_install(db_type)
+            else:
+                allow_val = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
+            gateway.set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
+
             return True, (
-                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개 — 다음 갱신 주기부터 적용)"
-            ).format(interval, len(topics))
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2} — 다음 갱신 주기부터 적용)"
+            ).format(interval, len(topics), "허용" if allow_val else "차단")
         except Exception as e:
             return False, "설정 저장 실패: {0}".format(e)
 

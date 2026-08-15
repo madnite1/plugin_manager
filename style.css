@@ -36,12 +36,12 @@
     width: 52px;
     height: 52px;
     border-radius: 14px;
-    background: linear-gradient(135deg, var(--app-accent, #6366f1), #8b5cf6);
+    background: linear-gradient(135deg, var(--app-accent, #6366f1), var(--app-accent-hover, #8b5cf6));
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 1.6rem;
-    color: #ffffff;
+    color: var(--app-text-primary, #ffffff);
     box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
 }
 
@@ -87,7 +87,7 @@
 
 .pm-btn-primary {
     background: var(--app-accent, #6366f1);
-    color: #ffffff;
+    color: var(--app-text-primary, #ffffff);
 }
 
 .pm-btn-primary:hover:not(:disabled) {
@@ -107,7 +107,7 @@
 
 .pm-btn-accent {
     background: linear-gradient(135deg, #10b981, #059669);
-    color: #ffffff;
+    color: var(--app-text-primary, #ffffff);
     box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
 }
 
@@ -117,7 +117,7 @@
 
 .pm-btn-danger {
     background: #ef4444;
-    color: #ffffff;
+    color: var(--app-text-primary, #ffffff);
 }
 
 .pm-btn-danger:hover:not(:disabled) {
@@ -128,6 +128,26 @@
     padding: 0.4rem 0.75rem;
     font-size: 0.82rem;
     border-radius: 6px;
+}
+
+/* 업데이트 버튼 (경고/강조) — 테마 CSS 변수 사용 */
+.pm-btn-warning {
+    background: var(--app-accent, #6366f1);
+    color: var(--app-text-primary, #ffffff);
+    border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15));
+    font-size: 0.76rem;
+    padding: 0.35rem 0.65rem;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.pm-btn-warning:hover:not(:disabled) {
+    background: var(--app-accent-hover, #4f46e5);
+    transform: translateY(-1px);
 }
 
 /* 아이콘 전용 버튼 (플러그인 카드 우상단 톱니바퀴 등) */
@@ -155,7 +175,7 @@
     animation: pmFadeIn 0.3s ease;
     background: rgba(99, 102, 241, 0.15);
     border: 1px solid rgba(99, 102, 241, 0.4);
-    color: #818cf8;
+    color: var(--app-accent, #818cf8);
 }
 
 .pm-alert.pm-alert-success {
@@ -316,7 +336,7 @@
 
 .pm-tab-btn.active {
     background: var(--app-accent, #6366f1);
-    color: #ffffff;
+    color: var(--app-text-primary, #ffffff);
 }
 
 .pm-count-badge {
@@ -456,7 +476,7 @@
 }
 
 .pm-status-dot.disabled {
-    color: #64748b;
+    color: var(--app-text-muted, #64748b);
     opacity: 0.6;
 }
 
@@ -468,13 +488,13 @@
 
 .pm-badge-local {
     background: rgba(148, 163, 184, 0.15);
-    color: #cbd5e1;
+    color: var(--app-text-secondary, #cbd5e1);
     border: 1px solid rgba(148, 163, 184, 0.3);
 }
 
 .pm-badge-git {
     background: rgba(110, 84, 148, 0.18);
-    color: #c4b5fd;
+    color: var(--app-accent, #c4b5fd);
     border: 1px solid rgba(110, 84, 148, 0.4);
     text-decoration: none;
     cursor: pointer;
@@ -483,18 +503,18 @@
 
 .pm-badge-git:hover {
     background: rgba(110, 84, 148, 0.32);
-    color: #ddd6fe;
+    color: var(--app-accent, #ddd6fe);
 }
 
 .pm-badge-system {
     background: rgba(99, 102, 241, 0.15);
-    color: #818cf8;
+    color: var(--app-accent, #818cf8);
     border: 1px solid rgba(99, 102, 241, 0.3);
 }
 
 .pm-badge-feature {
     background: rgba(168, 85, 247, 0.15);
-    color: #c084fc;
+    color: var(--app-accent, #c084fc);
     border: 1px solid rgba(168, 85, 247, 0.3);
 }
 
@@ -562,7 +582,7 @@
     position: absolute;
     cursor: pointer;
     top: 0; left: 0; right: 0; bottom: 0;
-    background-color: #475569;
+    background-color: var(--app-text-muted, #475569);
     transition: .3s;
     border-radius: 24px;
 }
@@ -839,7 +859,7 @@ input:checked + .pm-slider:before {
 }
 
 .pm-catalog-status-running {
-    color: #818cf8;
+    color: var(--app-accent, #818cf8);
     border-color: rgba(129, 140, 248, 0.4);
     background: rgba(99, 102, 241, 0.12);
 }
@@ -879,7 +899,7 @@ input:checked + .pm-slider:before {
 
 .pm-badge-uninstalled {
     background: rgba(139, 92, 246, 0.18);
-    color: #a78bfa;
+    color: var(--app-accent, #a78bfa);
     border: 1px solid rgba(139, 92, 246, 0.4);
 }
 
@@ -914,7 +934,7 @@ input:checked + .pm-slider:before {
 }
 
 .pm-catalog-meta a {
-    color: #a78bfa;
+    color: var(--app-accent, #a78bfa);
     text-decoration: none;
     display: inline-flex;
     align-items: center;
@@ -947,7 +967,7 @@ input:checked + .pm-slider:before {
     right: 0.9rem;
     bottom: 0.9rem;
     z-index: 30;
-    background: #0f172a;
+    background: var(--app-bg-main, #0f172a);
     border: 1px solid rgba(239, 68, 68, 0.55);
     border-radius: 10px;
     padding: 0.7rem 0.85rem;
@@ -973,7 +993,7 @@ input:checked + .pm-slider:before {
     font-family: inherit;
     font-size: 0.72rem;
     line-height: 1.5;
-    color: #e2e8f0;
+    color: var(--app-text-primary, #e2e8f0);
     white-space: pre-wrap;
     word-break: break-all;
     max-height: 160px;

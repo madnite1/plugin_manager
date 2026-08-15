@@ -38,7 +38,7 @@
             <div class="pm-card pm-install-card">
                 <div class="pm-card-header">
                     <h3 class="pm-card-title">
-                        <i class="fa-solid fa-file-zipper" style="color: #f59e0b;"></i> ZIP 파일 업로드 설치
+                        <i class="fa-solid fa-file-zipper" style="color: var(--app-accent, #f59e0b);"></i> ZIP 파일 업로드 설치
                     </h3>
                     <span class="pm-badge pm-badge-info">ZIP 업로드</span>
                 </div>
@@ -62,7 +62,7 @@
             <div class="pm-card pm-install-card">
                 <div class="pm-card-header">
                     <h3 class="pm-card-title">
-                        <i class="fa-brands fa-github" style="color: #8b5cf6;"></i> Git 저장소 URL 설치
+                        <i class="fa-brands fa-github" style="color: var(--app-accent, #8b5cf6);"></i> Git 저장소 URL 설치
                     </h3>
                     <span class="pm-badge pm-badge-feature">GIT 설치</span>
                 </div>
@@ -122,6 +122,29 @@
             <button id="pm-modal-cancel-btn" class="pm-btn pm-btn-secondary">취소</button>
             <button id="pm-modal-confirm-delete-btn" class="pm-btn pm-btn-danger">
                 <i class="fa-solid fa-trash-can"></i> 영구 삭제
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Validation Failed Confirm Modal — 검증 실패 시 계속 설치 확인 -->
+<div id="pm-validation-modal" class="pm-modal-overlay" style="display: none;">
+    <div class="pm-modal">
+        <div class="pm-modal-header">
+            <h3><i class="fa-solid fa-shield-halved pm-text-warning"></i> 플러그인 검증 실패</h3>
+            <button class="pm-modal-close" id="pm-validation-close-btn">&times;</button>
+        </div>
+        <div class="pm-modal-body" id="pm-validation-body">
+            <p style="color: var(--app-text-warning, #f59e0b); margin: 0 0 10px 0; font-size: 0.85rem;">
+                <i class="fa-solid fa-triangle-exclamation"></i> 아래 가이드 규정 위반 항목을 확인하세요:
+            </p>
+            <div id="pm-validation-details" style="max-height: 240px; overflow-y: auto; text-align: left; font-size: 0.82rem; line-height: 1.55; background: rgba(15,23,42,0.4); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 10px 12px;"></div>
+            <p class="pm-modal-subtext" style="margin-top: 10px;">계속 설치하면 위 규정을 위반한 플러그인이 설치됩니다. 가이드(guide_plugins.md)의 해당 섹션을 확인하세요.</p>
+        </div>
+        <div class="pm-modal-footer">
+            <button id="pm-validation-cancel-btn" class="pm-btn pm-btn-secondary">취소</button>
+            <button id="pm-validation-confirm-btn" class="pm-btn pm-btn-danger">
+                <i class="fa-solid fa-triangle-exclamation"></i> 계속 설치 (위험)
             </button>
         </div>
     </div>

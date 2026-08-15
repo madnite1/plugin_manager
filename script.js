@@ -50,7 +50,79 @@
                 source: 'plugin_manager',
                 item_data: actionData
             })
-        }).then(res => res.json());
+        }).then(res => res.json()).then(async data => {
+            // 검증 실패 응답 감지 — 가이드 위반 항목 안내 후 사용자 확인 → force 재시도
+            if (data && data.success === false && data.error && data.error.indexOf('__VALIDATION_FAILED__') !== -1) {
+                const marker = '__VALIDATION_FAILED__';
+                const idx = data.error.indexOf(marker);
+                const humanMsg = data.error.substring(0, idx).trim();
+                let payload = null;
+                try {
+                    payload = JSON.parse(data.error.substring(idx + marker.length));
+                } catch (e) { payload = null; }
+
+                let detailHtml = '<div style="max-height:260px;overflow-y:auto;text-align:left;font-size:0.82rem;line-height:1.5;">';
+                detailHtml += '<p style="margin:0 0 8px 0;color:#f87171;">검증 실패 항목:</p>';
+                detailHtml += '<ul style="margin:0 0 8px 0;padding-left:18px;">';
+                if (payload && Array.isArray(payload.checks)) {
+                    payload.checks.forEach(c => {
+                        detailHtml += '<li><b>' + (c.name || '') + '</b>: ' + (c.detail || '') +
+                            (c.guide_ref ? '<br><span style="color:#94a3b8;font-size:0.75rem;">↳ ' + c.guide_ref + '</span>' : '') + '</li>';
+                    });
+                }
+                detailHtml += '</ul>';
+                if (payload && Array.isArray(payload.guide_refs) && payload.guide_refs.length) {
+                    detailHtml += '<p style="margin:0;color:#94a3b8;font-size:0.75rem;">참조: ' + payload.guide_refs.join(' / ') + '</p>';
+                }
+                detailHtml += '</div>';
+
+                // 설정 OFF → 즉시 차단 (confirm 없이 안내만)
+                if (!payload || !payload.allow_invalid_install) {
+                    showAlert(humanMsg || '플러그인 검증 실패', true);
+                    return { success: false, error: humanMsg || '플러그인 검증 실패', blocked: true };
+                }
+
+                const userOk = await new Promise(resolve => {
+                    // 커스텀 확인 모달 표시 — 위반 항목 + 가이드 참조 렌더링
+                    const detailsEl = document.getElementById('pm-validation-details');
+                    if (detailsEl) detailsEl.innerHTML = detailHtml;
+                    const modal = document.getElementById('pm-validation-modal');
+                    if (!modal) { resolve(false); return; }
+                    const confirmBtn = document.getElementById('pm-validation-confirm-btn');
+                    const cancelBtn = document.getElementById('pm-validation-cancel-btn');
+                    const closeBtn = document.getElementById('pm-validation-close-btn');
+                    modal.style.display = 'flex';
+
+                    const cleanup = (result) => {
+                        modal.style.display = 'none';
+                        confirmBtn.removeEventListener('click', onConfirm);
+                        cancelBtn.removeEventListener('click', onCancel);
+                        closeBtn.removeEventListener('click', onCancel);
+                        resolve(result);
+                    };
+                    const onConfirm = () => cleanup(true);
+                    const onCancel = () => cleanup(false);
+                    confirmBtn.addEventListener('click', onConfirm);
+                    cancelBtn.addEventListener('click', onCancel);
+                    if (closeBtn) closeBtn.addEventListener('click', onCancel);
+                });
+                if (!userOk) {
+                    return { success: false, error: '설치가 취소되었습니다.', cancelled: true };
+                }
+                // force 재시도 — 원본 요청에 force=1 추가
+                const forcedData = Object.assign({}, actionData, { force: true });
+                return fetch('/api/media/books/0/apply-metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'general',
+                        source: 'plugin_manager',
+                        item_data: forcedData
+                    })
+                }).then(res => res.json());
+            }
+            return data;
+        });
     }
 
     // 플러그인 목록 조회
@@ -275,7 +347,7 @@
         const actions = card.querySelector('.pm-card-action-btns');
         if (!actions || actions.querySelector('.pm-btn-update')) return;
 
-        const btnHtml = `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtml(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(latestVersion)})" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.45); font-size: 0.76rem; padding: 0.35rem 0.65rem; border-radius: 6px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.3rem;">
+        const btnHtml = `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(latestVersion)})">
             <i class="fa-solid fa-arrow-up-from-bracket"></i> v${escapeHtml(latestVersion)}
            </button>`;
         actions.insertAdjacentHTML('afterbegin', btnHtml);
@@ -468,7 +540,7 @@
                 : '';
 
             const updateBtnHtml = (p.has_update && (p.has_update_manifest || !p.is_system))
-                ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${p.name}" title="최신 버전으로 업데이트 (v${p.latest_version})" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.45); font-size: 0.76rem; padding: 0.35rem 0.65rem; border-radius: 6px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.3rem;">
+                ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(p.latest_version)})">
                     <i class="fa-solid fa-arrow-up-from-bracket"></i> v${escapeHtml(p.latest_version)}
                    </button>`
                 : '';
@@ -696,7 +768,7 @@
             }
 
         } catch (err) {
-            bodyEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: #ef4444;"><i class="fa-solid fa-triangle-exclamation fa-2x"></i><p style="margin-top: 0.8rem;">${err.message}</p></div>`;
+            bodyEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: #ef4444;"><i class="fa-solid fa-triangle-exclamation fa-2x"></i><p style="margin-top: 0.8rem;">${escapeHtml(err.message)}</p></div>`;
         }
     }
 
@@ -721,7 +793,7 @@
             return `
                 <div style="display: flex; flex-direction: column; gap: 0.3rem;">
                     <label style="font-weight: 600; color: var(--app-text-primary, #fff); font-size: 0.88rem;">
-                        ${label} ${required ? '<span style="color:#f43f5e;">*</span>' : ''}
+                        ${label} ${required ? '<span style="color: #f43f5e;">*</span>' : ''}
                     </label>
                     <label style="display:flex; align-items:center; gap:0.5rem; color: var(--app-text-secondary, #cbd5e1); cursor: pointer;">
                         <input type="checkbox" name="${key}" ${checked ? 'checked' : ''} style="width: 16px; height: 16px;">
@@ -738,9 +810,9 @@
             return `
                 <div style="display: flex; flex-direction: column; gap: 0.3rem;">
                     <label style="font-weight: 600; color: var(--app-text-primary, #fff); font-size: 0.88rem;">
-                        ${label} ${required ? '<span style="color:#f43f5e;">*</span>' : ''}
+                        ${label} ${required ? '<span style="color: #f43f5e;">*</span>' : ''}
                     </label>
-                    <select name="${key}" style="width: 100%; padding: 0.5rem; border-radius: 6px; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.15); color: #fff; font-size: 0.88rem;">
+                    <select name="${key}" style="width: 100%; padding: 0.5rem; border-radius: 6px; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); font-size: 0.88rem;">
                         ${options.map(opt => {
                             const val = typeof opt === 'object' ? opt.value : opt;
                             const name = typeof opt === 'object' ? opt.label : opt;
@@ -757,9 +829,9 @@
         return `
             <div style="display: flex; flex-direction: column; gap: 0.3rem;">
                 <label style="font-weight: 600; color: var(--app-text-primary, #fff); font-size: 0.88rem;">
-                    ${label} ${required ? '<span style="color:#f43f5e;">*</span>' : ''}
-                </label>
-                <input type="${type === 'password' ? 'password' : 'text'}" name="${key}" value="${val}" style="width: 100%; padding: 0.5rem 0.8rem; border-radius: 6px; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.15); color: #fff; font-size: 0.88rem;" />
+                    ${label} ${required ? '<span style="color: #f43f5e;">*</span>' : ''}
+                    </label>
+                    <input type="${type === 'password' ? 'password' : 'text'}" name="${key}" value="${val}" style="width: 100%; padding: 0.5rem 0.8rem; border-radius: 6px; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); font-size: 0.88rem;" />
                 ${descHtml}
             </div>
         `;
@@ -782,6 +854,7 @@
 
         const intervalInput = document.getElementById('pm-catalog-interval');
         const topicsInput = document.getElementById('pm-catalog-topics');
+        const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
         const rawTopics = topicsInput ? topicsInput.value : '';
@@ -806,7 +879,8 @@
                 body: JSON.stringify({
                     type: 'general',
                     refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
-                    topics: topicsInput ? topicsInput.value.trim() : ''
+                    topics: topicsInput ? topicsInput.value.trim() : '',
+                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false
                 })
             });
             const data = await res.json();
