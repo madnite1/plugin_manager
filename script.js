@@ -598,6 +598,18 @@
                             ${deleteBtnHtml}
                         </div>
                     </div>
+                    ${p.is_category && p.category_vis && catalogMeta && catalogMeta.category_vis_enabled ? `
+                    <div class="pm-category-vis-row" data-id="${p.id}">
+                        <div class="pm-category-vis-label">표시 대상</div>
+                        <div class="pm-category-vis-checks">
+                            <label class="pm-cvis-check"><input type="checkbox" class="pm-cvis-input" data-lib="general" ${p.category_vis.general === 1 ? 'checked' : ''}> 일반</label>
+                            <label class="pm-cvis-check"><input type="checkbox" class="pm-cvis-input" data-lib="adult" ${p.category_vis.adult === 1 ? 'checked' : ''}> 성인</label>
+                            <label class="pm-cvis-check"><input type="checkbox" class="pm-cvis-input" data-lib="audiobook" ${p.category_vis.audiobook === 1 ? 'checked' : ''}> 오디오북</label>
+                        </div>
+                        <button class="pm-btn pm-btn-secondary pm-btn-sm pm-cvis-save" data-id="${p.id}">저장</button>
+                        <span class="pm-cvis-status"></span>
+                    </div>
+                    ` : ''}
                 </div>
             `;
         });
@@ -640,6 +652,58 @@
 
         // Update Button
         document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
+
+        // Category Visibility Save Button
+        document.querySelectorAll('.pm-cvis-save').forEach(btn => {
+            btn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                const pluginId = this.getAttribute('data-id');
+                const row = this.closest('.pm-category-vis-row');
+                if (!row) return;
+
+                const vis = { plugin_id: pluginId };
+                row.querySelectorAll('.pm-cvis-input').forEach(cb => {
+                    vis[cb.getAttribute('data-lib')] = cb.checked ? 1 : 0;
+                });
+
+                const statusEl = row.querySelector('.pm-cvis-status');
+                if (statusEl) {
+                    statusEl.textContent = '저장 중...';
+                    statusEl.className = 'pm-cvis-status pm-cvis-pending';
+                }
+
+                callPluginAction({ action: 'save_category_vis', plugin_id: pluginId, general: vis.general, adult: vis.adult, audiobook: vis.audiobook })
+                    .then(res => {
+                        if (res.success) {
+                            if (statusEl) {
+                                statusEl.textContent = '✓ 저장됨';
+                                statusEl.className = 'pm-cvis-status pm-cvis-ok';
+                            }
+                            showAlert(res.message || '저장되었습니다.');
+                            // 현재 탭이 카테고리 뷰라면 즉시 반영
+                            if (typeof window.invalidateMetadataPluginsCache === 'function') {
+                                window.invalidateMetadataPluginsCache();
+                            }
+                            if (typeof window.loadLibraries === 'function') {
+                                window.loadLibraries();
+                            }
+                        } else {
+                            if (statusEl) {
+                                statusEl.textContent = '✗ ' + (res.error || '저장 실패');
+                                statusEl.className = 'pm-cvis-status pm-cvis-error';
+                            }
+                            showAlert(res.error || '저장 실패', true);
+                        }
+                    })
+                    .catch(err => {
+                        if (statusEl) {
+                            statusEl.textContent = '✗ 통신 오류';
+                            statusEl.className = 'pm-cvis-status pm-cvis-error';
+                        }
+                        showAlert('통신 오류: ' + err.message, true);
+                    });
+            });
+        });
 
         // Catalog Install Button (미설치 카드)
         document.querySelectorAll('.pm-btn-install').forEach(bindInstallButton);
@@ -855,6 +919,7 @@
         const intervalInput = document.getElementById('pm-catalog-interval');
         const topicsInput = document.getElementById('pm-catalog-topics');
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
+        const cvisEnabledInput = document.getElementById('pm-cvis-enabled');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
         const rawTopics = topicsInput ? topicsInput.value : '';
@@ -880,7 +945,8 @@
                     type: 'general',
                     refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
                     topics: topicsInput ? topicsInput.value.trim() : '',
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false
+                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                    category_vis_enabled: cvisEnabledInput ? cvisEnabledInput.checked : false
                 })
             });
             const data = await res.json();

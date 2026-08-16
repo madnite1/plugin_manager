@@ -13,6 +13,7 @@
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
+    const cvisEnabledInput = root.querySelector('#pm-cvis-enabled');
 
     // 초기값 로드 — /data 응답의 catalog_meta (간격/토픽은 MariaDB 설정)
     async function loadInitial() {
@@ -29,6 +30,9 @@
             }
             if (allowInvalidInput) {
                 allowInvalidInput.checked = !!meta.allow_invalid_install;
+            }
+            if (cvisEnabledInput) {
+                cvisEnabledInput.checked = !!meta.category_vis_enabled;
             }
         } catch(e) {
             // 초기값 로드 실패 — 기본값 유지

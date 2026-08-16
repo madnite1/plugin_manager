@@ -564,6 +564,54 @@
     font-weight: 600;
 }
 
+/* Category View Visibility Row (표시 대상: 일반/성인/오디오북) */
+.pm-category-vis-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-top: 0.7rem;
+    margin-top: 0.7rem;
+    border-top: 1px dashed var(--app-border-light, rgba(255, 255, 255, 0.08));
+    font-size: 0.8rem;
+}
+
+.pm-category-vis-label {
+    font-weight: 700;
+    color: var(--app-text-muted, #94a3b8);
+    white-space: nowrap;
+}
+
+.pm-category-vis-checks {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+}
+
+.pm-cvis-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    cursor: pointer;
+    user-select: none;
+    color: var(--app-text, #e2e8f0);
+}
+
+.pm-cvis-check input[type="checkbox"] {
+    accent-color: var(--app-accent, #6366f1);
+    cursor: pointer;
+}
+
+.pm-cvis-status {
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.pm-cvis-status.pm-cvis-ok { color: #34d399; }
+.pm-cvis-status.pm-cvis-error { color: #f87171; }
+.pm-cvis-status.pm-cvis-pending { color: #fbbf24; }
+
 /* Switch Toggle Component */
 .pm-switch {
     position: relative;
