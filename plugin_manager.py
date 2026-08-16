@@ -852,11 +852,37 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             # 4. update_manifest.files 추출 + 플러그인 ID 감지
             manifest_files, manifest = self._extract_update_manifest_files(target_plugin_dir)
-            if not manifest_files:
-                return False, (
-                    "다운로드된 저장소에서 update_manifest.files 목록을 찾을 수 없습니다. "
-                    "Git URL 설치는 update_manifest 를 선언한 플러그인만 지원합니다."
-                )
+            has_manifest = bool(manifest_files)
+            manifest_files = manifest_files or []  # 폴백 진행 시 None 방지
+            if not has_manifest:
+                # update_manifest 없는 저장소 → "검증 실패시 설치 가능" 옵션 게이트
+                # (구조 실패가 아닌 옵션 우회 구간으로 취급 — ON 시에만 폴백 진행)
+                allow_invalid = self._catalog_get_allow_invalid_install(db_type)
+                if not allow_invalid:
+                    return False, (
+                        "다운로드된 저장소에서 update_manifest 를 찾을 수 없습니다. "
+                        "이 저장소는 자동 업데이트 계약(update_manifest)이 없는 저장소입니다. "
+                        "설치하려면 플러그인 매니저 설정에서 '검증 실패시 설치 가능'을 켠 후 다시 시도하세요."
+                    )
+                if not force:
+                    # 옵션 ON + 최초 시도 → 프론트 confirm 유도 (기존 __VALIDATION_FAILED__ 마커 재사용)
+                    import json as _json
+                    return False, (
+                        "이 저장소는 update_manifest 가 없어 자동 업데이트가 불가합니다. "
+                        "그래도 설치할까요? (전체 파일이 플러그인 폴더로 복사됩니다)\n"
+                        "__VALIDATION_FAILED__" + _json.dumps({
+                            "validation_failed": True,
+                            "allow_invalid_install": True,
+                            "checks": [{
+                                "name": "update_manifest 선언",
+                                "ok": False,
+                                "detail": "update_manifest 가 없습니다. 업데이트/배지가 비활성화됩니다.",
+                                "guide_ref": "§3.1",
+                            }],
+                            "guide_refs": ["§3.1"],
+                        }, ensure_ascii=False)
+                    )
+                # force=True (사용자 confirm 통과) → 아래 폴백 경로로 진행 (전체 복사 설치)
             plugin_id = self._detect_plugin_id(target_plugin_dir)
             if not plugin_id:
                 return False, "플러그인 ID를 식별할 수 없습니다. (BaseMetadataProvider 클래스 또는 VERSION 파일 필요)"
@@ -871,11 +897,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if err or not dest_dir:
                 return False, err or "유효하지 않은 플러그인 경로입니다."
 
-            # 5. files 목록 경로 안전성 검증 (경로 이탈 차단)
+            # 5. files 목록 경로 안전성 검증 (경로 이탈 차단 — manifest 있을 때만)
             for rel in manifest_files:
                 rel_clean = os.path.normpath(str(rel))
                 if (rel_clean.startswith("..") or rel_clean.startswith("/")
-                        or rel_clean.startswith("\\\\") or rel_clean in (".", "")):
+                        or rel_clean.startswith("\\") or rel_clean in (".", "")):
                     return False, f"update_manifest 에 유효하지 않은 파일 경로가 포함되어 있습니다: {rel}"
 
             # 5-1. 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔, zip 설치와 동일 기준)
@@ -884,16 +910,26 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not source_ok and not force:
                 return self._validation_fail_response(source_checks, db_type)
 
-            # 6. manifest 목록 외 전부 삭제 (.git 등 포함 안전 처리)
-            try:
-                self._prune_plugin_dir(target_plugin_dir, manifest_files)
-            except Exception as e:
-                return False, f"플러그인 파일 정리 중 오류가 발생했습니다: {str(e)}"
+            # 6. manifest 있을 때만 목록 외 전부 삭제 (.git 등 포함 안전 처리)
+            #    manifest 없음(폴백) → 전체 복사, prune 스킵 (빈 목록이면 전부 삭제 위험)
+            if has_manifest:
+                try:
+                    self._prune_plugin_dir(target_plugin_dir, manifest_files)
+                except Exception as e:
+                    return False, f"플러그인 파일 정리 중 오류가 발생했습니다: {str(e)}"
 
-            # 7. 이전 디렉토리 교체 후 복사
+            # 7. 이전 디렉토리 교체 후 복사 (manifest 없음 → ZIP 방식 ignore 패턴으로 전체 복사)
             if os.path.exists(dest_dir):
                 shutil.rmtree(dest_dir)
-            shutil.copytree(target_plugin_dir, dest_dir)
+            if has_manifest:
+                shutil.copytree(target_plugin_dir, dest_dir)
+            else:
+                shutil.copytree(
+                    target_plugin_dir, dest_dir,
+                    ignore=shutil.ignore_patterns(
+                        ".git", ".github", "__pycache__", "*.pyc", "__MACOSX", ".DS_Store"
+                    )
+                )
 
             # 8. Git 소스 메타 정보 저장 (sqlite plugin_sources — .git_source 파일 미생성)
             git_source_info = {
@@ -936,8 +972,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
             result_msg = (
                 f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
-                f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지, 검증 통과: {', '.join(passed)})"
             )
+            if has_manifest:
+                result_msg += (
+                    f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지, 검증 통과: {', '.join(passed)})"
+                )
+            else:
+                result_msg += (
+                    "(update_manifest 가 없는 저장소 — 전체 파일이 복사되었으며, 자동 업데이트/업데이트 버튼이 비활성화됩니다)"
+                )
             if force:
                 result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
