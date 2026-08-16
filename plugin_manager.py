@@ -51,6 +51,9 @@ _CATALOG_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # VERSION 재검증 TTL: 저장소가 20개를 넘어가면 24시간 이내 검증 결과 재사용
 _CATALOG_VERIFY_MAX_REPOS = 20
 _CATALOG_VERIFY_TTL_SECONDS = 24 * 3600
+# 갱신 실패 후 재시도 쿨다운 — rate limit(403) 등으로 실패 시 60초마다 재시도하면
+# 오히려 제한이 풀리지 않아 악순환됨. 실패하면 최소 이 시간(초) 뒤에야 재시도.
+_CATALOG_RETRY_COOLDOWN_SECONDS = 10 * 60
 
 
 class PluginManagerMetadataProvider(BaseMetadataProvider):
@@ -2418,8 +2421,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         rows_to_check.append(r)
                         continue
                     try:
-                        parsed = datetime.fromisoformat(str(r["last_checked"]))
-                        if (datetime.now() - parsed).total_seconds() >= _CATALOG_VERIFY_TTL_SECONDS:
+                        # Python 3.10 이하 fromisoformat은 'Z' 미지원 → +00:00 치환, naive면 UTC 부여
+                        parsed = datetime.fromisoformat(
+                            str(r["last_checked"]).replace("Z", "+00:00")
+                        )
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - parsed).total_seconds() >= _CATALOG_VERIFY_TTL_SECONDS:
                             rows_to_check.append(r)
                     except Exception:
                         rows_to_check.append(r)
@@ -2492,11 +2500,39 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     due = self._catalog_due_for_refresh(interval)
                 except Exception:
                     due = True
-                if due:
+                if not due:
+                    continue
+                # 실패 쿨다운: 마지막 실패(refresh_error 기록 시각) 이후
+                # _CATALOG_RETRY_COOLDOWN_SECONDS가 지나지 않았으면 재시도 보류.
+                try:
+                    meta = self._catalog_read_meta()
+                    if meta.get("refresh_state") == "error" and meta.get("refresh_error"):
+                        last_err_raw = meta.get("last_refresh_error_at") or ""
+                        if last_err_raw:
+                            last_err = datetime.fromisoformat(
+                                last_err_raw.replace("Z", "+00:00")
+                            )
+                            if last_err.tzinfo is None:
+                                last_err = last_err.replace(tzinfo=timezone.utc)
+                            if (
+                                datetime.now(timezone.utc) - last_err
+                            ).total_seconds() < _CATALOG_RETRY_COOLDOWN_SECONDS:
+                                continue  # 아직 쿨다운 중 — 다음 틱에 재확인
+                except Exception:
+                    pass  # 쿨다운 판정 실패 시 안전하게 갱신 진행
+                try:
+                    self._catalog_refresh_once(db_type)
+                except Exception:
+                    # 실패 시각을 기록해 다음 재시도를 쿨다운 (rate limit 악순환 방지)
                     try:
-                        self._catalog_refresh_once(db_type)
+                        self._catalog_set_meta(
+                            "last_refresh_error_at",
+                            datetime.now(timezone.utc)
+                            .isoformat(timespec="seconds")
+                            .replace("+00:00", "Z"),
+                        )
                     except Exception:
-                        pass  # refresh_once가 error 상태 기록, 다음 주기 재시도
+                        pass
         finally:
             _CATALOG_THREAD_ALIVE = False  # 루프 종료(사망) 시 재시작 가능하도록 리셋
 
