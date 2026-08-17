@@ -98,12 +98,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not isinstance(item_data, dict):
             return False, "유효하지 않은 요청 데이터 형식입니다."
 
-        # 신규 설치/삭제된 플러그인이 category_vis 래핑에 반영되도록 매 액션마다 재래핑 (멱등)
-        try:
-            _ensure_category_visibility_wrapped()
-        except Exception:
-            pass
-
         action = str(item_data.get("action", "")).strip().lower()
 
         if action == "install_zip":
@@ -161,12 +155,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         elif action == "save_config":
             return self._catalog_save_config(item_data, db_type)
 
-        elif action == "save_category_vis":
-            plugin_id = str(item_data.get("plugin_id", "")).strip()
-            if not plugin_id:
-                return False, "플러그인 ID가 누락되었습니다."
-            return self._save_category_vis(item_data, db_type)
-
         return False, f"지원하지 않는 액션입니다: {action}"
 
     def get_dashboard_data(self, db_type, limit=10):
@@ -198,11 +186,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _list_plugins(self, db_type):
             """설치된 전체 메타데이터 플러그인 상세 정보 수집"""
-            # 신규 설치 플러그인 래핑 반영 (멱등 재래핑)
-            try:
-                _ensure_category_visibility_wrapped()
-            except Exception:
-                pass
             base_dir = self._get_plugins_base_dir()
             plugins = []
 
@@ -244,14 +227,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 # 2. 메타 정보
                 name = getattr(cls_obj, "name", plugin_id) if cls_obj else plugin_id
                 is_searchable = getattr(cls_obj, "is_searchable", True) if cls_obj else False
-                # category_tab: descriptor 로 래핑된 경우 원본 dict 를 읽어 판정
-                # (descriptor __get__ 은 요청 type 기반으로 None 을 반환할 수 있어
-                #  "카테고리 플러그인 여부" 판정에는 원본 dict 유무가 기준이어야 함)
-                raw_category_tab = cls_obj.__dict__.get("category_tab", None) if cls_obj else None
-                if isinstance(raw_category_tab, _CategoryVisibilityDescriptor):
-                    category_tab = raw_category_tab._original
-                else:
-                    category_tab = raw_category_tab
+                category_tab = cls_obj.__dict__.get("category_tab", None) if cls_obj else None
                 dashboard_widget = getattr(cls_obj, "dashboard_widget", None) if cls_obj else None
                 update_manifest = getattr(cls_obj, "update_manifest", None) if cls_obj else None
 
@@ -286,22 +262,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 if git_info:
                     git_url = str(git_info.get("git_url") or "").strip() or None
 
-                # 4-2. 카테고리 뷰 표시 대상 설정 (일반/성인/오디오북 — 중복 가능)
-                category_vis = {"general": 1, "adult": 1, "audiobook": 1}
-                if bool(category_tab):
-                    try:
-                        vis_rows = self._sources_db_query(
-                            "SELECT general, adult, audiobook FROM category_vis WHERE plugin_id = ?",
-                            (plugin_id,),
-                        )
-                        if vis_rows:
-                            for _k in ("general", "adult", "audiobook"):
-                                _v = vis_rows[0].get(_k)
-                                if _v is not None:
-                                    category_vis[_k] = 1 if str(_v) == "1" else 0
-                    except Exception:
-                        pass
-
                 plugins.append({
                     "id": plugin_id,
                     "name": name,
@@ -317,7 +277,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
                     "is_installed": True,
-                    "category_vis": category_vis if bool(category_tab) else None,
                 })
 
             return plugins
@@ -756,11 +715,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
-            # 신규 설치 마커 — save_category_vis 에서 "서버 재시작 후 적용됩니다" 안내에 사용
-            try:
-                _CATEGORY_VIS_NEW_INSTALLS.add(str(plugin_id))
-            except Exception:
-                pass
             return True, result_msg
 
         except zipfile.BadZipFile:
@@ -988,11 +942,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
-            # 신규 설치 마커 — save_category_vis 에서 "서버 재시작 후 적용됩니다" 안내에 사용
-            try:
-                _CATEGORY_VIS_NEW_INSTALLS.add(str(plugin_id))
-            except Exception:
-                pass
             return True, result_msg
 
         except Exception as e:
@@ -1906,62 +1855,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             pass
 
-    def _save_category_vis(self, item_data, db_type):
-        """카테고리 뷰 표시 대상 저장 (일반/성인/오디오북 — 중복 선택).
-
-        plugin_id 에 해당하는 레코드가 없으면 INSERT, 있으면 UPDATE.
-        값이 모두 1(전부 표시)이면 레코드를 DELETE 하여 '기본값' 상태로 되돌린다.
-        """
-        plugin_id = str(item_data.get("plugin_id", "")).strip()
-        if not plugin_id:
-            return False, "플러그인 ID가 누락되었습니다."
-
-        # 대상 플러그인이 실제 존재하는지 확인 (카테고리 플러그인만 허용)
-        target_exists = False
-        try:
-            from services.metadata_factory import MetadataFactory
-            for _p_name, _target_cls in MetadataFactory._discover_provider_classes():
-                _pid = getattr(_target_cls, "id", _p_name)
-                if _pid == plugin_id:
-                    raw_ct = _target_cls.__dict__.get("category_tab", None)
-                    if isinstance(raw_ct, _CategoryVisibilityDescriptor):
-                        raw_ct = raw_ct._original
-                    if isinstance(raw_ct, dict):
-                        target_exists = True
-                    break
-        except Exception:
-            pass
-        if not target_exists:
-            return False, f"카테고리 플러그인이 아닙니다: {plugin_id}"
-
-        # 신규 설치 판정: 이번 프로세스에서 설치 API로 신규 설치된 플러그인
-        # → descriptor 래핑 전이라 아직 숨김 판정이 걸리지 않으므로 재시작 안내
-        is_new_install = plugin_id in _CATEGORY_VIS_NEW_INSTALLS
-
-        # 각 타입 값 정규화 (1/0, 기본값 1)
-        vis = {}
-        for lib in _CATEGORY_VIS_LIB_TYPES:
-            val = item_data.get(lib, 1)
-            vis[lib] = 1 if str(val) in ("1", "true", "True", "on") else 0
-
-        try:
-            if all(v == 1 for v in vis.values()):
-                # 전부 표시 = 기본값 → 레코드 삭제 (기본 동작과 동일)
-                self._sources_db_execute(
-                    "DELETE FROM category_vis WHERE plugin_id = ?", (plugin_id,)
-                )
-            else:
-                self._sources_db_execute(
-                    "INSERT OR REPLACE INTO category_vis "
-                    "(plugin_id, general, adult, audiobook) VALUES (?, ?, ?, ?)",
-                    (plugin_id, vis["general"], vis["adult"], vis["audiobook"]),
-                )
-            if is_new_install:
-                return True, "카테고리 뷰 표시 대상이 저장되었습니다. 서버 재시작 후 적용됩니다."
-            return True, "카테고리 뷰 표시 대상이 저장되었습니다."
-        except Exception as e:
-            return False, f"저장 실패: {e}"
-
     def _sources_meta_get(self, key):
         try:
             rows = self._sources_db_query("SELECT value FROM meta WHERE key = ?", (key,))
@@ -2124,18 +2017,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     CREATE TABLE IF NOT EXISTS meta (
                         key   TEXT PRIMARY KEY,
                         value TEXT
-                    )
-                    """
-                )
-                # 카테고리 뷰 표시 대상 설정 (일반/성인/오디오북 — 중복 선택 가능)
-                # 1 = 해당 라이브러리 타입에서 표시, 0 = 숨김. 기본(레코드 없음) = 전부 표시.
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS category_vis (
-                        plugin_id TEXT PRIMARY KEY,
-                        general   INTEGER NOT NULL DEFAULT 1,
-                        adult     INTEGER NOT NULL DEFAULT 1,
-                        audiobook INTEGER NOT NULL DEFAULT 1
                     )
                     """
                 )
@@ -2595,7 +2476,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "refresh_state": meta.get("refresh_state", "idle"),
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
-            "category_vis_enabled": self._sources_meta_get("category_vis_enabled") == "1",
         }
 
     def _catalog_get_allow_invalid_install(self, db_type):
@@ -2697,17 +2577,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 allow_val = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
             gateway.set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
 
-            # 카테고리 뷰 표시 설정 마스터 토글 (meta 테이블 — descriptor가 매 요청 조회)
-            vis_raw = item_data.get("category_vis_enabled")
-            if vis_raw is None or str(vis_raw).strip() == "":
-                vis_enabled = self._sources_meta_get("category_vis_enabled") == "1"
-            else:
-                vis_enabled = str(vis_raw).strip().lower() in ("1", "true", "yes", "on")
-            self._sources_meta_set("category_vis_enabled", "1" if vis_enabled else "0")
-
             return True, (
-                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, 카테고리 표시 설정 {3} — 다음 갱신 주기부터 적용)"
-            ).format(interval, len(topics), "허용" if allow_val else "차단", "사용" if vis_enabled else "미사용")
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2} — 다음 갱신 주기부터 적용)"
+            ).format(interval, len(topics), "허용" if allow_val else "차단")
         except Exception as e:
             return False, "설정 저장 실패: {0}".format(e)
 
@@ -2759,202 +2631,3 @@ if not globals().get("_PM_SKIP_AUTO_START", False):
         PluginManagerMetadataProvider()._ensure_catalog_thread("general")
     except Exception:
         pass  # import 실패로 플러그인 로드 전체가 죽는 것 방지
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 카테고리 뷰 표시 대상 제어 (2026-08-15) — 코어 수정 없이 플러그인만으로 동작
-#
-# 코어 services/metadata_factory.py 는 category_tab 을 "클래스 속성"으로 읽는다:
-#   p_category_tab = getattr(target_class, 'category_tab', None)
-# get_available_providers() 는 Flask 요청 컨텍스트 안에서 호출되므로, category_tab 을
-# descriptor 로 교체해 두면 __get__ 이 실행되는 시점에 flask.request.args 의
-# type(general/adult/audiobook) 을 읽어 표시 여부를 판정할 수 있다.
-#
-# - 래핑 대상: category_tab 이 dict 인 모든 플러그인 클래스 (plugin_manager 자신 제외)
-# - 미설정(레코드 없음) = 전부 표시 (기존 동작과 동일)
-# - 요청 컨텍스트가 없는 호출(스캐너/CLI 등) = 원본 dict 반환 (영향 없음)
-# ══════════════════════════════════════════════════════════════════════════
-_CATEGORY_VIS_LIB_TYPES = ("general", "adult", "audiobook")
-_CATEGORY_VIS_WRAP_LOCK = threading.Lock()
-_CATEGORY_VIS_WRAPPED = False
-# 이번 프로세스(모듈 로드 이후)에서 신규 설치된 카테고리 플러그인 id 집합.
-# 설치 API(_install_from_zip/_install_from_git) 성공 시 add 되며,
-# save_category_vis 에서 이 집합에 있으면 "서버 재시작 후 적용됩니다" 안내.
-# 프로세스가 재시작되면 비워지므로 재시작 후 저장은 기존 메시지로 자동 복귀.
-_CATEGORY_VIS_NEW_INSTALLS = set()
-
-
-class _CategoryVisibilityDescriptor:
-    """category_tab 클래스 속성 → 표시 대상별 동적 판정 descriptor.
-
-    코어의 getattr(target_class, 'category_tab', None) 호출 시점에
-    flask.request.args 의 type 파라미터를 읽어, 해당 라이브러리 타입에서
-    숨김 처리된 플러그인이면 None 을 반환한다 (코어가 메뉴에서 제외).
-    None 이 아닌 경우 항상 원본 dict 를 그대로 돌려준다.
-    """
-
-    __slots__ = ("_owner_id", "_original")
-
-    # 카테고리 표시 설정 사용 여부 마스터 키 (meta 테이블)
-    _ENABLED_KEY = "category_vis_enabled"
-
-    def __init__(self, owner_id, original_dict):
-        self._owner_id = owner_id
-        # 원본 dict 를 복사해 보관 (외부 변조 방지 + descriptor 간 공유 방지)
-        self._original = dict(original_dict)
-
-    def __get__(self, instance, owner):
-        # 1. 요청 컨텍스트가 없으면 원본 그대로 (스캐너/CLI/백그라운드 스레드 안전)
-        try:
-            from flask import has_request_context, request
-        except Exception:
-            return self._original
-        if not has_request_context():
-            return self._original
-
-        # 1.5 마스터 토글 OFF → 설정 미사용 (모든 플러그인 모든 탭 표시)
-        try:
-            enabled = self._query_master_enabled()
-            if not enabled:
-                return self._original
-        except Exception:
-            # 조회 실패 시에도 안전하게 기본 동작 보존 (숨김 미적용)
-            return self._original
-
-        # 2. 현재 라이브러리 타입 감지 (쿼리 파라미터 → JSON 바디 순)
-        db_type = None
-        try:
-            db_type = str(request.args.get("type") or "").strip() or None
-            if not db_type:
-                body = request.get_json(silent=True) or {}
-                db_type = str(body.get("type") or "").strip() or None
-        except Exception:
-            db_type = None
-
-        if db_type not in _CATEGORY_VIS_LIB_TYPES:
-            # 타입 정보가 없거나 알 수 없는 값이면 숨기지 않음 (기본 동작 보존)
-            return self._original
-
-        # 3. category_vis 설정 조회 — 레코드 없으면 기본(전부 표시)
-        try:
-            rows = self._query_vis(self._owner_id)
-        except Exception:
-            return self._original
-
-        if not rows:
-            return self._original
-
-        row = rows[0]
-        col = "general" if db_type == "general" else db_type
-        if str(row.get(col, "1")) == "1":
-            return self._original
-        # 해당 타입에서 숨김 → None → 코어 사이드바/뷰포트에서 제외
-        return None
-
-    @staticmethod
-    def _query_vis(plugin_id):
-        # plugin_manager.py 위치 = plugins/metadata/plugin_manager/ → 같은 폴더의 plugin_sources.db
-        db_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "plugin_sources.db",
-        )
-        try:
-            import sqlite3 as _sq
-            conn = _sq.connect(db_path, timeout=5)
-            try:
-                conn.row_factory = _sq.Row
-                cur = conn.execute(
-                    "SELECT general, adult, audiobook FROM category_vis WHERE plugin_id = ?",
-                    (plugin_id,),
-                )
-                rows = cur.fetchall()
-                return [dict(r) for r in rows]
-            finally:
-                conn.close()
-        except Exception:
-            return []
-
-    @staticmethod
-    def _query_master_enabled():
-        """카테고리 표시 설정 마스터 토글 — meta.category_vis_enabled == '1' 이면 True.
-
-        DB/테이블이 없거나 조회 실패 시 False (기본 OFF — 설정 미사용).
-        """
-        db_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "plugin_sources.db",
-        )
-        try:
-            import sqlite3 as _sq
-            conn = _sq.connect(db_path, timeout=5)
-            try:
-                cur = conn.execute(
-                    "SELECT value FROM meta WHERE key = 'category_vis_enabled'"
-                )
-                row = cur.fetchone()
-                return bool(row and str(row[0]) == "1")
-            finally:
-                conn.close()
-        except Exception:
-            return False
-
-
-def _wrap_category_visibility():
-    """모든 카테고리 플러그인 클래스의 category_tab 을 표시 판정 descriptor 로 교체.
-
-    - plugin_manager 자신은 제외 (항상 모든 탭에서 표시 — 설정 UI 접근 보장)
-    - 이미 래핑된 클래스(descriptor 인스턴스)는 건너뜀 (중복 래핑 방지)
-    - 멱등: _CATEGORY_VIS_WRAPPED 플래그와 무관하게 매 호출마다 스캔하되,
-      이미 래핑된 클래스는 건너뛰므로, 재시작 이후 신규 설치된 플러그인도
-      다음 호출 시점에 자동으로 래핑된다.
-    - sys.modules 캐시를 타므로 이후 _discover_provider_classes() 는 래핑된 클래스를 반환
-    """
-    global _CATEGORY_VIS_WRAPPED
-    with _CATEGORY_VIS_WRAP_LOCK:
-        try:
-            from services.metadata_factory import MetadataFactory
-            for _p_name, _target_cls in MetadataFactory._discover_provider_classes():
-                _p_id = getattr(_target_cls, "id", _p_name)
-                if _p_id == "plugin_manager":
-                    continue
-                # 클래스 __dict__ 직접 접근: 이미 descriptor 이거나 dict 가 아니면 건너뜀
-                _raw = _target_cls.__dict__.get("category_tab", None)
-                if isinstance(_raw, _CategoryVisibilityDescriptor):
-                    continue
-                if not isinstance(_raw, dict):
-                    continue
-                try:
-                    setattr(
-                        _target_cls,
-                        "category_tab",
-                        _CategoryVisibilityDescriptor(_p_id, _raw),
-                    )
-                except Exception:
-                    continue
-            _CATEGORY_VIS_WRAPPED = True
-        except Exception as e:
-            print(f"[PluginManager] Category visibility wrap failed: {e}")
-
-
-def _ensure_category_visibility_wrapped():
-    """descriptor 래핑을 안전하게 재실행 — 요청마다 호출 가능 (멱등).
-
-    이미 래핑된 클래스는 건너뛰므로 중복 래핑이 없고, 재시작 이후
-    신규 설치된 플러그인은 이 호출 시점에 래핑된다.
-    """
-    try:
-        _wrap_category_visibility()
-    except Exception:
-        pass  # 래핑 실패해도 플러그인 로드 전체가 죽는 것 방지 — 다음 기회에 재시도
-
-
-# ── 카테고리 뷰 표시 대상 descriptor 래핑 즉시 수행 ─────────────────────────
-# 코어가 category-plugins API 를 처리할 때 _discover_provider_classes() 가
-# plugin_manager 모듈을 import 하므로, 이 모듈 로드 시점에 래핑을 완료해 둔다.
-# (이 시점에는 PluginManagerMetadataProvider 클래스가 이미 정의되어 있어
-#  재귀 import 가 발생해도 안전하다. 래핑은 _CATEGORY_VIS_WRAPPED 로 1회 보장)
-if not globals().get("_PM_SKIP_AUTO_START", False):
-    try:
-        _wrap_category_visibility()
-    except Exception:
-        pass  # 래핑 실패해도 플러그인 로드 전체가 죽는 것 방지 — 다음 기회에 재시도

@@ -19,7 +19,6 @@
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
-    const cvisEnabledInput = root.querySelector('#pm-cvis-enabled');
 
     // 초기값 로드 — /data 응답의 catalog_meta (간격/토픽은 MariaDB 설정)
     // 레이스 방지: 이미 값이 변경된(사용자가 입력한) 필드는 덮어쓰지 않음
@@ -38,9 +37,6 @@
             if (allowInvalidInput && !allowInvalidInput.dataset.touched) {
                 allowInvalidInput.checked = !!meta.allow_invalid_install;
             }
-            if (cvisEnabledInput && !cvisEnabledInput.dataset.touched) {
-                cvisEnabledInput.checked = !!meta.category_vis_enabled;
-            }
         } catch(e) {
             // 초기값 로드 실패 — 기본값 유지
         }
@@ -50,7 +46,6 @@
     if (intervalInput) intervalInput.addEventListener('input', () => { intervalInput.dataset.touched = '1'; });
     if (topicsInput) topicsInput.addEventListener('input', () => { topicsInput.dataset.touched = '1'; });
     if (allowInvalidInput) allowInvalidInput.addEventListener('change', () => { allowInvalidInput.dataset.touched = '1'; });
-    if (cvisEnabledInput) cvisEnabledInput.addEventListener('change', () => { cvisEnabledInput.dataset.touched = '1'; });
 
     // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
     function parseTopics(raw) {
@@ -104,8 +99,7 @@
                     type: 'general',
                     refresh_interval_hours: intervalVal,
                     topics: topicsVal,
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
-                    category_vis_enabled: cvisEnabledInput ? cvisEnabledInput.checked : false
+                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false
                 })
             });
             const data = await res.json();
