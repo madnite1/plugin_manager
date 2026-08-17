@@ -19,6 +19,8 @@
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
+    const tokenInput = root.querySelector('#pm-github-token');
+    const tokenClearBtn = root.querySelector('#pm-token-clear');
 
     // 초기값 로드 — /data 응답의 catalog_meta (간격/토픽은 MariaDB 설정)
     // 레이스 방지: 이미 값이 변경된(사용자가 입력한) 필드는 덮어쓰지 않음
@@ -37,6 +39,10 @@
             if (allowInvalidInput && !allowInvalidInput.dataset.touched) {
                 allowInvalidInput.checked = !!meta.allow_invalid_install;
             }
+            if (tokenInput) {
+                // 실제 토큰은 절대 내려주지 않음 — 저장 여부만 표시
+                tokenInput.placeholder = meta.github_token_set ? '토큰 저장됨 (변경 시 새 값 입력)' : 'ghp_... (저장 안 됨)';
+            }
         } catch(e) {
             // 초기값 로드 실패 — 기본값 유지
         }
@@ -46,6 +52,7 @@
     if (intervalInput) intervalInput.addEventListener('input', () => { intervalInput.dataset.touched = '1'; });
     if (topicsInput) topicsInput.addEventListener('input', () => { topicsInput.dataset.touched = '1'; });
     if (allowInvalidInput) allowInvalidInput.addEventListener('change', () => { allowInvalidInput.dataset.touched = '1'; });
+    if (tokenInput) tokenInput.addEventListener('input', () => { tokenInput.dataset.touched = '1'; });
 
     // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
     function parseTopics(raw) {
@@ -99,7 +106,8 @@
                     type: 'general',
                     refresh_interval_hours: intervalVal,
                     topics: topicsVal,
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false
+                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                    github_token: tokenInput ? tokenInput.value.trim() : ''
                 })
             });
             const data = await res.json();
@@ -133,4 +141,29 @@
     }
 
     loadInitial();
+
+    // 토큰 삭제 — 즉시 clear 요청 (빈 입력은 기존 유지라 별도 삭제 경로)
+    if (tokenClearBtn) {
+        tokenClearBtn.addEventListener('click', async function() {
+            if (!tokenInput) return;
+            if (typeof window.confirm === 'function' && !confirm('저장된 GitHub 토큰을 삭제할까요?')) return;
+            try {
+                const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: 'general', clear_github_token: true })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    tokenInput.value = '';
+                    tokenInput.placeholder = 'ghp_... (저장 안 됨)';
+                    showSuccess(data.message || 'GitHub 토큰이 삭제되었습니다.');
+                } else {
+                    showError(data.error || '토큰 삭제 실패');
+                }
+            } catch (err) {
+                showError('통신 오류: ' + err.message);
+            }
+        });
+    }
 })(window, pluginId, root, config);

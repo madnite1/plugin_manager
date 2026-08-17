@@ -2123,13 +2123,32 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     # ---- GitHub 조회 ----
 
-    def _catalog_search_topic(self, topic):
-        """GitHub Search API topic 검색 (per_page=100). 응답 dict 반환 (예외 전파)."""
+    def _catalog_get_github_token(self, db_type):
+        """PM_GITHUB_TOKEN 조회 (MariaDB 설정). 설정돼 있으면 Bearer 헤더로 사용.
+        토큰 사용 시 GitHub Search API 제한이 IP 기준이 아닌 계정 기준 5,000/hr가 되어
+        공용/클라우드 IP 제한(403)에서 벗어난다."""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_GITHUB_TOKEN", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            tok = str(raw or "").strip()
+            return tok or None
+        except Exception:
+            return None
+
+    def _catalog_search_topic(self, db_type, topic):
+        """GitHub Search API topic 검색 (per_page=100). 응답 dict 반환 (예외 전파).
+        토큰이 설정되면 Authorization: Bearer 헤더 추가 — 공용 IP 풀 403 회피."""
         url = "https://api.github.com/search/repositories?q=topic:{0}&per_page=100".format(topic)
-        req = Request(url, headers={
+        headers = {
             "User-Agent": "BookOasis/1.0",
             "Accept": "application/vnd.github+json",
-        })
+        }
+        token = self._catalog_get_github_token(db_type)
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        req = Request(url, headers=headers)
         with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
 
@@ -2230,7 +2249,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 1. 토픽별 Search API → full_name 기준 합집합
             merged = {}
             for topic in topics:
-                data = self._catalog_search_topic(topic)
+                data = self._catalog_search_topic(db_type, topic)
                 if not isinstance(data, dict) or "items" not in data:
                     raise RuntimeError(
                         "GitHub Search API 응답 오류 (rate limit 또는 일시 오류일 수 있음): topic={0}".format(topic)
@@ -2434,6 +2453,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if last.tzinfo is None:
                 last = last.replace(tzinfo=timezone.utc)
             elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+            if meta.get("refresh_state") == "error":
+                # 실패 상태면 interval 무관하게 재시도 대상 — daemon의 쿨다운 게이트
+                # (10분)가 실제 동작하도록 due=True 반환. 최근 성공 직후 실패 시
+                # last_refresh가 최신이라 6시간 동안 error가 방치되는 문제 해결.
+                return elapsed, True
             return elapsed, elapsed >= interval_sec
         except Exception:
             # 파싱 불가/오류 시 안전하게 즉시 갱신 (스택 방지)
@@ -2476,6 +2500,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "refresh_state": meta.get("refresh_state", "idle"),
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
+            "github_token_set": bool(self._catalog_get_github_token(db_type)),
         }
 
     def _catalog_get_allow_invalid_install(self, db_type):
@@ -2577,9 +2602,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 allow_val = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
             gateway.set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
 
+            # GitHub 토큰 — 비어 있으면 기존 유지(보안: 실제 토큰을 프론트로 내려주지 않음),
+            # clear_github_token=true면 삭제, 값이 있으면 새로 저장.
+            if item_data.get("clear_github_token"):
+                gateway.set_setting("PM_GITHUB_TOKEN", "")
+            else:
+                raw_token = item_data.get("github_token")
+                if raw_token and str(raw_token).strip():
+                    gateway.set_setting("PM_GITHUB_TOKEN", str(raw_token).strip())
+
             return True, (
-                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2} — 다음 갱신 주기부터 적용)"
-            ).format(interval, len(topics), "허용" if allow_val else "차단")
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, GitHub 토큰 {3} — 다음 갱신 주기부터 적용)"
+            ).format(
+                interval, len(topics), "허용" if allow_val else "차단",
+                "삭제됨" if item_data.get("clear_github_token")
+                else ("등록됨" if (item_data.get("github_token") and str(item_data.get("github_token")).strip()) else "유지"),
+            )
         except Exception as e:
             return False, "설정 저장 실패: {0}".format(e)
 

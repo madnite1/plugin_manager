@@ -290,31 +290,7 @@
         });
     }
 
-    // 개별 카드 업데이트 재확인 버튼 (수동)
-    function bindCheckUpdateButton(btn) {
-        btn.addEventListener('click', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            const pluginId = this.getAttribute('data-id');
-            if (!pluginId) return;
-            const icon = this.querySelector('i');
-            const origHtml = icon ? icon.outerHTML : '';
-            if (icon) icon.className = 'fa-solid fa-circle-notch fa-spin';
-            this.disabled = true;
-            callPluginAction({ action: 'check_update', plugin_id: pluginId })
-                .then(res => {
-                    const r = res && res.success ? res.message : null;
-                    if (r && typeof r === 'object') {
-                        patchCardUpdate(r.plugin_id, !!r.has_update, r.latest_version);
-                    }
-                })
-                .catch(() => {})
-                .finally(() => {
-                    if (icon && origHtml) icon.outerHTML = origHtml;
-                    this.disabled = false;
-                });
-        });
-    }
+    // 개별 카드 업데이트 재확인 버튼 (수동) — 2026-08-17 제거됨
 
     // 업데이트 체크 비동기 진행 (목록 렌더 이후 개별 조회)
     let updateCheckSeq = 0;
@@ -620,9 +596,6 @@
                             <span>${p.enabled ? '사용 중' : '중지됨'}</span>
                         </div>
                         <div class="pm-card-action-btns">
-                            <button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-icon-only pm-btn-check-update" data-id="${p.id}" title="업데이트 확인">
-                                <i class="fa-solid fa-rotate"></i>
-                            </button>
                             ${updateBtnHtml}
                             ${deleteBtnHtml}
                         </div>
@@ -669,9 +642,6 @@
 
         // Update Button
         document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
-
-        // 개별 업데이트 재확인 버튼 (수동)
-        document.querySelectorAll('.pm-btn-check-update').forEach(bindCheckUpdateButton);
 
         // Catalog Install Button (미설치 카드)
         document.querySelectorAll('.pm-btn-install').forEach(bindInstallButton);
@@ -887,6 +857,7 @@
         const intervalInput = document.getElementById('pm-catalog-interval');
         const topicsInput = document.getElementById('pm-catalog-topics');
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
+        const tokenInput = document.getElementById('pm-github-token');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
         const rawTopics = topicsInput ? topicsInput.value : '';
@@ -912,7 +883,8 @@
                     type: 'general',
                     refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
                     topics: topicsInput ? topicsInput.value.trim() : '',
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false
+                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                    github_token: tokenInput ? tokenInput.value.trim() : ''
                 })
             });
             const data = await res.json();

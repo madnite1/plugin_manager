@@ -35,6 +35,28 @@
             </p>
         </div>
 
+        <!-- GitHub 토큰 -->
+        <div style="margin-top: 0.5rem;">
+            <label style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
+                <i class="fa-solid fa-lock" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> GitHub 토큰 (선택)
+            </label>
+            <div style="display: flex; align-items: center; gap: 0.6rem;">
+                <input type="password" id="pm-github-token" class="pm-catalog-input" autocomplete="new-password"
+                       placeholder="ghp_..." style="flex: 1; min-width: 0; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem; box-sizing: border-box;" />
+                <button type="button" id="pm-token-clear" class="pm-btn pm-btn-secondary pm-btn-sm"
+                        style="white-space: nowrap; cursor: pointer; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px solid var(--app-border, rgba(255,255,255,0.15)); background: transparent; color: var(--app-text-muted, #94a3b8); font-size: 0.8rem;">
+                    <i class="fa-solid fa-trash" style="margin-right: 0.25rem;"></i>토큰 삭제
+                </button>
+            </div>
+            <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.45rem 0 0 0;">
+                입력 후 저장하면 GitHub Search API에
+                <code style="background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 4px;">Authorization: Bearer</code>
+                로 전송됩니다. 토큰 사용 시 호출이 <strong style="color: var(--app-accent, #8b5cf6);">공용 IP 기준이 아닌 계정 기준</strong>으로
+                집계되어 클라우드 공용 IP의 403(rate limit)을 피할 수 있습니다. (Search 30회/분, 일반 API 5,000회/시간).
+                실제 토큰 값은 화면에 표시되지 않으며 저장 여부만 표시됩니다. (토큰 스코프: 공개 저장소 검색이라 특별 권한 불필요 — 권장: fine-grained, "Public Repositories" 읽기)
+            </p>
+        </div>
+
     </div>
 
         <!-- 3. 검증 실패시 설치 허용 -->
