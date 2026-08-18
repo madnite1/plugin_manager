@@ -76,4 +76,22 @@
             </div>
         </div>
 
+        <!-- 4. 플러그인 자동 업데이트 -->
+        <div style="display: flex; align-items: flex-start; gap: 0.6rem; margin-top: 1.2rem;">
+            <input type="checkbox" id="pm-auto-update" class="pm-catalog-input"
+                   style="width: 18px; height: 18px; margin-top: 0.15rem; accent-color: var(--app-accent, #8b5cf6); cursor: pointer;" />
+            <div>
+                <label for="pm-auto-update" style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; cursor: pointer;">
+                    <i class="fa-solid fa-rotate" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> 플러그인 자동 업데이트
+                </label>
+                <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.3rem 0 0 0;">
+                    켜면 설정된 <strong style="color: var(--app-accent, #8b5cf6);">카탈로그 갱신 간격</strong>마다 카탈로그를 새로고침한 뒤,
+                    설치된 플러그인 중 <code style="background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 4px;">update_manifest</code> 가 있고
+                    새 버전이 있는 것을 자동으로 교체합니다.
+                    <strong style="color: var(--app-accent-hover, #f59e0b);">기본 OFF</strong> — 실서버에서 자동 교체가 부담되면 OFF를 유지하세요.
+                    플러그인 매니저 본인은 자동 업데이트 대상에서 제외됩니다.
+                </p>
+            </div>
+        </div>
+
 </div>

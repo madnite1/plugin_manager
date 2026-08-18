@@ -2422,6 +2422,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     pass  # 쿨다운 판정 실패 시 안전하게 갱신 진행
                 try:
                     self._catalog_refresh_once(db_type)
+                    # 카탈로그 갱신 직후 — 자동 업데이트 ON이면 설치 플러그인 일괄 갱신
+                    self._catalog_run_auto_update(db_type)
                 except Exception:
                     # 실패 시각을 기록해 다음 재시도를 쿨다운 (rate limit 악순환 방지)
                     try:
@@ -2500,6 +2502,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "refresh_state": meta.get("refresh_state", "idle"),
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
+            "auto_update": self._catalog_get_auto_update(db_type),
             "github_token_set": bool(self._catalog_get_github_token(db_type)),
         }
 
@@ -2513,6 +2516,25 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return str(raw).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             return False
+
+    def _catalog_get_auto_update(self, db_type):
+        """플러그인 자동 업데이트 설정 (기본 OFF — 실서버 자동 교체 기본 차단)"""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_AUTO_UPDATE", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            return False
+
+    def _catalog_run_auto_update(self, db_type):
+        """자동 업데이트 실행 — ON일 때만 일괄 업데이트. 실패해도 상위 갱신 루프를 깨지 않게 이중 격리."""
+        try:
+            if self._catalog_get_auto_update(db_type):
+                self._update_all_plugins(db_type)
+        except Exception:
+            logger.warning("플러그인 자동 업데이트 실행 중 오류 (%s)", db_type, exc_info=True)
 
     def _catalog_list_valid_repos(self):
         """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순)"""
@@ -2602,6 +2624,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 allow_val = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
             gateway.set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
 
+            auto_raw = item_data.get("auto_update")
+            if auto_raw is None or str(auto_raw).strip() == "":
+                auto_val = self._catalog_get_auto_update(db_type)
+            else:
+                auto_val = str(auto_raw).strip().lower() in ("1", "true", "yes", "on")
+            gateway.set_setting("PM_AUTO_UPDATE", "1" if auto_val else "0")
+
             # GitHub 토큰 — 비어 있으면 기존 유지(보안: 실제 토큰을 프론트로 내려주지 않음),
             # clear_github_token=true면 삭제, 값이 있으면 새로 저장.
             if item_data.get("clear_github_token"):
@@ -2612,9 +2641,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     gateway.set_setting("PM_GITHUB_TOKEN", str(raw_token).strip())
 
             return True, (
-                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, GitHub 토큰 {3} — 다음 갱신 주기부터 적용)"
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, 자동 업데이트 {3}, GitHub 토큰 {4} — 다음 갱신 주기부터 적용)"
             ).format(
                 interval, len(topics), "허용" if allow_val else "차단",
+                "ON" if auto_val else "OFF",
                 "삭제됨" if item_data.get("clear_github_token")
                 else ("등록됨" if (item_data.get("github_token") and str(item_data.get("github_token")).strip()) else "유지"),
             )

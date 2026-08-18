@@ -19,6 +19,7 @@
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
+    const autoUpdateInput = root.querySelector('#pm-auto-update');
     const tokenInput = root.querySelector('#pm-github-token');
     const tokenClearBtn = root.querySelector('#pm-token-clear');
 
@@ -39,6 +40,9 @@
             if (allowInvalidInput && !allowInvalidInput.dataset.touched) {
                 allowInvalidInput.checked = !!meta.allow_invalid_install;
             }
+            if (autoUpdateInput && !autoUpdateInput.dataset.touched) {
+                autoUpdateInput.checked = !!meta.auto_update;
+            }
             if (tokenInput) {
                 // 실제 토큰은 절대 내려주지 않음 — 저장 여부만 표시
                 tokenInput.placeholder = meta.github_token_set ? '토큰 저장됨 (변경 시 새 값 입력)' : 'ghp_... (저장 안 됨)';
@@ -52,6 +56,7 @@
     if (intervalInput) intervalInput.addEventListener('input', () => { intervalInput.dataset.touched = '1'; });
     if (topicsInput) topicsInput.addEventListener('input', () => { topicsInput.dataset.touched = '1'; });
     if (allowInvalidInput) allowInvalidInput.addEventListener('change', () => { allowInvalidInput.dataset.touched = '1'; });
+    if (autoUpdateInput) autoUpdateInput.addEventListener('change', () => { autoUpdateInput.dataset.touched = '1'; });
     if (tokenInput) tokenInput.addEventListener('input', () => { tokenInput.dataset.touched = '1'; });
 
     // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
@@ -107,6 +112,7 @@
                     refresh_interval_hours: intervalVal,
                     topics: topicsVal,
                     allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                    auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                     github_token: tokenInput ? tokenInput.value.trim() : ''
                 })
             });
