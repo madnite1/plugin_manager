@@ -333,6 +333,8 @@
                         const autoOn = !!(catalogMeta && catalogMeta.auto_update);
                         if (r.has_update && autoOn && !p.is_system) {
                             // 자동 업데이트 ON → 버튼 대신 순차 큐에 넣어 실제 교체
+                            // patchCardUpdated가 새 버전 표시에 쓸 latest_version을 먼저 기록
+                            p.latest_version = r.latest_version;
                             enqueueAutoUpdate(r.plugin_id);
                         } else {
                             patchCardUpdate(r.plugin_id, !!r.has_update, r.latest_version);
