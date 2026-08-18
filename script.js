@@ -789,7 +789,10 @@
             }
 
             if (titleEl) {
-                titleEl.textContent = `${p.name} (${p.id}) v${p.version || '1.0.0'}`;
+                // manage API 응답에는 version 필드가 없음 → allPlugins(버전/최신버전 보유)에서 보완
+                const known = allPlugins.find(x => x.id === pluginId);
+                const displayVersion = p.version || (known && (known.latest_version || known.version)) || '1.0.0';
+                titleEl.textContent = `${p.name} (${p.id}) v${displayVersion}`;
             }
 
             if (extraLinksEl) {
