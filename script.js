@@ -278,7 +278,7 @@
                 this.innerHTML = origHtml;
                 if (res.success) {
                     showAlert(res.message || `'${pluginName}' 플러그인이 최신 버전으로 업데이트되었습니다!`);
-                    loadPlugins();
+                    patchCardUpdated(pluginId);
                 } else {
                     showAlert(res.error || '플러그인 업데이트 실패', true);
                 }
@@ -383,14 +383,49 @@
                 const pluginId = autoUpdateQueue.shift();
                 try {
                     await callPluginAction({ action: 'update', plugin_id: pluginId });
+                    patchCardUpdated(pluginId);
                 } catch (e) {
-                    // 개별 실패는 무시하고 다음 진행 (loadPlugins 재조회가 상태 반영)
+                    setCardUpdating(pluginId, false); // 실패 시 "업데이트 중" 표시 해제
                 }
             }
         } finally {
             autoUpdateRunning = false;
             autoUpdateQueued.clear();
-            if (autoUpdateQueue.length === 0) loadPlugins();
+        }
+    }
+
+    // 업데이트 완료 후 대상 카드만 부분 갱신 (네트워크 재요청 없이 DOM 패치)
+    function patchCardUpdated(pluginId) {
+        const p = allPlugins.find(x => x.id === pluginId);
+        if (!p) return;
+        p.has_update = false;
+        if (p.latest_version) p.version = p.latest_version;
+        const card = document.getElementById(`pm-card-${pluginId}`);
+        if (card) {
+            const idEl = card.querySelector('.pm-plugin-id');
+            if (idEl) idEl.textContent = `${p.id} • v${p.version}`;
+            const ub = card.querySelector('.pm-btn-update'); if (ub) ub.remove();
+            const au = card.querySelector('.pm-auto-updating'); if (au) au.remove();
+        }
+        updateCounts();
+    }
+
+    // 설치 후 무깜빡 목록 재조회 (로딩 플래시·업데이트 재체크 없이 새 카드 반영)
+    async function silentReload() {
+        try {
+            const res = await fetch('/api/media/dashboard/widgets/plugin_manager/data?type=general');
+            const data = await res.json();
+            if (data.success && Array.isArray(data.plugins)) {
+                allPlugins = data.plugins;
+                catalogMeta = data.catalog_meta || catalogMeta;
+                updateCounts();
+                updateCatalogStatus();
+                renderPlugins();
+            } else {
+                loadPlugins();
+            }
+        } catch(e) {
+            loadPlugins();
         }
     }
 
@@ -522,7 +557,7 @@
                 this.innerHTML = origHtml;
                 if (res.success) {
                     showAlert(res.message || "'" + name + "' 플러그인이 설치되었습니다!");
-                    loadPlugins();
+                    silentReload();
                 } else {
                     // 실패 시 목록 재조회 — 백엔드가 install_error를 저장하므로 카드가 설치 불가 상태로 전환됨
                     showAlert(res.error || '플러그인 설치 실패', true);
@@ -1121,7 +1156,7 @@
                                 showAlert(res.message || 'ZIP 플러그인이 설치되었습니다!');
                                 zipInput.value = '';
                                 if (zipLabel) zipLabel.textContent = 'ZIP 압축 파일 선택...';
-                                loadPlugins();
+                                silentReload();
                             } else {
                                 showAlert(res.error || 'ZIP 플러그인 설치 실패', true);
                             }
@@ -1169,7 +1204,7 @@
                         if (res.success) {
                             showAlert(res.message || 'Git 플러그인이 설치되었습니다!');
                             gitUrlInput.value = '';
-                            loadPlugins();
+                            silentReload();
                         } else {
                             showAlert(res.error || 'Git 플러그인 설치 실패', true);
                         }
