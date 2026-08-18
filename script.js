@@ -857,6 +857,7 @@
         const intervalInput = document.getElementById('pm-catalog-interval');
         const topicsInput = document.getElementById('pm-catalog-topics');
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
+        const autoUpdateInput = document.getElementById('pm-auto-update');
         const tokenInput = document.getElementById('pm-github-token');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
@@ -884,6 +885,7 @@
                     refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
                     topics: topicsInput ? topicsInput.value.trim() : '',
                     allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                    auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                     github_token: tokenInput ? tokenInput.value.trim() : ''
                 })
             });
