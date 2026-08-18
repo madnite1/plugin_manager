@@ -294,6 +294,10 @@
 
     // 업데이트 체크 비동기 진행 (목록 렌더 이후 개별 조회)
     let updateCheckSeq = 0;
+    // 자동 업데이트 큐 — 화면 진입 시 자동 업데이트 ON이면 순차(1건씩) 실행 (2026-08-18)
+    let autoUpdateQueue = [];
+    let autoUpdateRunning = false;
+    let autoUpdateQueued = new Set();
     function checkUpdatesAsync() {
         const seq = ++updateCheckSeq; // loadPlugins 재호출 시 이전 배치 결과 무시
         const targets = allPlugins.filter(p => p.has_update_manifest);
@@ -326,7 +330,13 @@
                     // 성공 시 message에 결과 객체가 담김
                     const r = res && res.success ? res.message : null;
                     if (r && typeof r === 'object') {
-                        patchCardUpdate(r.plugin_id, !!r.has_update, r.latest_version);
+                        const autoOn = !!(catalogMeta && catalogMeta.auto_update);
+                        if (r.has_update && autoOn && !p.is_system) {
+                            // 자동 업데이트 ON → 버튼 대신 순차 큐에 넣어 실제 교체
+                            enqueueAutoUpdate(r.plugin_id);
+                        } else {
+                            patchCardUpdate(r.plugin_id, !!r.has_update, r.latest_version);
+                        }
                     }
                 })
                 .catch(() => { markChecking(p, false); })
@@ -334,6 +344,54 @@
         }
 
         for (let i = 0; i < CONCURRENCY; i++) next();
+    }
+
+    // 카드 "업데이트 중" 상태 표시 (자동 업데이트 큐 대기/실행 중)
+    function setCardUpdating(pluginId, updating) {
+        const card = document.getElementById(`pm-card-${pluginId}`);
+        if (!card) return;
+        const actions = card.querySelector('.pm-card-action-btns');
+        if (!actions) return;
+        if (updating) {
+            const existing = actions.querySelector('.pm-btn-update');
+            if (existing) existing.remove();
+            if (actions.querySelector('.pm-auto-updating')) return;
+            actions.insertAdjacentHTML('beforeend',
+                `<span class="pm-auto-updating pm-btn pm-btn-warning pm-btn-sm" style="pointer-events:none;opacity:.85;cursor:default;white-space:nowrap;">
+                    <i class="fa-solid fa-circle-notch fa-spin"></i> 업데이트 중...</span>`);
+        } else {
+            const el = actions.querySelector('.pm-auto-updating');
+            if (el) el.remove();
+        }
+    }
+
+    // 자동 업데이트 큐에 플러그인 추가 (중복 방지 + 즉시 "업데이트 중" 표시)
+    function enqueueAutoUpdate(pluginId) {
+        if (autoUpdateQueued.has(pluginId)) return;
+        autoUpdateQueued.add(pluginId);
+        autoUpdateQueue.push(pluginId);
+        setCardUpdating(pluginId, true);
+        processAutoUpdateQueue();
+    }
+
+    // 순차(1건씩) 실행 — 서버 부하 방지. 모두 처리 후 목록 새로고침으로 상태 반영.
+    async function processAutoUpdateQueue() {
+        if (autoUpdateRunning) return;
+        autoUpdateRunning = true;
+        try {
+            while (autoUpdateQueue.length > 0) {
+                const pluginId = autoUpdateQueue.shift();
+                try {
+                    await callPluginAction({ action: 'update', plugin_id: pluginId });
+                } catch (e) {
+                    // 개별 실패는 무시하고 다음 진행 (loadPlugins 재조회가 상태 반영)
+                }
+            }
+        } finally {
+            autoUpdateRunning = false;
+            autoUpdateQueued.clear();
+            if (autoUpdateQueue.length === 0) loadPlugins();
+        }
     }
 
     // 개별 카드 업데이트 상태 반영 (부분 DOM 패치)
