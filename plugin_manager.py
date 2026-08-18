@@ -2361,15 +2361,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             raise
 
     def _catalog_manual_refresh(self, db_type):
-        """catalog_refresh 액션 — 백그라운드 스레드로 즉시 1회 갱신 (응답은 즉시)"""
+        """catalog_refresh 액션 — 백그라운드 스레드로 즉시 1회 갱신 후
+        자동 업데이트가 ON이면 설치 플러그인 일괄 갱신까지 실행 (응답은 즉시)."""
+        def _run():
+            try:
+                self._catalog_refresh_once(db_type)
+            finally:
+                # 수동 갱신 후에도 설정(PM_AUTO_UPDATE)에 따라 자동 업데이트 수행
+                self._catalog_run_auto_update(db_type)
         try:
             self._ensure_catalog_thread(db_type)
             t = threading.Thread(
-                target=self._catalog_refresh_once, args=(db_type,),
+                target=_run,
                 daemon=True, name="pm-catalog-manual-refresh",
             )
             t.start()
-            return True, "카탈로그 갱신을 시작했습니다. (완료까지 수십 초 소요)"
+            return True, "카탈로그 갱신(+자동 업데이트)을 시작했습니다. (완료까지 수십 초 소요)"
         except Exception as e:
             return False, "카탈로그 갱신 시작 실패: {0}".format(e)
 
