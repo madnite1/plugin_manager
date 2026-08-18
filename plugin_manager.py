@@ -2235,10 +2235,28 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         실패 시 refresh_state=error 기록 후 예외 전파 (스레드 루프가 다음 주기 재시도).
         """
         self._catalog_init_db()
-        state_rows = self._catalog_db_query("SELECT value FROM meta WHERE key='refresh_state'")
-        if state_rows and state_rows[0]["value"] == "running":
-            return
+        meta = self._catalog_read_meta()
+        if meta.get("refresh_state") == "running":
+            started_raw = meta.get("refresh_started_at") or ""
+            is_stale = False
+            if started_raw:
+                try:
+                    started_dt = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+                    if started_dt.tzinfo is None:
+                        started_dt = started_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - started_dt).total_seconds() > 300:
+                        is_stale = True
+                except Exception:
+                    is_stale = True
+            else:
+                is_stale = True
+
+            if not is_stale:
+                return
+
+        now_str = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         self._catalog_set_meta("refresh_state", "running")
+        self._catalog_set_meta("refresh_started_at", now_str)
         self._catalog_set_meta("refresh_error", "")
 
         try:
@@ -2502,11 +2520,34 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _catalog_meta_dict(self, db_type):
         """catalog_meta 응답 — 설정은 MariaDB에서, 상태는 catalog.db meta에서"""
         meta = self._catalog_read_meta()
+        refresh_state = meta.get("refresh_state", "idle")
+        if refresh_state == "running":
+            started_raw = meta.get("refresh_started_at") or ""
+            is_stale = False
+            if started_raw:
+                try:
+                    started_dt = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+                    if started_dt.tzinfo is None:
+                        started_dt = started_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - started_dt).total_seconds() > 300:
+                        is_stale = True
+                except Exception:
+                    is_stale = True
+            else:
+                is_stale = True
+
+            if is_stale:
+                refresh_state = "idle"
+                try:
+                    self._catalog_set_meta("refresh_state", "idle")
+                except Exception:
+                    pass
+
         return {
             "last_refresh": meta.get("last_refresh"),
             "refresh_interval_hours": self._catalog_get_interval_hours(db_type),
             "topics": self._catalog_get_topics(db_type),
-            "refresh_state": meta.get("refresh_state", "idle"),
+            "refresh_state": refresh_state,
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
             "auto_update": self._catalog_get_auto_update(db_type),
