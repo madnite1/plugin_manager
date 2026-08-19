@@ -127,6 +127,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return False, "업데이트할 플러그인 ID가 누락되었습니다."
             return self._update_plugin(plugin_id, db_type)
 
+        elif action == "replace_git":
+            plugin_id = str(item_data.get("plugin_id", "")).strip()
+            git_url = str(item_data.get("git_url", "")).strip()
+            if not plugin_id:
+                return False, "교체할 플러그인 ID가 누락되었습니다."
+            if not git_url:
+                return False, "새 Git 저장소 URL이 누락되었습니다."
+            return self._replace_plugin(plugin_id, git_url, db_type)
+
         elif action == "update_all":
             return self._update_all_plugins(db_type)
 
@@ -650,27 +659,80 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception as e:
             print(f"[PluginManager] check_update discover error: {e}")
 
-        has_update, latest_version = self._check_plugin_update(plugin_id, version, cls_obj, db_type)
-        return True, {
+        result = {
             "plugin_id": plugin_id,
             "version": version,
-            "has_update": has_update,
-            "latest_version": latest_version,
+            "has_update": False,
+            "latest_version": version,
         }
 
-    def _check_plugin_update(self, plugin_id, local_version, cls_obj, db_type=None):
-        """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)"""
+        # ---- 소스 교체 후보 판정 (설계: update_blocked + blocked_reason) ----
+        # A. git 소스 메타 없음 → 즉시 판정 (원격 fetch 불가)
+        git_info = None
+        try:
+            git_info = self._read_git_source_info(plugin_id)
+        except Exception:
+            git_info = None
+        has_manifest = bool(getattr(cls_obj, "update_manifest", None) if cls_obj else None)
+
+        has_update, latest_version, fetch_status = self._check_plugin_update_detail(
+            plugin_id, version, cls_obj, db_type
+        )
+        result["has_update"] = has_update
+        if latest_version:
+            result["latest_version"] = latest_version
+
+        # B/C 판정: fetch 실패 (404/저장소 삭제/버전 파싱 실패) + A: 소스 메타 없음
+        blocked_reason = None
+        if fetch_status in ("no_source", "http_404", "fetch_failed", "parse_failed"):
+            blocked_reason = fetch_status
+        if not has_manifest and blocked_reason is None:
+            # update_manifest 자체가 없으면 업데이트 계약 부재 — 교체 제안 대상은 아니나 정보성 표시
+            blocked_reason = None
+
+        if blocked_reason:
+            result["update_blocked"] = True
+            result["blocked_reason"] = blocked_reason
+            # 같은 plugin_id의 카탈로그 후보 (현재 소스 제외) — 프론트가 모달에 표시
+            candidates = self._catalog_replace_candidates(plugin_id, db_type)
+            if candidates:
+                result["replace_candidates"] = candidates
+
+        return True, result
+
+    def _check_plugin_update_detail(self, plugin_id, local_version, cls_obj, db_type=None):
+        """_check_plugin_update 확장 — 업데이트 가능 여부 + fetch 상태 분류.
+
+        반환: (has_update, latest_version, fetch_status)
+        fetch_status:
+          - 'no_source'  : git 소스 메타 없음 (원격 URL 결정 불가)
+          - 'no_manifest': update_manifest 없음 (업데이트 계약 없음 — 차단 아님)
+          - 'ok'         : fetch 성공 (has_update로 최신 여부 판단)
+          - 'http_404'   : 원격 fetch 404 (저장소/파일 삭제)
+          - 'fetch_failed': 그 외 네트워크/HTTP 오류
+          - 'parse_failed': fetch는 됐지만 버전 파싱 실패
+        """
         has_update = False
         latest_version = local_version
+        fetch_status = "no_manifest"
 
         update_manifest = getattr(cls_obj, "update_manifest", None) if cls_obj else None
         if not (update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled")):
-            return has_update, latest_version
+            return has_update, latest_version, fetch_status
+
+        # git 소스 메타 없음 → 원격 fetch 불가 (A 조건)
+        git_info = None
+        try:
+            git_info = self._read_git_source_info(plugin_id)
+        except Exception:
+            git_info = None
+        if not git_info:
+            return has_update, latest_version, "no_source"
 
         try:
             spec = self._build_update_spec(plugin_id, update_manifest)
             if not spec:
-                return has_update, latest_version
+                return has_update, latest_version, "no_source"
 
             base_url = self._resolve_update_base_url(
                 plugin_id, spec["raw_base_url"], spec.get("files"), db_type
@@ -681,17 +743,35 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if raw_parsed:
                 src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
                 gitea_token = self._gitea_token_for_host(db_type, src_host)
-            remote_ver = self._fetch_remote_plugin_version(
-                base_url,
-                version_file=spec["version_file"],
-                version_key=spec["version_key"],
-                token=gitea_token,
-            )
-            if remote_ver and self._can_update_to_version(local_version, remote_ver):
-                return True, remote_ver
+            try:
+                remote_ver = self._fetch_remote_plugin_version(
+                    base_url,
+                    version_file=spec["version_file"],
+                    version_key=spec["version_key"],
+                    token=gitea_token,
+                )
+            except HTTPError as e:
+                if e.code == 404:
+                    return has_update, latest_version, "http_404"
+                return has_update, latest_version, "fetch_failed"
+            except Exception:
+                return has_update, latest_version, "fetch_failed"
+            if not remote_ver:
+                return has_update, latest_version, "parse_failed"
+            if self._can_update_to_version(local_version, remote_ver):
+                return True, remote_ver, "ok"
+            return has_update, remote_ver, "ok"
         except Exception:
-            pass
+            return has_update, latest_version, "fetch_failed"
 
+    def _check_plugin_update(self, plugin_id, local_version, cls_obj, db_type=None):
+        """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)
+
+        레거시 호환 래퍼 — 내부적으로 상세 판정 사용, fetch_status 무시.
+        """
+        has_update, latest_version, _status = self._check_plugin_update_detail(
+            plugin_id, local_version, cls_obj, db_type
+        )
         return has_update, latest_version
 
     def _validation_fail_response(self, source_checks, db_type, allow_invalid=None):
@@ -851,10 +931,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _install_from_git(self, git_url, db_type, force=False):
+    def _install_from_git(self, git_url, db_type, force=False, backup_dir=None):
         """
         GitHub/Gitea 저장소 URL 을 통한 플러그인 설치 (git 바이너리 불필요).
         force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
+        backup_dir: 지정 시 설치 실패(로드 검증 포함) 후 해당 디렉토리로 롤백 (소스 교체용).
 
         절차:
           1. 저장소 소스를 HTTP ZIP 으로 다운로드 (urllib 표준 라이브러리만 사용)
@@ -875,6 +956,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "Git 저장소 URL 형식을 인식할 수 없습니다."
 
         temp_dir = tempfile.mkdtemp(prefix="bo_plugin_git_")
+        dest_dir = None  # except 롤백에서 참조 (초기화)
 
         try:
             import io
@@ -1040,6 +1122,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not loaded_ok:
                 if os.path.exists(dest_dir):
                     shutil.rmtree(dest_dir, ignore_errors=True)
+                if backup_dir and os.path.isdir(backup_dir):
+                    # 소스 교체 실패 → 이전 소스 폴더 복원
+                    try:
+                        shutil.copytree(backup_dir, dest_dir)
+                    except Exception as rb_e:
+                        print(f"[PluginManager] replace rollback copy error: {rb_e}")
                 return False, (
                     f"검증 실패: '{plugin_id}' 플러그인이 설치 후 로드되지 않았습니다. "
                     f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
@@ -1067,13 +1155,80 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
+            if backup_dir and os.path.isdir(backup_dir):
+                shutil.rmtree(backup_dir, ignore_errors=True)  # 백업 성공 → 정리
             return True, result_msg
 
         except Exception as e:
+            # 소스 교체 실패 → 원본 복원 시도 (dest_dir은 try 내부에서 정의됨)
+            if backup_dir and os.path.isdir(backup_dir) and dest_dir:
+                try:
+                    if os.path.exists(dest_dir):
+                        shutil.rmtree(dest_dir, ignore_errors=True)
+                    shutil.copytree(backup_dir, dest_dir)
+                except Exception as rb_e:
+                    print(f"[PluginManager] replace rollback (except) error: {rb_e}")
             return False, f"Git 플러그인 설치 중 오류가 발생했습니다: {str(e)}"
         finally:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _replace_plugin(self, plugin_id, new_git_url, db_type):
+        """설치된 플러그인의 소스를 교체 (백업 → 재설치 → 실패 시 롤백).
+
+        설계: 소스마다 파일 구조/update_manifest/subpath가 다를 수 있어
+        git_url 메타만 바꾸는 대신 폴더 재설치 방식으로 안전하게 교체.
+        - 백업: plugins_base/.pm_replace_backup_<id> (플러그인 폴더 전체 + 소스 메타)
+        - 재설치: _install_from_git(new_git_url, backup_dir=백업경로)
+        - 성공: 백업 삭제, 실패: 백업 복원 (소스 메타도 원복)
+        """
+        base_dir = self._get_plugins_base_dir()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", plugin_id or ""):
+            return False, f"유효하지 않은 플러그인 ID입니다: {plugin_id}"
+
+        pdir, err = self._validate_plugin_path(plugin_id)
+        if err or not pdir:
+            return False, err or "유효하지 않은 플러그인 ID입니다."
+        if not os.path.isdir(pdir):
+            return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
+        if plugin_id in ("plugin_manager", "base.py", "base"):
+            return False, "시스템 핵심 플러그인은 소스를 교체할 수 없습니다."
+
+        # 1. 후보 검증: 카탈로그에 같은 plugin_id + 유효한 소스가 있는지
+        candidates = self._catalog_replace_candidates(plugin_id, db_type)
+        candidate_urls = {str(c["git_url"]).rstrip("/") for c in candidates}
+        if new_git_url.rstrip("/") not in candidate_urls:
+            return False, (
+                "소스 교체 거부: 요청한 저장소는 이 플러그인의 카탈로그 후보가 아닙니다. "
+                "(카탈로그 갱신 후 다시 시도하세요)"
+            )
+
+        # 2. 백업 (플러그인 폴더 + 소스 메타)
+        backup_dir = os.path.join(base_dir, f".pm_replace_backup_{plugin_id}")
+        old_git_info = None
+        try:
+            old_git_info = self._read_git_source_info(plugin_id)
+        except Exception:
+            old_git_info = None
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        try:
+            shutil.copytree(pdir, backup_dir)
+        except Exception as e:
+            return False, f"소스 교체 백업 실패: {str(e)}"
+
+        # 3. 재설치 (실패 시 backup_dir로 롤백)
+        ok, msg = self._install_from_git(new_git_url, db_type, force=False, backup_dir=backup_dir)
+        if not ok:
+            # _install_from_git이 backup_dir에서 복원했으면 여기서는 정리만
+            if os.path.exists(backup_dir):
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            return False, f"소스 교체 실패 (원본 복원됨): {msg}"
+
+        # 4. 성공 — 교체된 소스로 재활성화 + 소스 메타 정리 완료 (_install_from_git이 갱신)
+        return True, (
+            f"플러그인 '{plugin_id}' 소스가 교체되었습니다: {new_git_url}"
+        )
 
     def _build_repo_zip_url(self, git_url):
         """
@@ -2356,18 +2511,26 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None):
+    def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None, force_q_fallback=False):
         """토픽 검색 (per_page=100). 응답 dict 반환 (예외 전파).
 
-        - GitHub: Search API (토큰 설정 시 Authorization: Bearer ***)
+        - GitHub: Search API (토큰 설정 시 Authorization: Bearer ***
         - Gitea : 등록 서버의 /api/v1/repos/search?topic=... (토큰 필요 시 token ***)
+          force_q_fallback=True면 topic 파라미터 대신 q 키워드 검색 (topic 무시 서버 대응)
         """
         if source == "gitea":
             if not gitea_server:
                 raise RuntimeError("Gitea 서버 설정이 없습니다.")
-            url = "{0}/api/v1/repos/search?topic={1}&limit=50&page=1".format(
-                gitea_server["url"], topic
-            )
+            # Gitea 서버에 따라 topic 파라미터가 무시되는 경우가 있음 (토픽 미등록/비활성 서버).
+            # 1차: topic 검색, 2차: q 키워드 검색(토픽 필터 무시 폴백) — 플러그인 여부는 VERSION 존재로 판별
+            if force_q_fallback:
+                url = "{0}/api/v1/repos/search?q={1}&limit=50&page=1".format(
+                    gitea_server["url"], topic
+                )
+            else:
+                url = "{0}/api/v1/repos/search?topic={1}&limit=50&page=1".format(
+                    gitea_server["url"], topic
+                )
             headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
             token = gitea_server.get("token") or ""
             if token:
@@ -2390,6 +2553,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _catalog_search_gitea_topic(self, db_type, topic, server):
         """Gitea 토픽 검색 → GitHub과 동일한 {items:[...]} 형태로 정규화.
         Gitea API 응답: {data: [ {full_name, html_url, description, topics, default_branch, updated_at, private}, ... ]}
+        일부 서버는 topic 파라미터를 무시하고 전체를 반환 → 클라이언트 토픽 필터에서 0개면
+        q 키워드 검색으로 폴백 (VERSION 존재 여부는 별도 검증 단계에서 판별).
         """
         raw = self._catalog_search_topic(db_type, topic, source="gitea", gitea_server=server)
         items = raw.get("data") if isinstance(raw, dict) else None
@@ -2423,6 +2588,44 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "_source": "gitea",
                 "_base_url": server["url"],
             })
+
+        # topic 필터 결과 0개 → 서버가 topic 파라미터를 무시한 것으로 보고 q 키워드 폴백
+        # q는 저장소명/설명 키워드이므로 토픽명 그대로가 아닌, 토픽명에서 하이픈/밑줄로 분해한 첫 단어로 검색
+        # (예: bookoasis-plugin → bookoasis)
+        if not out:
+            q_terms = []
+            for part in str(topic).lower().replace(",", " ").split():
+                for seg in re.split(r"[-_]", part):
+                    if seg and len(seg) >= 3 and seg not in q_terms:
+                        q_terms.append(seg)
+            if not q_terms:
+                q_terms = [str(topic).lower().strip()]
+            seen = set()
+            for q in q_terms:
+                try:
+                    fb_raw = self._catalog_search_topic(db_type, q, source="gitea", gitea_server=server, force_q_fallback=True)
+                except Exception:
+                    continue
+                fb_items = fb_raw.get("data") if isinstance(fb_raw, dict) else None
+                if not isinstance(fb_items, list):
+                    continue
+                for it in fb_items:
+                    if not isinstance(it, dict):
+                        continue
+                    full_name = str(it.get("full_name") or "").strip()
+                    if not full_name or full_name in seen:
+                        continue
+                    seen.add(full_name)
+                    out.append({
+                        "full_name": full_name,
+                        "html_url": str(it.get("html_url") or ""),
+                        "description": str(it.get("description") or "")[:500],
+                        "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
+                        "default_branch": str(it.get("default_branch") or "main"),
+                        "pushed_at": str(it.get("updated_at") or ""),
+                        "_source": "gitea",
+                        "_base_url": server["url"],
+                    })
         return {"items": out}
 
     def _catalog_check_repo_version(self, full_name, default_branch, source="github", base_url=None, db_type=None):
@@ -2943,6 +3146,48 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return []
 
+    def _catalog_replace_candidates(self, plugin_id, db_type=None):
+        """같은 plugin_id의 카탈로그 행 중 현재 소스를 제외한 유효 후보 목록.
+
+        소스 교체 후보: 같은 plugin_id, is_valid='valid', 현재 설치된 소스(git_url)와 다른 행.
+        반환: [{full_name, html_url, source, base_url, git_url, latest_version, plugin_name, default_branch}]
+        """
+        try:
+            installed_git = None
+            git_info = self._read_git_source_info(plugin_id)
+            if git_info:
+                installed_git = str(git_info.get("git_url") or "").strip().rstrip("/") or None
+        except Exception:
+            installed_git = None
+
+        rows = self._catalog_list_valid_repos()
+        candidates = []
+        for r in rows:
+            pid = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
+            if pid != plugin_id:
+                continue
+            source = str(r.get("source") or "github")
+            base_url = r.get("base_url")
+            if source == "gitea" and base_url:
+                git_url = r.get("html_url") or ("{0}/{1}".format(base_url, r["full_name"]))
+            else:
+                git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            # 현재 소스 제외
+            if installed_git and git_url.rstrip("/") == installed_git:
+                continue
+            candidates.append({
+                "full_name": r["full_name"],
+                "html_url": r.get("html_url"),
+                "source": source,
+                "base_url": base_url,
+                "git_url": git_url,
+                "latest_version": r.get("latest_version"),
+                "plugin_name": str(r.get("plugin_name") or "").strip() or pid,
+                "default_branch": r.get("default_branch"),
+                "description": r.get("description"),
+            })
+        return candidates
+
     def _merge_catalog_plugins(self, plugins, db_type):
         """
         설치된 플러그인 목록에 미설치 카탈로그 항목(valid만) 병합.
@@ -2952,6 +3197,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         installed_ids = {p.get("id") for p in plugins if p.get("id")}
         catalog_rows = self._catalog_list_valid_repos()
         merged = list(plugins)
+        # 설치된 플러그인 → 같은 plugin_id의 다른 소스 후보 첨부 (소스 교체용)
+        installed_by_id = {p.get("id"): p for p in plugins if p.get("id")}
+        for r in catalog_rows:
+            plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
+            if plugin_id not in installed_by_id:
+                continue  # 미설치 — 아래 병합 루프에서 처리
+            inst = installed_by_id[plugin_id]
+            source = str(r.get("source") or "github")
+            if source == "gitea" and r.get("base_url"):
+                git_url = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
+            else:
+                git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            cur_url = str(inst.get("git_url") or "").strip().rstrip("/")
+            if cur_url and git_url.rstrip("/") == cur_url:
+                continue  # 현재 소스 자신 — 후보 아님
+            cand = {
+                "full_name": r["full_name"],
+                "html_url": r.get("html_url"),
+                "source": source,
+                "base_url": r.get("base_url"),
+                "git_url": git_url,
+                "latest_version": r.get("latest_version"),
+                "plugin_name": str(r.get("plugin_name") or "").strip() or plugin_id,
+                "default_branch": r.get("default_branch"),
+                "description": r.get("description"),
+            }
+            inst.setdefault("replace_candidates", []).append(cand)
         for r in catalog_rows:
             plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
             if plugin_id in installed_ids:
