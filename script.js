@@ -397,7 +397,7 @@
         modal.innerHTML = `
             <div class="pm-modal pm-replace-modal">
                 <div class="pm-modal-header">
-                    <h3><i class="fa-solid fa-arrows-rotate"></i> 소스 교체 — ${escapeHtml(pluginName)}</h3>
+                    <h3><i class="fa-solid fa-arrows-rotate"></i> 저장소 변경 — ${escapeHtml(pluginName)}</h3>
                     <button class="pm-modal-close" title="닫기"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="pm-modal-body">
@@ -407,14 +407,14 @@
                     </div>
                     <p class="pm-replace-notice">
                         <i class="fa-solid fa-triangle-exclamation" style="color:var(--mdx-danger,#e5534b)"></i>
-                        소스 교체는 플러그인 폴더를 새 저장소 내용으로 <b>재설치</b>합니다.
+                        저장소 변경은 플러그인 폴더를 새 저장소 내용으로 <b>재설치</b>합니다.
                         설정/데이터는 유지되지만, 업데이트 소스가 바뀌면 이전 소스의 새 버전은 더 이상 받지 않습니다.
                     </p>
                     <div class="pm-replace-options">${rows}</div>
                 </div>
                 <div class="pm-modal-footer">
                     <button class="pm-btn pm-btn-secondary pm-btn-sm pm-modal-cancel">취소</button>
-                    <button class="pm-btn pm-btn-warning pm-btn-sm pm-replace-confirm">교체하기</button>
+                    <button class="pm-btn pm-btn-warning pm-btn-sm pm-replace-confirm">변경하기</button>
                 </div>
             </div>`;
 
@@ -643,15 +643,15 @@
         // 배지 (ID 줄 옆)
         const idEl = card.querySelector('.pm-plugin-id');
         if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
-            idEl.insertAdjacentHTML('beforeend',
-                ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>');
-        }
+                        idEl.insertAdjacentHTML('beforeend',
+                            ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>');
+                    }
         // 교체 버튼
         const actions = card.querySelector('.pm-card-action-btns');
         if (!actions || actions.querySelector('.pm-btn-replace')) return;
         actions.insertAdjacentHTML('afterbegin',
-            `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 소스로 교체 (업데이트 불가 상태 탈출)">
-                <i class="fa-solid fa-arrows-rotate"></i> 소스 교체
+            `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 저장소로 변경 (업데이트 불가 상태 탈출)">
+                <i class="fa-solid fa-arrows-rotate"></i> 저장소 변경
                </button>`);
         const btn = actions.querySelector('.pm-btn-replace');
         if (btn) bindReplaceButton(btn);
@@ -663,9 +663,9 @@
         if (!card) return;
         const idEl = card.querySelector('.pm-plugin-id');
         if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
-            idEl.insertAdjacentHTML('beforeend',
-                ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>');
-        }
+                        idEl.insertAdjacentHTML('beforeend',
+                            ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>');
+                    }
     }
 
     // 카운트 배지 업데이트
@@ -859,13 +859,13 @@
 
             // 소스 교체 필요 상태 (업데이트 차단 + 후보 존재)
             const replaceBtnHtml = (p.update_blocked && Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0 && !p.is_system)
-                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 소스로 교체 (업데이트 불가 상태 탈출)">
-                    <i class="fa-solid fa-arrows-rotate"></i> 소스 교체
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 저장소로 변경 (업데이트 불가 상태 탈출)">
+                    <i class="fa-solid fa-arrows-rotate"></i> 저장소 변경
                    </button>`
                 : '';
 
             const blockedBadge = p.update_blocked
-                ? '<span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>'
+                ? '<span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>'
                 : '';
 
             const deleteBtnHtml = p.is_system
