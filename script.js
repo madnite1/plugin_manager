@@ -323,6 +323,144 @@
         });
     }
 
+    // ---- 소스 교체 (replace_git) ----
+    // 카드의 replace_candidates를 모달로 보여주고 선택 시 replace_git 호출
+
+    // 교체 후보 서버 재조회 (카드 데이터에 없으면 check_update 응답 기준)
+    async function fetchReplaceCandidates(pluginId) {
+        const p = allPlugins.find(x => x.id === pluginId);
+        if (p && Array.isArray(p.replace_candidates)) return p.replace_candidates;
+        try {
+            const res = await callPluginAction({ action: 'check_update', plugin_id: pluginId });
+            const r = res && res.success ? res.message : null;
+            if (r && Array.isArray(r.replace_candidates)) return r.replace_candidates;
+        } catch(e) { /* ignore */ }
+        return [];
+    }
+
+    function bindReplaceButton(btn) {
+        btn.addEventListener('click', async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const pluginId = this.getAttribute('data-id');
+            const pluginName = this.getAttribute('data-name');
+            if (!pluginId) return;
+
+            const candidates = await fetchReplaceCandidates(pluginId);
+            if (!candidates.length) {
+                showAlert(`'${pluginName}' 교체 가능한 소스 후보가 없습니다. (카탈로그 갱신 후 다시 시도)`, true);
+                return;
+            }
+            openReplaceModal(pluginId, pluginName, candidates);
+        });
+    }
+
+    // 교체 모달 열기
+    function openReplaceModal(pluginId, pluginName, candidates) {
+        const p = allPlugins.find(x => x.id === pluginId);
+        const currentVer = p ? p.version : '';
+        const currentSrc = p && p.git_url ? p.git_url : '';
+
+        const rows = candidates.map((c, i) => {
+            const isGitea = c.source === 'gitea';
+            const srcLabel = isGitea ? 'Gitea' : 'GitHub';
+            const srcIcon = isGitea ? 'fa-solid fa-server' : 'fa-brands fa-github';
+            // 버전 비교 — 다운그레이드 경고
+            const cver = c.latest_version || '?';
+            let warnDowngrade = '';
+            if (currentVer && cver && cver !== '?') {
+                const cmp = compareVersions(cver, currentVer);
+                if (cmp < 0) warnDowngrade = '<span class="pm-badge pm-badge-danger" title="선택 소스가 현재 버전보다 낮습니다">다운그레이드</span>';
+                else if (cmp > 0) warnDowngrade = '<span class="pm-badge pm-badge-version" title="선택 소스가 현재 버전보다 높습니다">최신</span>';
+            }
+            return `
+                <label class="pm-replace-option" data-idx="${i}">
+                    <input type="radio" name="pm-replace-src" value="${escapeHtmlAttr(c.git_url)}" ${i === 0 ? 'checked' : ''}>
+                    <div class="pm-replace-option-body">
+                        <div class="pm-replace-option-title">
+                            <i class="${srcIcon}"></i> ${srcLabel}
+                            <span class="pm-replace-repo">${escapeHtml(c.full_name)}</span>
+                            ${warnDowngrade}
+                        </div>
+                        <div class="pm-replace-option-meta">
+                            <span class="pm-badge pm-badge-version" title="최신 버전"><i class="fa-solid fa-tag"></i> v${escapeHtml(cver)}</span>
+                            ${c.default_branch ? `<span class="pm-badge">${escapeHtml(c.default_branch)}</span>` : ''}
+                        </div>
+                        ${c.description ? `<p class="pm-catalog-desc">${escapeHtml(c.description)}</p>` : ''}
+                    </div>
+                </label>`;
+        }).join('');
+
+        const modal = document.createElement('div');
+        modal.className = 'pm-modal-overlay';
+        modal.innerHTML = `
+            <div class="pm-modal pm-replace-modal">
+                <div class="pm-modal-header">
+                    <h3><i class="fa-solid fa-arrows-rotate"></i> 소스 교체 — ${escapeHtml(pluginName)}</h3>
+                    <button class="pm-modal-close" title="닫기"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="pm-modal-body">
+                    <div class="pm-replace-info">
+                        현재 소스: ${currentSrc ? `<code>${escapeHtml(currentSrc)}</code>` : '알 수 없음 (로컬 설치)'}
+                        ${currentVer ? ` · v${escapeHtml(currentVer)}` : ''}
+                    </div>
+                    <p class="pm-replace-notice">
+                        <i class="fa-solid fa-triangle-exclamation" style="color:var(--mdx-danger,#e5534b)"></i>
+                        소스 교체는 플러그인 폴더를 새 저장소 내용으로 <b>재설치</b>합니다.
+                        설정/데이터는 유지되지만, 업데이트 소스가 바뀌면 이전 소스의 새 버전은 더 이상 받지 않습니다.
+                    </p>
+                    <div class="pm-replace-options">${rows}</div>
+                </div>
+                <div class="pm-modal-footer">
+                    <button class="pm-btn pm-btn-secondary pm-btn-sm pm-modal-cancel">취소</button>
+                    <button class="pm-btn pm-btn-warning pm-btn-sm pm-replace-confirm">교체하기</button>
+                </div>
+            </div>`;
+
+        document.body.appendChild(modal);
+        const close = () => modal.remove();
+        modal.querySelector('.pm-modal-close').addEventListener('click', close);
+        modal.querySelector('.pm-modal-cancel').addEventListener('click', close);
+        modal.addEventListener('click', e => { if (e.target === modal) close(); });
+
+        modal.querySelector('.pm-replace-confirm').addEventListener('click', async function() {
+            const checked = modal.querySelector('input[name="pm-replace-src"]:checked');
+            if (!checked) { showAlert('교체할 소스를 선택하세요.', true); return; }
+            const targetUrl = checked.value;
+            this.disabled = true;
+            const origHtml = this.innerHTML;
+            this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 교체 중...';
+
+            try {
+                const res = await callPluginAction({ action: 'replace_git', plugin_id: pluginId, git_url: targetUrl });
+                close();
+                if (res.success) {
+                    showAlert(res.message || `'${pluginName}' 소스가 교체되었습니다.`);
+                    silentReload(); // 목록 재조회 (새 소스 기준 카드)
+                } else {
+                    showAlert(res.error || '소스 교체 실패', true);
+                }
+            } catch(err) {
+                this.disabled = false;
+                this.innerHTML = origHtml;
+                showAlert('소스 교체 중 통신 오류가 발생했습니다: ' + err.message, true);
+            }
+        });
+    }
+
+    // 버전 비교 헬퍼 (x.y.z 문자열 → 숫자 비교, 파싱 불가면 0)
+    function compareVersions(a, b) {
+        const pa = String(a || '').split('.').map(x => parseInt(x, 10) || 0);
+        const pb = String(b || '').split('.').map(x => parseInt(x, 10) || 0);
+        const len = Math.max(pa.length, pb.length);
+        for (let i = 0; i < len; i++) {
+            const va = pa[i] || 0, vb = pb[i] || 0;
+            if (va !== vb) return va < vb ? -1 : 1;
+        }
+        return 0;
+    }
+
     // 개별 카드 업데이트 재확인 버튼 (수동) — 2026-08-17 제거됨
 
     // 업데이트 체크 비동기 진행 (목록 렌더 이후 개별 조회)
@@ -363,6 +501,18 @@
                     // 성공 시 message에 결과 객체가 담김
                     const r = res && res.success ? res.message : null;
                     if (r && typeof r === 'object') {
+                        // 소스 교체 필요 (업데이트 차단) — 배지/버튼 표시
+                        if (r.update_blocked) {
+                            p.update_blocked = true;
+                            p.blocked_reason = r.blocked_reason;
+                            p.replace_candidates = r.replace_candidates || [];
+                            if (p.replace_candidates.length > 0 && !p.is_system) {
+                                patchCardReplace(p);
+                            } else {
+                                patchCardBlocked(p);
+                            }
+                            return;
+                        }
                         const autoOn = !!(catalogMeta && catalogMeta.auto_update);
                         if (r.has_update && autoOn && !p.is_system) {
                             // 자동 업데이트 ON → 버튼 대신 순차 큐에 넣어 실제 교체
@@ -484,6 +634,38 @@
 
         const btn = actions.querySelector('.pm-btn-update');
         if (btn) bindUpdateButton(btn);
+    }
+
+    // 업데이트 차단 + 소스 교체 후보 있음 — 배지 + 교체 버튼 (부분 DOM 패치)
+    function patchCardReplace(p) {
+        const card = document.getElementById(`pm-card-${p.id}`);
+        if (!card) return;
+        // 배지 (ID 줄 옆)
+        const idEl = card.querySelector('.pm-plugin-id');
+        if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
+            idEl.insertAdjacentHTML('beforeend',
+                ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>');
+        }
+        // 교체 버튼
+        const actions = card.querySelector('.pm-card-action-btns');
+        if (!actions || actions.querySelector('.pm-btn-replace')) return;
+        actions.insertAdjacentHTML('afterbegin',
+            `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 소스로 교체 (업데이트 불가 상태 탈출)">
+                <i class="fa-solid fa-arrows-rotate"></i> 소스 교체
+               </button>`);
+        const btn = actions.querySelector('.pm-btn-replace');
+        if (btn) bindReplaceButton(btn);
+    }
+
+    // 업데이트 차단 + 후보 없음 — 배지만 표시 (후보 없으면 교체 버튼 없음)
+    function patchCardBlocked(p) {
+        const card = document.getElementById(`pm-card-${p.id}`);
+        if (!card) return;
+        const idEl = card.querySelector('.pm-plugin-id');
+        if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
+            idEl.insertAdjacentHTML('beforeend',
+                ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>');
+        }
     }
 
     // 카운트 배지 업데이트
@@ -673,6 +855,17 @@
                 ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(p.latest_version)})">
                     <i class="fa-solid fa-arrow-up-from-bracket"></i> v${escapeHtml(p.latest_version)}
                    </button>`
+                : '';
+
+            // 소스 교체 필요 상태 (업데이트 차단 + 후보 존재)
+            const replaceBtnHtml = (p.update_blocked && Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0 && !p.is_system)
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 소스로 교체 (업데이트 불가 상태 탈출)">
+                    <i class="fa-solid fa-arrows-rotate"></i> 소스 교체
+                   </button>`
+                : '';
+
+            const blockedBadge = p.update_blocked
+                ? '<span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 소스에 문제가 있습니다">소스 확인 필요</span>'
                 : '';
 
             const deleteBtnHtml = p.is_system
