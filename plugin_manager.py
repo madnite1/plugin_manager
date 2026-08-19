@@ -338,6 +338,72 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return m.group(1), m.group(2)
         return None
 
+    # ---- 저장소 호스트 일반화 (GitHub + Gitea) ----
+
+    def _parse_git_repo(self, git_url):
+        """Git 저장소 웹 URL 파싱 → dict (type/owner/repo/branch/subpath) 또는 None.
+
+        - GitHub: https://github.com/owner/repo[/tree/branch]
+        - Gitea : https://host/owner/repo[/src/branch/branch]
+        반환: {"type": "github"|"gitea", "host": ..., "base": "https://github.com"|"https://host",
+               "owner": ..., "repo": ..., "branch": ..., "subpath": ...}
+        """
+        url = str(git_url or "").strip().rstrip("/")
+        url = re.sub(r"\.git$", "", url)
+        if not url:
+            return None
+        m = re.match(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:/tree/([^/]+))?(?:/.*)?$", url)
+        if m:
+            return {
+                "type": "github",
+                "host": "github.com",
+                "base": "https://github.com",
+                "owner": m.group(1),
+                "repo": m.group(2),
+                "branch": m.group(3) or None,
+                "subpath": "",
+            }
+        m = re.match(r"^https?://([^/]+)/([^/]+)/([^/]+?)(?:/src/branch/([^/]+))?(?:/.*)?$", url)
+        if m:
+            return {
+                "type": "gitea",
+                "host": m.group(1),
+                "base": "https://{0}".format(m.group(1)),
+                "owner": m.group(2),
+                "repo": m.group(3),
+                "branch": m.group(4) or None,
+                "subpath": "",
+            }
+        return None
+
+    def _host_zip_base(self, parsed):
+        """파싱된 저장소 → (zip_base, tag_base, raw_base, api_base) 튜플.
+        - GitHub: codeload / github / raw.githubusercontent / api.github.com
+        - Gitea : {base}/archive / {base} / {base}/raw / {base}/api/v1
+        """
+        if not parsed:
+            return None
+        if parsed["type"] == "github":
+            o, r = parsed["owner"], parsed["repo"]
+            return (
+                "https://codeload.github.com/{0}/{1}".format(o, r),
+                "https://github.com/{0}/{1}".format(o, r),
+                "https://raw.githubusercontent.com/{0}/{1}".format(o, r),
+                "https://api.github.com",
+            )
+        base = parsed["base"]
+        o, r = parsed["owner"], parsed["repo"]
+        return (
+            "{0}/{1}/{2}/archive".format(base, o, r),
+            "{0}/{1}/{2}".format(base, o, r),
+            "{0}/{1}/{2}/raw".format(base, o, r),
+            "{0}/api/v1".format(base),
+        )
+
+    def _host_branch(self, parsed):
+        """브랜치 결정: 명시 → default_branch 설정 → main"""
+        return parsed.get("branch") or parsed.get("default_branch") or "main"
+
     def _fetch_latest_release_tag(self, owner, repo):
         """
         GitHub 최신 릴리즈 태그 조회.
@@ -368,14 +434,38 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         _RELEASE_TAG_CACHE[repo_key] = (tag, now)
         return tag
 
+    def _fetch_gitea_latest_release_tag(self, base, owner, repo, token=None):
+        """Gitea 최신 릴리즈 태그 조회 (API /api/v1/repos/{o}/{r}/releases/latest).
+        릴리즈 없으면 None. 비공개 저장소는 토큰 필요."""
+        api_base = "{0}/api/v1".format(base)
+        url = "{0}/repos/{1}/{2}/releases/latest".format(api_base, owner, repo)
+        try:
+            headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
+            if token:
+                headers["Authorization"] = "token {0}".format(token)
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            tag = str(data.get("tag_name") or "").strip()
+            return tag or None
+        except Exception:
+            return None
+
     def _parse_raw_base_url(self, raw_base_url):
         """raw.githubusercontent.com URL에서 (owner, repo, branch, subpath) 추출.
         subpath: branch 이후의 서브디렉토리 경로 (없으면 '').
         e.g. .../madnite1/plugin_manager/main → ('madnite1', 'plugin_manager', 'main', '')
              .../leeyj/BookOasis_stable/main/plugins/metadata/stats_dashboard → ('leeyj', 'BookOasis_stable', 'main', 'plugins/metadata/stats_dashboard')
              .../yume-script/plugin_board/refs/heads/main → ('yume-script', 'plugin_board', 'main', '')
+        Gitea raw URL: https://host/owner/repo/raw/branch/<branch>[/subpath] 도 지원.
         """
         url = str(raw_base_url or "").strip().rstrip("/")
+        # Gitea: https://host/{o}/{r}/raw/branch/{branch}[/subpath] 또는 /raw/{branch}
+        m = re.match(
+            r"^https?://([^/]+)/([^/]+)/([^/]+)/raw/(?:branch/)?([^/]+)(/.*)?$", url
+        )
+        if m:
+            return m.group(2), m.group(3), m.group(4), (m.group(5) or "").strip("/")
         m = re.match(
             r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)(/.*)?$", url
         )
@@ -392,7 +482,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return None
 
     def _ensure_git_source_from_raw_base_url(self, plugin_id, raw_base_url, manifest_files):
-        """소스 메타가 없을 때, raw_base_url에서 GitHub 정보를 추론하여
+        """소스 메타가 없을 때, raw_base_url에서 GitHub/Gitea 정보를 추론하여
         git 설치 시와 동일한 형태로 sqlite plugin_sources 에 저장한다.
         단, 서브디렉토리 경로(monorepo 내 플러그인)는 릴리즈 태그 기준이 달라
         잘못된 태그를 참조하므로 생성하지 않는다."""
@@ -404,7 +494,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if subpath:
                 # 모놀리식 저장소의 서브디렉토리 — 릴리즈 태그가 플러그인 기준이 아니므로 스킵
                 return None
-            git_url = f"https://github.com/{owner}/{repo}"
+            if "raw.githubusercontent.com" in str(raw_base_url):
+                git_url = f"https://github.com/{owner}/{repo}"
+            else:
+                # Gitea raw — 호스트는 raw_base_url에서 추출
+                host = re.sub(r"^https?://", "", str(raw_base_url)).split("/")[0]
+                git_url = f"https://{host}/{owner}/{repo}"
             git_source_info = {
                 "git_url": git_url,
                 "branch": branch,
@@ -416,8 +511,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None):
-        """업데이트 소스 URL 결정: GitHub 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백.
+    def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None, db_type=None):
+        """업데이트 소스 URL 결정: 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백.
+        GitHub는 /releases/latest 리다이렉트, Gitea는 API로 태그 조회 (토큰 필요 시 사용).
         소스 메타가 없으면 raw_base_url에서 추론하여 저장한 뒤 동일하게 처리."""
         try:
             git_info = self._read_git_source_info(plugin_id)
@@ -425,22 +521,45 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 git_info = self._ensure_git_source_from_raw_base_url(
                     plugin_id, raw_base_url, manifest_files
                 )
-            repo = self._parse_github_repo(git_info.get("git_url")) if git_info else None
-            if repo:
-                tag = self._fetch_latest_release_tag(repo[0], repo[1])
+            git_url = (git_info.get("git_url") or "") if git_info else ""
+            parsed = self._parse_git_repo(git_url)
+            if not parsed:
+                return raw_base_url
+            branch = str(git_info.get("branch") or "").strip() or self._host_branch(parsed)
+            raw_prefix = self._host_zip_base(parsed)[2]
+            # 현재 raw_base_url이 이 저장소의 raw 브랜치 경로인지 확인 후 태그로 교체
+            if raw_base_url.startswith(raw_prefix):
+                # GitHub/Gitea 공통: 태그 조회
+                if parsed["type"] == "github":
+                    tag = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
+                else:
+                    token = self._gitea_token_for_host(db_type, parsed["host"])
+                    tag = self._fetch_gitea_latest_release_tag(
+                        parsed["base"], parsed["owner"], parsed["repo"], token
+                    )
                 if tag:
-                    branch = str(git_info.get("branch") or "").strip()
-                    prefix = f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{branch}"
-                    if branch and raw_base_url.startswith(prefix):
-                        return raw_base_url.replace(prefix, f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{tag}", 1)
-                    return f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/{tag}"
+                    # Gitea raw URL은 /raw/branch/<branch> 형식, GitHub는 /raw.githubusercontent.com/.../<branch>
+                    if parsed["type"] == "gitea" and "/raw/branch/" in raw_base_url:
+                        return raw_base_url.replace(
+                            raw_prefix + "/branch/" + branch,
+                            raw_prefix + "/branch/" + tag,
+                            1,
+                        )
+                    return raw_base_url.replace(
+                        raw_prefix + "/" + branch,
+                        raw_prefix + "/" + tag,
+                        1,
+                    )
         except Exception:
             pass
         return raw_base_url
 
-    def _fetch_text(self, url, timeout=15):
-        """URL GET → 텍스트 (UTF-8, 오류 시 예외 전파)"""
-        req = Request(url, headers={"User-Agent": "BookOasis/1.0"})
+    def _fetch_text(self, url, timeout=15, token=None):
+        """URL GET → 텍스트 (UTF-8, 오류 시 예외 전파). token은 Gitea 인증 헤더용."""
+        headers = {"User-Agent": "BookOasis/1.0"}
+        if token:
+            headers["Authorization"] = "token {0}".format(token)
+        req = Request(url, headers=headers)
         with urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
 
@@ -491,11 +610,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _fetch_remote_plugin_version(self, base_url, version_file="VERSION", version_key="plugin version"):
-        """원격 VERSION 조회 (실패/파싱 불가 시 None — 체크는 조용히 실패)"""
+    def _fetch_remote_plugin_version(self, base_url, version_file="VERSION", version_key="plugin version", token=None):
+        """원격 VERSION 조회 (실패/파싱 불가 시 None — 체크는 조용히 실패)
+        token은 Gitea 인증용 (비공개 저장소)."""
         try:
             url = f"{base_url.rstrip('/')}/{version_file}"
-            return self._parse_remote_version(self._fetch_text(url), version_key)
+            return self._parse_remote_version(self._fetch_text(url, token=token), version_key)
         except Exception:
             return None
 
@@ -530,7 +650,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception as e:
             print(f"[PluginManager] check_update discover error: {e}")
 
-        has_update, latest_version = self._check_plugin_update(plugin_id, version, cls_obj)
+        has_update, latest_version = self._check_plugin_update(plugin_id, version, cls_obj, db_type)
         return True, {
             "plugin_id": plugin_id,
             "version": version,
@@ -538,7 +658,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "latest_version": latest_version,
         }
 
-    def _check_plugin_update(self, plugin_id, local_version, cls_obj):
+    def _check_plugin_update(self, plugin_id, local_version, cls_obj, db_type=None):
         """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)"""
         has_update = False
         latest_version = local_version
@@ -553,12 +673,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return has_update, latest_version
 
             base_url = self._resolve_update_base_url(
-                plugin_id, spec["raw_base_url"], spec.get("files")
+                plugin_id, spec["raw_base_url"], spec.get("files"), db_type
             )
+            # Gitea 소스면 해당 호스트 토큰 사용 (비공개 저장소 인증)
+            gitea_token = None
+            raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
+            if raw_parsed:
+                src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
+                gitea_token = self._gitea_token_for_host(db_type, src_host)
             remote_ver = self._fetch_remote_plugin_version(
                 base_url,
                 version_file=spec["version_file"],
                 version_key=spec["version_key"],
+                token=gitea_token,
             )
             if remote_ver and self._can_update_to_version(local_version, remote_ver):
                 return True, remote_ver
@@ -1592,7 +1719,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         local_ver = self._read_local_plugin_version(pdir, spec["version_file"], spec["version_key"])
         base_url = self._resolve_update_base_url(
-            plugin_id, spec["raw_base_url"], spec.get("files")
+            plugin_id, spec["raw_base_url"], spec.get("files"), db_type
         )
         remote_ver = self._fetch_remote_plugin_version(
             base_url,
@@ -1609,11 +1736,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
 
         # 파일 다운로드 → 교체
+        # Gitea 소스면 해당 호스트 토큰 사용 (비공개 저장소 인증)
+        gitea_token = None
+        raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
+        if raw_parsed:
+            src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
+            gitea_token = self._gitea_token_for_host(db_type, src_host)
         downloaded = {}
         for name in spec["files"]:
             file_url = f"{base_url.rstrip('/')}/{name}"
             try:
-                downloaded[name] = self._fetch_text(file_url)
+                downloaded[name] = self._fetch_text(file_url, token=gitea_token)
             except HTTPError as e:
                 if e.code == 404:
                     return False, f"원격 저장소에서 파일을 찾을 수 없습니다: {name}"
@@ -2003,7 +2136,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         latest_version TEXT,
                         is_valid       TEXT DEFAULT 'unknown',
                         last_checked   TEXT,
-                        install_error  TEXT
+                        install_error  TEXT,
+                        source         TEXT DEFAULT 'github',
+                        base_url       TEXT
                     )
                     """
                 )
@@ -2013,6 +2148,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     conn.execute("ALTER TABLE repos ADD COLUMN plugin_name TEXT")
                 if "install_error" not in repo_cols:
                     conn.execute("ALTER TABLE repos ADD COLUMN install_error TEXT")
+                if "source" not in repo_cols:
+                    conn.execute("ALTER TABLE repos ADD COLUMN source TEXT DEFAULT 'github'")
+                if "base_url" not in repo_cols:
+                    conn.execute("ALTER TABLE repos ADD COLUMN base_url TEXT")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS meta (
@@ -2122,6 +2261,85 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return list(_CATALOG_DEFAULT_TOPICS)
 
+    # ---- Gitea 서버 설정 ----
+
+    def _catalog_get_gitea_servers(self, db_type):
+        """PM_CATALOG_GITEA_SERVERS 조회 → [{url, token, host}] 목록 (정규화).
+        url은 https:// 강제, 중복 host 제거, 토큰은 빈 문자열 가능.
+        설정 없으면 빈 목록 (Gitea 비활성)."""
+        try:
+            gateway = self.get_db_gateway(db_type)
+            raw = gateway.get_setting("PM_CATALOG_GITEA_SERVERS", default=None)
+            if isinstance(raw, dict):
+                raw = raw.get("value")
+            if not raw:
+                return []
+            data = json.loads(str(raw)) if isinstance(raw, str) else raw
+            if not isinstance(data, list):
+                return []
+            servers = []
+            seen_hosts = set()
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip().rstrip("/")
+                if not url.startswith("https://"):
+                    continue
+                host = re.sub(r"^https?://", "", url).split("/")[0]
+                if not host or host in seen_hosts:
+                    continue
+                seen_hosts.add(host)
+                token = str(item.get("token") or "").strip()
+                servers.append({"url": url, "host": host, "token": token})
+            return servers
+        except Exception:
+            return []
+
+    def _gitea_server_for_host(self, db_type, host):
+        """호스트에 해당하는 Gitea 서버 설정 dict 반환 (없으면 None)"""
+        host = str(host or "").strip().lower()
+        for s in self._catalog_get_gitea_servers(db_type):
+            if str(s.get("host") or "").lower() == host:
+                return s
+        return None
+
+    def _gitea_token_for_host(self, db_type, host):
+        """Gitea 호스트의 토큰 반환 (미등록/미설정이면 None)"""
+        s = self._gitea_server_for_host(db_type, host)
+        return (s or {}).get("token") or None
+
+    def _catalog_validate_gitea_servers(self, raw):
+        """저장 전 Gitea 서버 목록 검증 → 정규화된 JSON 문자열 (무효 항목 제거).
+        - url: https:// 강제
+        - host 중복 제거
+        - 토큰은 마스킹 형태(앞 4 + ***)면 무시 (프론트가 내려준 실제 값만 저장)"""
+        servers = []
+        seen_hosts = set()
+        if isinstance(raw, (list, tuple)):
+            items = raw
+        else:
+            try:
+                items = json.loads(str(raw or "[]"))
+            except Exception:
+                items = []
+            if not isinstance(items, list):
+                items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip().rstrip("/")
+            if not url.startswith("https://"):
+                continue
+            host = re.sub(r"^https?://", "", url).split("/")[0]
+            if not host or host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            token = str(item.get("token") or "").strip()
+            # 프론트에서 보낸 마스킹 표시(등록된 토큰 유지 요청)면 실제 값을
+            # 유지하기 위해 별도 처리 — 여기서는 저장하지 않고 호출부에서 처리.
+            servers.append({"url": url, "token": token})
+        return json.dumps(servers, ensure_ascii=False)
+
     # ---- GitHub 조회 ----
 
     def _catalog_get_github_token(self, db_type):
@@ -2138,9 +2356,25 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _catalog_search_topic(self, db_type, topic):
-        """GitHub Search API topic 검색 (per_page=100). 응답 dict 반환 (예외 전파).
-        토큰이 설정되면 Authorization: Bearer 헤더 추가 — 공용 IP 풀 403 회피."""
+    def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None):
+        """토픽 검색 (per_page=100). 응답 dict 반환 (예외 전파).
+
+        - GitHub: Search API (토큰 설정 시 Authorization: Bearer ***)
+        - Gitea : 등록 서버의 /api/v1/repos/search?topic=... (토큰 필요 시 token ***)
+        """
+        if source == "gitea":
+            if not gitea_server:
+                raise RuntimeError("Gitea 서버 설정이 없습니다.")
+            url = "{0}/api/v1/repos/search?topic={1}&limit=50&page=1".format(
+                gitea_server["url"], topic
+            )
+            headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
+            token = gitea_server.get("token") or ""
+            if token:
+                headers["Authorization"] = "token {0}".format(token)
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
         url = "https://api.github.com/search/repositories?q=topic:{0}&per_page=100".format(topic)
         headers = {
             "User-Agent": "BookOasis/1.0",
@@ -2152,6 +2386,79 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         req = Request(url, headers=headers)
         with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _catalog_search_gitea_topic(self, db_type, topic, server):
+        """Gitea 토픽 검색 → GitHub과 동일한 {items:[...]} 형태로 정규화.
+        Gitea API 응답: {data: [ {full_name, html_url, description, topics, default_branch, updated_at, private}, ... ]}
+        """
+        raw = self._catalog_search_topic(db_type, topic, source="gitea", gitea_server=server)
+        items = raw.get("data") if isinstance(raw, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("Gitea Search API 응답 오류 (topic={0}, server={1})".format(
+                topic, server.get("host", "?")
+            ))
+        out = []
+        wanted = set()
+        for part in str(topic).lower().replace(",", " ").split():
+            if part:
+                wanted.add(part)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            full_name = str(it.get("full_name") or "").strip()
+            if not full_name:
+                continue
+            # Gitea Search API는 topic 파라미터를 완전일치 필터로 보장하지 않음 → 클라이언트에서 필터
+            if wanted:
+                it_topics = {str(t).lower() for t in (it.get("topics") or [])}
+                if not it_topics.intersection(wanted):
+                    continue
+            out.append({
+                "full_name": full_name,
+                "html_url": str(it.get("html_url") or ""),
+                "description": str(it.get("description") or "")[:500],
+                "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
+                "default_branch": str(it.get("default_branch") or "main"),
+                "pushed_at": str(it.get("updated_at") or ""),
+                "_source": "gitea",
+                "_base_url": server["url"],
+            })
+        return {"items": out}
+
+    def _catalog_check_repo_version(self, full_name, default_branch, source="github", base_url=None, db_type=None):
+        """
+        raw VERSION 조회 → (is_valid, plugin_id, latest_version, plugin_name).
+        GitHub: raw.githubusercontent.com, Gitea: {base}/raw/branch/{branch}/VERSION (토큰 필요 시 사용).
+        name은 VERSION JSON 키 → 없으면 코드 raw fetch 후 AST(name 클래스 속성) 추출.
+        404/비JSON/네트워크 오류 → invalid (다음 주기 재판정).
+        """
+        branch = str(default_branch or "main").strip() or "main"
+        if source == "gitea" and base_url:
+            url = "{0}/{1}/raw/branch/{2}/VERSION".format(base_url, full_name, branch)
+        else:
+            url = "https://raw.githubusercontent.com/{0}/{1}/VERSION".format(full_name, branch)
+        try:
+            token = None
+            if source == "gitea" and base_url:
+                token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
+            text = self._fetch_text(url, timeout=15, token=token)
+            version, plugin_id, name = self._catalog_parse_remote_version_meta(text)
+            if not version:
+                return "invalid", None, None, None
+            if not plugin_id:
+                plugin_id = str(full_name).split("/")[-1]
+            if not name:
+                name = self._catalog_fetch_plugin_name(full_name, branch, plugin_id, source, base_url, db_type)
+            return "valid", plugin_id, version, name
+        except Exception:
+            return "invalid", None, None, None
+
+    def _host_of_url(self, url):
+        """URL에서 호스트 추출 (예: https://gitea.example.com → gitea.example.com)"""
+        try:
+            return re.sub(r"^https?://", "", str(url)).split("/")[0]
+        except Exception:
+            return ""
 
     def _catalog_parse_remote_version_meta(self, text):
         """VERSION 텍스트 → (version, plugin_id, name). JSON dict의 id/plugin_id/name 키 최우선."""
@@ -2175,19 +2482,27 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             version = self._parse_remote_version(text)
         return version, plugin_id, name
 
-    def _catalog_fetch_plugin_name(self, full_name, branch, plugin_id):
-        """코드 raw 파일에서 BaseMetadataProvider name 클래스 속성 추출 (없으면 None)."""
+    def _catalog_fetch_plugin_name(self, full_name, branch, plugin_id, source="github", base_url=None, db_type=None):
+        """코드 raw 파일에서 BaseMetadataProvider name 클래스 속성 추출 (없으면 None).
+        GitHub: raw.githubusercontent.com, Gitea: {base}/raw/branch/{branch}"""
         try:
-            src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}.py".format(
-                full_name, branch, plugin_id
-            )
-            source = self._fetch_text(src_url, timeout=15)
+            if source == "gitea" and base_url:
+                src_url = "{0}/{1}/raw/branch/{2}/{3}.py".format(
+                    base_url, full_name, branch, plugin_id
+                )
+                token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
+            else:
+                src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}.py".format(
+                    full_name, branch, plugin_id
+                )
+                token = None
+            source_text = self._fetch_text(src_url, timeout=15, token=token)
         except Exception:
             return None
-        if not source:
+        if not source_text:
             return None
         try:
-            tree = ast.parse(source)
+            tree = ast.parse(source_text)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ClassDef):
                     continue
@@ -2205,27 +2520,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             pass
         return None
-
-    def _catalog_check_repo_version(self, full_name, default_branch):
-        """
-        raw VERSION 조회 → (is_valid, plugin_id, latest_version, plugin_name).
-        name은 VERSION JSON 키 → 없으면 코드 raw fetch 후 AST(name 클래스 속성) 추출.
-        404/비JSON/네트워크 오류 → invalid (다음 주기 재판정).
-        """
-        branch = str(default_branch or "main").strip() or "main"
-        url = "https://raw.githubusercontent.com/{0}/{1}/VERSION".format(full_name, branch)
-        try:
-            text = self._fetch_text(url, timeout=15)
-            version, plugin_id, name = self._catalog_parse_remote_version_meta(text)
-            if not version:
-                return "invalid", None, None, None
-            if not plugin_id:
-                plugin_id = str(full_name).split("/")[-1]
-            if not name:
-                name = self._catalog_fetch_plugin_name(full_name, branch, plugin_id)
-            return "valid", plugin_id, version, name
-        except Exception:
-            return "invalid", None, None, None
 
     # ---- 갱신 로직 ----
 
@@ -2265,7 +2559,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not topics:
                 topics = list(_CATALOG_DEFAULT_TOPICS)
 
-            # 1. 토픽별 Search API → full_name 기준 합집합
+            # 1. 토픽별 Search API (GitHub + 등록된 모든 Gitea 서버) → (source, full_name) 기준 합집합
             merged = {}
             for topic in topics:
                 data = self._catalog_search_topic(db_type, topic)
@@ -2277,21 +2571,46 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     full_name = str(it.get("full_name") or "").strip()
                     if not full_name:
                         continue
-                    merged[full_name] = {
+                    merged[("github", full_name)] = {
                         "html_url": str(it.get("html_url") or ""),
                         "description": str(it.get("description") or "")[:500],
                         "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
                         "default_branch": str(it.get("default_branch") or "main"),
                         "pushed_at": str(it.get("pushed_at") or ""),
+                        "source": "github",
+                        "base_url": "https://github.com",
                     }
 
+            gitea_servers = self._catalog_get_gitea_servers(db_type)
+            gitea_errors = []
+            for server in gitea_servers:
+                try:
+                    for topic in topics:
+                        data = self._catalog_search_gitea_topic(db_type, topic, server)
+                        for it in data.get("items", []):
+                            full_name = str(it.get("full_name") or "").strip()
+                            if not full_name:
+                                continue
+                            merged[("gitea", full_name)] = {
+                                "html_url": str(it.get("html_url") or ""),
+                                "description": str(it.get("description") or "")[:500],
+                                "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
+                                "default_branch": str(it.get("default_branch") or "main"),
+                                "pushed_at": str(it.get("pushed_at") or ""),
+                                "source": "gitea",
+                                "base_url": server["url"],
+                            }
+                except Exception as e:
+                    # 개별 Gitea 서버 실패는 전체 갱신을 막지 않음 (GitHub는 이미 수집됨)
+                    gitea_errors.append("{0}: {1}".format(server.get("host", "?"), str(e)[:200]))
+
             # 2. repos upsert (검색 메타만 — is_valid/last_checked는 보존)
-            for full_name, info in merged.items():
+            for (source, full_name), info in merged.items():
                 self._catalog_db_execute(
                     """
                     INSERT INTO repos
-                        (full_name, html_url, description, topics, default_branch, pushed_at, plugin_id, latest_version, is_valid, last_checked)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'unknown', NULL)
+                        (full_name, html_url, description, topics, default_branch, pushed_at, plugin_id, latest_version, is_valid, last_checked, source, base_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'unknown', NULL, ?, ?)
                     ON CONFLICT(full_name) DO UPDATE SET
                         html_url=excluded.html_url,
                         description=excluded.description,
@@ -2299,6 +2618,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         default_branch=excluded.default_branch,
                         pushed_at=excluded.pushed_at,
                         plugin_id=excluded.plugin_id,
+                        source=excluded.source,
+                        base_url=excluded.base_url,
                         install_error=NULL
                     """,
                     (
@@ -2309,16 +2630,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         info["default_branch"],
                         info["pushed_at"],
                         str(full_name).split("/")[-1],
+                        source,
+                        info["base_url"],
                     ),
                 )
 
             # 3. 검색에서 더 이상 조회되지 않는 미설치 저장소 정리 (DB 제거)
             #    설치된 플러그인은 검색과 무관하게 유지 (업데이트/정보 보존).
-            #    모든 토픽 검색이 성공한 시점에만 실행 — 부분 실패 시 위에서 raise 되어 도달 안 함.
+            #    모든 토픽 검색이 성공한 시점에만 실행 — GitHub 실패 시 위에서 raise 되어 도달 안 함.
             removed = 0
             base_dir = self._get_plugins_base_dir()
             for r in self._catalog_db_query("SELECT full_name, plugin_id FROM repos"):
-                if r["full_name"] in merged:
+                key = (str(r.get("source") or "github"), r["full_name"])
+                if key in merged:
                     continue
                 plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
                 if os.path.isdir(os.path.join(base_dir, plugin_id)):
@@ -2331,7 +2655,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 4. VERSION 판별 (rate 보호: 저장소 20개 초과 시 24시간 내 검증 결과 재사용)
             now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             repo_rows = self._catalog_db_query(
-                "SELECT full_name, default_branch, is_valid, last_checked FROM repos"
+                "SELECT full_name, default_branch, is_valid, last_checked, source, base_url FROM repos"
             )
             rows_to_check = []
             if len(repo_rows) > _CATALOG_VERIFY_MAX_REPOS:
@@ -2356,7 +2680,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             for r in rows_to_check:
                 full_name = r["full_name"]
                 is_valid, plugin_id, version, plugin_name = self._catalog_check_repo_version(
-                    full_name, r.get("default_branch") or "main"
+                    full_name,
+                    r.get("default_branch") or "main",
+                    source=str(r.get("source") or "github"),
+                    base_url=r.get("base_url"),
+                    db_type=db_type,
                 )
                 self._catalog_db_execute(
                     "UPDATE repos SET is_valid=?, plugin_id=?, latest_version=?, plugin_name=?, last_checked=? WHERE full_name=?",
@@ -2544,6 +2872,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 except Exception:
                     pass
 
+        # Gitea 서버 목록 — 토큰은 실제 값 대신 마스킹 표시 (보안: 프론트로 내려주지 않음)
+        gitea_servers = []
+        for s in self._catalog_get_gitea_servers(db_type):
+            token = s.get("token") or ""
+            gitea_servers.append({
+                "url": s["url"],
+                "host": s["host"],
+                "token": (token[:4] + "****") if token else "",
+            })
+
         return {
             "last_refresh": meta.get("last_refresh"),
             "refresh_interval_hours": self._catalog_get_interval_hours(db_type),
@@ -2553,6 +2891,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
             "auto_update": self._catalog_get_auto_update(db_type),
             "github_token_set": bool(self._catalog_get_github_token(db_type)),
+            "gitea_servers": gitea_servers,
         }
 
     def _catalog_get_allow_invalid_install(self, db_type):
@@ -2590,7 +2929,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             return self._catalog_db_query(
                 "SELECT full_name, html_url, description, topics, default_branch, pushed_at, "
-                "plugin_id, plugin_name, latest_version, last_checked, install_error FROM repos "
+                "plugin_id, plugin_name, latest_version, last_checked, install_error, source, base_url FROM repos "
                 "WHERE is_valid='valid' ORDER BY COALESCE(pushed_at, '') DESC"
             )
         except Exception:
@@ -2617,7 +2956,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
             if plugin_id in installed_ids:
                 continue  # 이미 설치됨
-            git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            source = str(r.get("source") or "github")
+            if source == "gitea" and r.get("base_url"):
+                git_url = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
+            else:
+                git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
             merged.append({
                 "id": plugin_id,
                 "name": str(r.get("plugin_name") or "").strip() or plugin_id,
@@ -2641,6 +2984,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "topics": self._catalog_parse_topics_json(r.get("topics")),
                     "default_branch": r.get("default_branch"),
                     "last_checked": r.get("last_checked"),
+                    "source": source,
+                    "base_url": r.get("base_url"),
                 },
             })
         return merged, self._catalog_meta_dict(db_type)
@@ -2679,6 +3024,39 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             else:
                 auto_val = str(auto_raw).strip().lower() in ("1", "true", "yes", "on")
             gateway.set_setting("PM_AUTO_UPDATE", "1" if auto_val else "0")
+
+            # Gitea 서버 목록 — 프론트가 보낸 마스킹 토큰(****)은 기존 값 유지
+            gitea_raw = item_data.get("gitea_servers")
+            if gitea_raw is not None:
+                existing = {s["host"]: s["token"] for s in self._catalog_get_gitea_servers(db_type)}
+                validated = []
+                for item in (gitea_raw if isinstance(gitea_raw, list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or "").strip().rstrip("/")
+                    if not url.startswith("https://"):
+                        continue
+                    host = re.sub(r"^https?://", "", url).split("/")[0]
+                    if not host:
+                        continue
+                    token = str(item.get("token") or "").strip()
+                    # 마스킹 표시면 기존 토큰 유지, 실제 값이면 교체
+                    if token and "***" in token:
+                        token = existing.get(host, "")
+                    validated.append({"url": url, "token": token})
+                # host 중복 제거
+                seen = set()
+                dedup = []
+                for item in validated:
+                    host = re.sub(r"^https?://", "", item["url"]).split("/")[0]
+                    if host in seen:
+                        continue
+                    seen.add(host)
+                    dedup.append(item)
+                gateway.set_setting(
+                    "PM_CATALOG_GITEA_SERVERS",
+                    json.dumps(dedup, ensure_ascii=False),
+                )
 
             # GitHub 토큰 — 비어 있으면 기존 유지(보안: 실제 토큰을 프론트로 내려주지 않음),
             # clear_github_token=true면 삭제, 값이 있으면 새로 저장.
