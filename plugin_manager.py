@@ -682,8 +682,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception:
                 pass
 
-            from services.plugin_service import PluginService
-            PluginService.toggle_plugin_enabled('general', plugin_id, "1")
+            self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
 
             # Hot reload
             from services.metadata_factory import MetadataFactory
@@ -898,8 +897,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             self._sources_set(plugin_id, git_source_info)
 
             # 9. 활성화 + 핫 리로드
-            from services.plugin_service import PluginService
-            PluginService.toggle_plugin_enabled('general', plugin_id, "1")
+            self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
 
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
@@ -1700,12 +1698,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, f"플러그인 삭제 실패: {str(e)}"
 
     def _toggle_plugin(self, plugin_id, enabled_val, db_type):
-        """플러그인 활성화/비활성화 토글"""
+        """플러그인 활성화/비활성화 토글
+
+        가이드 부합: PluginService 직접 import 대신 get_db_gateway 헬퍼로
+        general 세션 DB의 PLUGIN_ENABLED_<id> 설정을 직접 쓴다.
+        """
         try:
-            from services.plugin_service import PluginService
-            ok, err = PluginService.toggle_plugin_enabled('general', plugin_id, str(enabled_val))
-            if not ok:
-                return False, err or "상태 변경 실패"
+            self.get_db_gateway('general').set_setting(
+                f"PLUGIN_ENABLED_{plugin_id}", str(enabled_val)
+            )
 
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
