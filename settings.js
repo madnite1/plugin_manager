@@ -30,6 +30,9 @@
     // Gitea 서버 로컬 목록 (마스킹 토큰 포함 — 저장 시 백엔드가 마스킹이면 기존 유지)
     let giteaServers = [];
 
+    // script.js saveCatalogSettings(실제 저장 경로)에서 접근할 수 있도록 window에 노출
+    window.__pm_gitea_servers_get = function() { return giteaServers; };
+
     function renderGiteaList() {
         if (!giteaListEl) return;
         giteaListEl.innerHTML = '';

@@ -1008,6 +1008,11 @@
         }
 
         try {
+            // settings.js가 노출한 Gitea 서버 목록 (마스킹 토큰 포함 — 백엔드가 기존 값 유지)
+            let giteaServers = [];
+            if (typeof window.__pm_gitea_servers_get === 'function') {
+                giteaServers = window.__pm_gitea_servers_get() || [];
+            }
             const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1017,7 +1022,8 @@
                     topics: topicsInput ? topicsInput.value.trim() : '',
                     allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                     auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
-                    github_token: tokenInput ? tokenInput.value.trim() : ''
+                    github_token: tokenInput ? tokenInput.value.trim() : '',
+                    gitea_servers: giteaServers
                 })
             });
             const data = await res.json();
