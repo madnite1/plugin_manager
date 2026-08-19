@@ -57,6 +57,31 @@
             </p>
         </div>
 
+        <!-- Gitea 서버 -->
+        <div style="margin-top: 1.2rem;">
+            <label style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; margin-bottom: 0.4rem; display: block;">
+                <i class="fa-solid fa-server" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> Gitea 서버 (선택)
+            </label>
+            <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+                <input type="text" id="pm-gitea-url" class="pm-catalog-input" autocomplete="off"
+                       placeholder="https://git.example.com" style="flex: 1; min-width: 200px; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem; box-sizing: border-box;" />
+                <input type="password" id="pm-gitea-token" class="pm-catalog-input" autocomplete="new-password"
+                       placeholder="토큰 (선택 — 비공개 저장소용)" style="flex: 1; min-width: 160px; background: var(--app-input-bg, rgba(15, 23, 42, 0.6)); border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15)); color: var(--app-text-primary, #fff); padding: 0.55rem 0.8rem; border-radius: 6px; outline: none; font-size: 0.88rem; box-sizing: border-box;" />
+                <button type="button" id="pm-gitea-add" class="pm-btn pm-btn-sm"
+                        style="white-space: nowrap; cursor: pointer; padding: 0.55rem 0.9rem; border-radius: 6px; border: 1px solid var(--app-accent, #8b5cf6); background: var(--app-accent, #8b5cf6); color: #fff; font-size: 0.8rem;">
+                    <i class="fa-solid fa-plus" style="margin-right: 0.25rem;"></i>추가
+                </button>
+            </div>
+            <div id="pm-gitea-list" style="margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.45rem;"></div>
+            <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.45rem 0 0 0;">
+                등록한 Gitea 서버의
+                <code style="background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 4px;">bookoasis-plugin</code>
+                토픽 저장소도 GitHub와 함께 카탈로그에 표시됩니다. 저장소가 비공개라면 토큰이 필요합니다
+                (토큰 값은 화면에 표시되지 않으며, 저장된 서버는 마스킹으로만 표시됩니다).
+                등록 목록은 <strong style="color: var(--app-accent, #8b5cf6);">설정 저장</strong> 시 반영됩니다.
+            </p>
+        </div>
+
     </div>
 
         <!-- 3. 검증 실패시 설치 허용 -->

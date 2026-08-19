@@ -22,6 +22,48 @@
     const autoUpdateInput = root.querySelector('#pm-auto-update');
     const tokenInput = root.querySelector('#pm-github-token');
     const tokenClearBtn = root.querySelector('#pm-token-clear');
+    const giteaUrlInput = root.querySelector('#pm-gitea-url');
+    const giteaTokenInput = root.querySelector('#pm-gitea-token');
+    const giteaAddBtn = root.querySelector('#pm-gitea-add');
+    const giteaListEl = root.querySelector('#pm-gitea-list');
+
+    // Gitea 서버 로컬 목록 (마스킹 토큰 포함 — 저장 시 백엔드가 마스킹이면 기존 유지)
+    let giteaServers = [];
+
+    function renderGiteaList() {
+        if (!giteaListEl) return;
+        giteaListEl.innerHTML = '';
+        if (!giteaServers.length) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'font-size: 0.8rem; color: var(--app-text-muted, #94a3b8); padding: 0.4rem 0;';
+            empty.textContent = '등록된 Gitea 서버가 없습니다.';
+            giteaListEl.appendChild(empty);
+            return;
+        }
+        giteaServers.forEach(function(s, idx) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display: flex; align-items: center; gap: 0.6rem; background: rgba(255,255,255,0.04); border: 1px solid var(--app-border, rgba(255,255,255,0.12)); border-radius: 6px; padding: 0.45rem 0.7rem;';
+            const urlSpan = document.createElement('span');
+            urlSpan.style.cssText = 'flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.82rem; color: var(--app-text-primary, #fff);';
+            urlSpan.textContent = s.url;
+            const tokSpan = document.createElement('span');
+            tokSpan.style.cssText = 'font-size: 0.74rem; color: var(--app-text-muted, #94a3b8); white-space: nowrap;';
+            tokSpan.textContent = s.token ? ('토큰: ' + s.token) : '토큰 없음';
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+            delBtn.title = '서버 삭제';
+            delBtn.style.cssText = 'cursor: pointer; border: none; background: transparent; color: var(--app-text-muted, #94a3b8); font-size: 0.85rem; padding: 0.2rem 0.4rem; border-radius: 4px;';
+            delBtn.addEventListener('click', function() {
+                giteaServers.splice(idx, 1);
+                renderGiteaList();
+            });
+            row.appendChild(urlSpan);
+            row.appendChild(tokSpan);
+            row.appendChild(delBtn);
+            giteaListEl.appendChild(row);
+        });
+    }
 
     // 초기값 로드 — /data 응답의 catalog_meta (간격/토픽은 MariaDB 설정)
     // 레이스 방지: 이미 값이 변경된(사용자가 입력한) 필드는 덮어쓰지 않음
@@ -46,6 +88,12 @@
             if (tokenInput) {
                 // 실제 토큰은 절대 내려주지 않음 — 저장 여부만 표시
                 tokenInput.placeholder = meta.github_token_set ? '토큰 저장됨 (변경 시 새 값 입력)' : 'ghp_... (저장 안 됨)';
+            }
+            if (Array.isArray(meta.gitea_servers)) {
+                giteaServers = meta.gitea_servers.map(function(s) {
+                    return { url: s.url || '', token: s.token || '' };
+                });
+                renderGiteaList();
             }
         } catch(e) {
             // 초기값 로드 실패 — 기본값 유지
@@ -113,7 +161,8 @@
                     topics: topicsVal,
                     allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                     auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
-                    github_token: tokenInput ? tokenInput.value.trim() : ''
+                    github_token: tokenInput ? tokenInput.value.trim() : '',
+                    gitea_servers: giteaServers
                 })
             });
             const data = await res.json();
@@ -147,6 +196,40 @@
     }
 
     loadInitial();
+
+    // Gitea 서버 추가 — URL 검증 후 로컬 목록에 추가 (저장은 설정 저장 시)
+    if (giteaAddBtn) {
+        giteaAddBtn.addEventListener('click', function() {
+            const url = giteaUrlInput ? giteaUrlInput.value.trim() : '';
+            const token = giteaTokenInput ? giteaTokenInput.value.trim() : '';
+            if (!url) {
+                showError('Gitea 서버 URL을 입력하세요.');
+                return;
+            }
+            let norm;
+            try {
+                const u = new URL(url);
+                if (u.protocol !== 'https:') throw new Error('https only');
+                norm = u.origin;
+            } catch(e) {
+                showError('올바른 https:// URL을 입력하세요. (예: https://git.example.com)');
+                return;
+            }
+            // 중복 host 체크
+            const dup = giteaServers.some(function(s) {
+                try { return new URL(s.url).host === new URL(norm).host; }
+                catch(e) { return false; }
+            });
+            if (dup) {
+                showError('이미 등록된 Gitea 서버입니다.');
+                return;
+            }
+            giteaServers.push({ url: norm, token: token });
+            if (giteaUrlInput) giteaUrlInput.value = '';
+            if (giteaTokenInput) giteaTokenInput.value = '';
+            renderGiteaList();
+        });
+    }
 
     // 토큰 삭제 — 즉시 clear 요청 (빈 입력은 기존 유지라 별도 삭제 경로)
     if (tokenClearBtn) {
