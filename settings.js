@@ -31,7 +31,27 @@
     let giteaServers = [];
 
     // script.js saveCatalogSettings(실제 저장 경로)에서 접근할 수 있도록 window에 노출
-    window.__pm_gitea_servers_get = function() { return giteaServers; };
+    // 저장 시 입력창에 남아있는 미등록 URL/token도 자동 포함 (추가 버튼 누락 방지)
+    window.__pm_gitea_servers_get = function() {
+        const list = giteaServers.slice();
+        const url = giteaUrlInput ? giteaUrlInput.value.trim() : '';
+        const token = giteaTokenInput ? giteaTokenInput.value.trim() : '';
+        if (url) {
+            let norm = null;
+            try {
+                const u = new URL(url);
+                if (u.protocol === 'https:') norm = u.origin;
+            } catch(e) {}
+            if (norm) {
+                const dup = list.some(function(s) {
+                    try { return new URL(s.url).host === new URL(norm).host; }
+                    catch(e) { return false; }
+                });
+                if (!dup) list.push({ url: norm, token: token });
+            }
+        }
+        return list;
+    };
 
     function renderGiteaList() {
         if (!giteaListEl) return;
