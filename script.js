@@ -41,6 +41,35 @@
     }
 
     // Backend API 호출 헬퍼 (apply-metadata 액션)
+    // ── 플러그인 변경 이벤트 ─────────────────────────────────────────
+    // 성공한 상태 변경(active/inactive/install/delete/update)을 window CustomEvent로 발화.
+    // 같은 window에 로드된 다른 플러그인(예: 통합 뷰어)이 subscribe 가능.
+    function eventActionFor(actionData) {
+        const a = actionData && actionData.action;
+        if (a === 'toggle') return actionData.enabled === '1' ? 'active' : 'inactive';
+        if (a === 'install_git' || a === 'install_zip') return 'install';
+        if (a === 'delete') return 'delete';
+        if (a === 'update') return 'update';
+        return null; // 조회성 액션(check_update/list_all 등)은 이벤트 없음
+    }
+
+    function dispatchPluginChanged(actionData, data) {
+        if (!data || data.success !== true || !actionData) return;
+        const action = eventActionFor(actionData);
+        if (!action || !actionData.plugin_id) return;
+        try {
+            window.dispatchEvent(new CustomEvent('plugin_manager:plugins_changed', {
+                detail: {
+                    action: action,
+                    plugin_id: actionData.plugin_id,
+                    ts: Date.now()
+                }
+            }));
+        } catch (err) {
+            console.warn('[PluginManager] 변경 이벤트 발화 실패:', err);
+        }
+    }
+
     function callPluginAction(actionData) {
         return fetch('/api/media/books/0/apply-metadata', {
             method: 'POST',
@@ -119,8 +148,12 @@
                         source: 'plugin_manager',
                         item_data: forcedData
                     })
-                }).then(res => res.json());
+                }).then(res => res.json()).then(d => {
+                    dispatchPluginChanged(forcedData, d);
+                    return d;
+                });
             }
+            dispatchPluginChanged(actionData, data);
             return data;
         });
     }
