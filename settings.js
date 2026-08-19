@@ -47,7 +47,7 @@
                     try { return new URL(s.url).host === new URL(norm).host; }
                     catch(e) { return false; }
                 });
-                if (!dup) list.push({ url: norm, token: token });
+                if (!dup) list.push({ url: norm, token: token, enabled: true });
             }
         }
         return list;
@@ -66,6 +66,17 @@
         giteaServers.forEach(function(s, idx) {
             const row = document.createElement('div');
             row.style.cssText = 'display: flex; align-items: center; gap: 0.6rem; background: rgba(255,255,255,0.04); border: 1px solid var(--app-border, rgba(255,255,255,0.12)); border-radius: 6px; padding: 0.45rem 0.7rem;';
+            
+            // 활성화 토글
+            const toggle = document.createElement('input');
+            toggle.type = 'checkbox';
+            toggle.checked = s.enabled !== false;  // 기본 true
+            toggle.title = '카탈로그 조회 사용';
+            toggle.style.cssText = 'width: 18px; height: 18px; accent-color: var(--app-accent, #8b5cf6); cursor: pointer; flex-shrink: 0;';
+            toggle.addEventListener('change', function() {
+                giteaServers[idx].enabled = this.checked;
+            });
+            
             const urlSpan = document.createElement('span');
             urlSpan.style.cssText = 'flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.82rem; color: var(--app-text-primary, #fff);';
             urlSpan.textContent = s.url;
@@ -81,6 +92,7 @@
                 giteaServers.splice(idx, 1);
                 renderGiteaList();
             });
+            row.appendChild(toggle);
             row.appendChild(urlSpan);
             row.appendChild(tokSpan);
             row.appendChild(delBtn);
@@ -114,7 +126,7 @@
             }
             if (Array.isArray(meta.gitea_servers)) {
                 giteaServers = meta.gitea_servers.map(function(s) {
-                    return { url: s.url || '', token: s.token || '' };
+                    return { url: s.url || '', token: s.token || '', enabled: s.enabled !== false };
                 });
                 renderGiteaList();
             }

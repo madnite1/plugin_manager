@@ -1255,11 +1255,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             owner, repo = m.group(1), m.group(2)
             return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/main", "main"
 
-        # Gitea/GitLab 등 (archive 방식)
-        m = re.match(r'^https?://([^/]+)/([^/]+)/([^/]+?)(?:/src/branch/([^/]+))?$', url)
+        # Gitea/GitLab 등 (archive 방식) — 원본 스킴 보존
+        m = re.match(r'^(https?)://([^/]+)/([^/]+)/([^/]+?)(?:/src/branch/([^/]+))?$', url)
         if m:
-            host, org, repo_name, branch = m.group(1), m.group(2), m.group(3), (m.group(4) or "main")
-            return f"https://{host}/{org}/{repo_name}/archive/{branch}.zip", branch
+            scheme, host, org, repo_name, branch = m.group(1), m.group(2), m.group(3), m.group(4), (m.group(5) or "main")
+            return f"{scheme}://{host}/{org}/{repo_name}/archive/{branch}.zip", branch
 
         return None, None
 
@@ -2419,9 +2419,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # ---- Gitea 서버 설정 ----
 
     def _catalog_get_gitea_servers(self, db_type):
-        """PM_CATALOG_GITEA_SERVERS 조회 → [{url, token, host}] 목록 (정규화).
+        """PM_CATALOG_GITEA_SERVERS 조회 → [{url, token, host, enabled}] 목록 (정규화).
         url은 https:// 강제, 중복 host 제거, 토큰은 빈 문자열 가능.
-        설정 없으면 빈 목록 (Gitea 비활성)."""
+        설정 없으면 빈 목록 (Gitea 비활성).
+        enabled=False인 서버는 제외 (카탈로그 조회/업데이트에 사용 안 함)."""
         try:
             gateway = self.get_db_gateway(db_type)
             raw = gateway.get_setting("PM_CATALOG_GITEA_SERVERS", default=None)
@@ -2445,7 +2446,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     continue
                 seen_hosts.add(host)
                 token = str(item.get("token") or "").strip()
-                servers.append({"url": url, "host": host, "token": token})
+                # enabled 기본값 True (기존 설정 호환) — False면 카탈로그에서 제외
+                enabled = item.get("enabled", True)
+                if not enabled:
+                    continue
+                servers.append({"url": url, "host": host, "token": token, "enabled": True})
             return servers
         except Exception:
             return []
@@ -2467,7 +2472,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """저장 전 Gitea 서버 목록 검증 → 정규화된 JSON 문자열 (무효 항목 제거).
         - url: https:// 강제
         - host 중복 제거
-        - 토큰은 마스킹 형태(앞 4 + ***)면 무시 (프론트가 내려준 실제 값만 저장)"""
+        - 토큰은 마스킹 형태(앞 4 + ***)면 무시 (프론트가 내려준 실제 값만 저장)
+        - enabled: boolean (기본 true)"""
         servers = []
         seen_hosts = set()
         if isinstance(raw, (list, tuple)):
@@ -2492,7 +2498,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             token = str(item.get("token") or "").strip()
             # 프론트에서 보낸 마스킹 표시(등록된 토큰 유지 요청)면 실제 값을
             # 유지하기 위해 별도 처리 — 여기서는 저장하지 않고 호출부에서 처리.
-            servers.append({"url": url, "token": token})
+            enabled = item.get("enabled", True)
+            if not isinstance(enabled, bool):
+                enabled = True
+            servers.append({"url": url, "token": token, "enabled": enabled})
         return json.dumps(servers, ensure_ascii=False)
 
     # ---- GitHub 조회 ----
@@ -3083,6 +3092,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "url": s["url"],
                 "host": s["host"],
                 "token": (token[:4] + "****") if token else "",
+                "enabled": s.get("enabled", True),
             })
 
         return {
@@ -3127,14 +3137,34 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             logger.warning("플러그인 자동 업데이트 실행 중 오류 (%s)", db_type, exc_info=True)
 
-    def _catalog_list_valid_repos(self):
-        """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순)"""
+    def _catalog_list_valid_repos(self, db_type=None):
+        """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순).
+        db_type이 주어지면 활성화된 Gitea 서버의 base_url에 해당하는 행만 포함."""
         try:
-            return self._catalog_db_query(
+            enabled_hosts = set()
+            if db_type:
+                for s in self._catalog_get_gitea_servers(db_type):
+                    enabled_hosts.add(s["host"])
+            query = (
                 "SELECT full_name, html_url, description, topics, default_branch, pushed_at, "
                 "plugin_id, plugin_name, latest_version, last_checked, install_error, source, base_url FROM repos "
                 "WHERE is_valid='valid' ORDER BY COALESCE(pushed_at, '') DESC"
             )
+            rows = self._catalog_db_query(query)
+            if enabled_hosts:
+                filtered = []
+                for r in rows:
+                    if r.get("source") == "gitea":
+                        base_url = r.get("base_url") or ""
+                        host = None
+                        if base_url:
+                            host = re.sub(r"^https?://", "", base_url).split("/")[0]
+                        if host and host in enabled_hosts:
+                            filtered.append(r)
+                    else:
+                        filtered.append(r)
+                return filtered
+            return rows
         except Exception:
             return []
 
@@ -3160,7 +3190,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             installed_git = None
 
-        rows = self._catalog_list_valid_repos()
+        rows = self._catalog_list_valid_repos(db_type)
         candidates = []
         for r in rows:
             pid = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
@@ -3195,7 +3225,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         invalid 저장소는 목록/count에서 제외.
         """
         installed_ids = {p.get("id") for p in plugins if p.get("id")}
-        catalog_rows = self._catalog_list_valid_repos()
+        catalog_rows = self._catalog_list_valid_repos(db_type)
         merged = list(plugins)
         # 설치된 플러그인 → 같은 plugin_id의 다른 소스 후보 첨부 (소스 교체용)
         installed_by_id = {p.get("id"): p for p in plugins if p.get("id")}
@@ -3315,7 +3345,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     # 마스킹 표시면 기존 토큰 유지, 실제 값이면 교체
                     if token and "***" in token:
                         token = existing.get(host, "")
-                    validated.append({"url": url, "token": token})
+                    enabled = item.get("enabled", True)
+                    if not isinstance(enabled, bool):
+                        enabled = True
+                    validated.append({"url": url, "token": token, "enabled": enabled})
                 # host 중복 제거
                 seen = set()
                 dedup = []
