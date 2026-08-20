@@ -1887,10 +1887,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         base_url = self._resolve_update_base_url(
             plugin_id, spec["raw_base_url"], spec.get("files"), db_type
         )
+
+        # Gitea 소스면 원격 VERSION 확인 단계부터 같은 호스트 토큰을 사용해야 한다.
+        # (비공개 저장소는 파일 다운로드 단계만 토큰을 붙이면 버전 판별이 먼저 실패함)
+        gitea_token = None
+        raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
+        if raw_parsed:
+            src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
+            gitea_token = self._gitea_token_for_host(db_type, src_host)
+
         remote_ver = self._fetch_remote_plugin_version(
             base_url,
             version_file=spec["version_file"],
             version_key=spec["version_key"],
+            token=gitea_token,
         )
 
         if not remote_ver:
@@ -1902,12 +1912,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
 
         # 파일 다운로드 → 교체
-        # Gitea 소스면 해당 호스트 토큰 사용 (비공개 저장소 인증)
-        gitea_token = None
-        raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
-        if raw_parsed:
-            src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
-            gitea_token = self._gitea_token_for_host(db_type, src_host)
         downloaded = {}
         for name in spec["files"]:
             file_url = f"{base_url.rstrip('/')}/{name}"
@@ -2538,20 +2542,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """토픽 검색 (per_page=100). 응답 dict 반환 (예외 전파).
 
         - GitHub: Search API (토큰 설정 시 Authorization: Bearer ***
-        - Gitea : 등록 서버의 /api/v1/repos/search?topic=... (토큰 필요 시 token ***)
+        - Gitea : 등록 서버의 /api/v1/repos/search?topic=...&topic=true (토큰 필요 시 token ***)
           force_q_fallback=True면 topic 파라미터 대신 q 키워드 검색 (topic 무시 서버 대응)
         """
         if source == "gitea":
             if not gitea_server:
                 raise RuntimeError("Gitea 서버 설정이 없습니다.")
-            # Gitea 서버에 따라 topic 파라미터가 무시되는 경우가 있음 (토픽 미등록/비활성 서버).
-            # 1차: topic 검색, 2차: q 키워드 검색(토픽 필터 무시 폴백) — 플러그인 여부는 VERSION 존재로 판별
+            # Gitea Search API: topic 파라미터 사용 시 topic=true 필요 (v1.24+ 문서 기준)
+            # 1차: topic 검색 (+topic=true), 2차: q 키워드 검색(토픽 필터 무시 폴백)
             if force_q_fallback:
                 url = "{0}/api/v1/repos/search?q={1}&limit=50&page=1".format(
                     gitea_server["url"], topic
                 )
             else:
-                url = "{0}/api/v1/repos/search?topic={1}&limit=50&page=1".format(
+                url = "{0}/api/v1/repos/search?topic={1}&topic=true&limit=50&page=1".format(
                     gitea_server["url"], topic
                 )
             headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
@@ -2590,6 +2594,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         for part in str(topic).lower().replace(",", " ").split():
             if part:
                 wanted.add(part)
+        # 호환: security-bookoasis-plugin 토픽도 허용
+        if "bookoasis-plugin" in wanted:
+            wanted.add("security-bookoasis-plugin")
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -2831,7 +2838,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     gitea_errors.append("{0}: {1}".format(server.get("host", "?"), str(e)[:200]))
 
             # 2. repos upsert (검색 메타만 — is_valid/last_checked는 보존)
+            print(f"[DEBUG] Step 2: upserting {len(merged)} items")
             for (source, full_name), info in merged.items():
+                print(f"[DEBUG]   upsert: {full_name}")
                 self._catalog_db_execute(
                     """
                     INSERT INTO repos
@@ -2864,15 +2873,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 3. 검색에서 더 이상 조회되지 않는 미설치 저장소 정리 (DB 제거)
             #    설치된 플러그인은 검색과 무관하게 유지 (업데이트/정보 보존).
             #    모든 토픽 검색이 성공한 시점에만 실행 — GitHub 실패 시 위에서 raise 되어 도달 안 함.
+            print(f"[DEBUG] Step 3: cleaning up, merged has {len(merged)} items")
             removed = 0
             base_dir = self._get_plugins_base_dir()
-            for r in self._catalog_db_query("SELECT full_name, plugin_id FROM repos"):
+            # 성공한 Gitea 서버의 base_url 집합 (실패한 서버 것은 보호 안 함)
+            successful_gitea_base_urls = set()
+            for server in gitea_servers:
+                if server.get("enabled"):
+                    # merged에 이 서버의 repo가 있는지 확인
+                    for key, info in merged.items():
+                        if key[0] == "gitea" and info.get("base_url") == server["url"]:
+                            successful_gitea_base_urls.add(server["url"])
+                            break
+            print(f"[DEBUG]   successful_gitea_base_urls: {successful_gitea_base_urls}")
+            for r in self._catalog_db_query("SELECT full_name, plugin_id, source, base_url FROM repos"):
                 key = (str(r.get("source") or "github"), r["full_name"])
                 if key in merged:
                     continue
+                # Gitea repo인데 성공한 서버의 base_url이면 보호
+                if r.get("source") == "gitea":
+                    base_url = r.get("base_url")
+                    if base_url and base_url in successful_gitea_base_urls:
+                        print(f"[DEBUG]   PROTECT: {r['full_name']} (from successful server {base_url})")
+                        continue
                 plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
                 if os.path.isdir(os.path.join(base_dir, plugin_id)):
                     continue
+                print(f"[DEBUG]   DELETE: {r['full_name']} (key={key}, in_merged={key in merged})")
                 self._catalog_db_execute(
                     "DELETE FROM repos WHERE full_name=?", (r["full_name"],)
                 )
@@ -2905,6 +2932,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             for r in rows_to_check:
                 full_name = r["full_name"]
+                print(f"[DEBUG] Step 4: checking version for {full_name} (source={r.get('source')}, base_url={r.get('base_url')})")
                 is_valid, plugin_id, version, plugin_name = self._catalog_check_repo_version(
                     full_name,
                     r.get("default_branch") or "main",
@@ -2912,6 +2940,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     base_url=r.get("base_url"),
                     db_type=db_type,
                 )
+                print(f"[DEBUG] Step 4: result for {full_name} = {is_valid}, {plugin_id}, {version}, {plugin_name}")
                 self._catalog_db_execute(
                     "UPDATE repos SET is_valid=?, plugin_id=?, latest_version=?, plugin_name=?, last_checked=? WHERE full_name=?",
                     (is_valid, plugin_id or str(full_name).split("/")[-1], version, plugin_name, now, full_name),
