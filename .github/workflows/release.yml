@@ -74,4 +74,6 @@ jobs:
             index.html
             style.css
             script.js
+            settings.html
+            settings.js
           fail_on_unmatched_files: false

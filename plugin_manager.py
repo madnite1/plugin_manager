@@ -2429,11 +2429,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     # ---- Gitea 서버 설정 ----
 
-    def _catalog_get_gitea_servers(self, db_type):
+    def _catalog_get_all_gitea_servers(self, db_type):
         """PM_CATALOG_GITEA_SERVERS 조회 → [{url, token, host, enabled}] 목록 (정규화).
         url은 https:// 강제, 중복 host 제거, 토큰은 빈 문자열 가능.
         설정 없으면 빈 목록 (Gitea 비활성).
-        enabled=False인 서버는 제외 (카탈로그 조회/업데이트에 사용 안 함)."""
+        enabled가 없으면 True로 간주해 기존 설정과 호환한다."""
         try:
             gateway = self.get_db_gateway(db_type)
             raw = gateway.get_setting("PM_CATALOG_GITEA_SERVERS", default=None)
@@ -2457,19 +2457,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     continue
                 seen_hosts.add(host)
                 token = str(item.get("token") or "").strip()
-                # enabled 기본값 True (기존 설정 호환) — False면 카탈로그에서 제외
                 enabled = item.get("enabled", True)
-                if not enabled:
-                    continue
-                servers.append({"url": url, "host": host, "token": token, "enabled": True})
+                if not isinstance(enabled, bool):
+                    enabled = True
+                servers.append({"url": url, "host": host, "token": token, "enabled": enabled})
             return servers
         except Exception:
             return []
 
+    def _catalog_get_gitea_servers(self, db_type):
+        """활성화된 Gitea 서버만 반환 (카탈로그 조회/업데이트용)."""
+        return [s for s in self._catalog_get_all_gitea_servers(db_type) if s.get("enabled", True)]
+
     def _gitea_server_for_host(self, db_type, host):
         """호스트에 해당하는 Gitea 서버 설정 dict 반환 (없으면 None)"""
         host = str(host or "").strip().lower()
-        for s in self._catalog_get_gitea_servers(db_type):
+        for s in self._catalog_get_all_gitea_servers(db_type):
             if str(s.get("host") or "").lower() == host:
                 return s
         return None
@@ -3096,8 +3099,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     pass
 
         # Gitea 서버 목록 — 토큰은 실제 값 대신 마스킹 표시 (보안: 프론트로 내려주지 않음)
+        # 설정 UI 복원용이므로 비활성 서버도 포함한다.
         gitea_servers = []
-        for s in self._catalog_get_gitea_servers(db_type):
+        for s in self._catalog_get_all_gitea_servers(db_type):
             token = s.get("token") or ""
             gitea_servers.append({
                 "url": s["url"],
@@ -3341,7 +3345,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # Gitea 서버 목록 — 프론트가 보낸 마스킹 토큰(****)은 기존 값 유지
             gitea_raw = item_data.get("gitea_servers")
             if gitea_raw is not None:
-                existing = {s["host"]: s["token"] for s in self._catalog_get_gitea_servers(db_type)}
+                existing = {s["host"]: s["token"] for s in self._catalog_get_all_gitea_servers(db_type)}
                 validated = []
                 for item in (gitea_raw if isinstance(gitea_raw, list) else []):
                     if not isinstance(item, dict):
