@@ -983,9 +983,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             zip_bytes = None
             last_err = None
             used_url = None
+            # Gitea 토큰 준비 (Gitea 호스트인 경우)
+            gitea_token = None
+            gitea_host = None
+            gitea_m = re.match(r'^https?://([^/]+)/', zip_url)
+            if gitea_m:
+                gitea_host = gitea_m.group(1)
+                gitea_token = self._gitea_token_for_host(db_type, gitea_host)
             for cand_url in candidates:
                 try:
-                    req = Request(cand_url, headers={"User-Agent": "BookOasis/1.0"})
+                    headers = {"User-Agent": "BookOasis/1.0"}
+                    # Gitea 호스트인 경우 토큰 추가 (비공개 저장소 접근용)
+                    if gitea_token:
+                        headers["Authorization"] = f"token {gitea_token}"
+                    req = Request(cand_url, headers=headers)
                     with urlopen(req, timeout=60) as resp:
                         zip_bytes = resp.read()
                     used_url = cand_url
