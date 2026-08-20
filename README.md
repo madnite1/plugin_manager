@@ -33,17 +33,17 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 
 ```text
 BookOasis/
-├── plugins/
-│   └── metadata/
-│       └── plugin_manager/          ← 플러그인 코드 (업데이트 시 교체)
-│           ├── plugin_manager.py
-│           ├── catalog.db           ← 레거시 위치 (마이그레이션 후 미사용)
-│           └── plugin_sources.db    ← 레거시 위치 (마이그레이션 후 미사용)
-└── data/
-    └── plugin_manager/              ← 영속 데이터 (../../data/plugin_manager/)
-        ├── catalog.db               # 카탈로그 인덱스(repos, meta) + 설정(settings)
-        ├── plugin_sources.db        # 소스 메타 (git_url, branch 등)
-        └── .migrated                # 마이그레이션 완료 플래그
+└── plugins/
+    ├── metadata/
+    │   └── plugin_manager/          ← 플러그인 코드 (업데이트 시 교체)
+    │       ├── plugin_manager.py
+    │       ├── catalog.db           ← 레거시 위치 (마이그레이션 후 미사용)
+    │       └── plugin_sources.db    ← 레거시 위치 (마이그레이션 후 미사용)
+    └── data/
+        └── plugin_manager/          ← 영속 데이터 (../../data/plugin_manager/)
+            ├── catalog.db           # 카탈로그 인덱스(repos, meta) + 설정(settings)
+            ├── plugin_sources.db    # 소스 메타 (git_url, branch 등)
+            └── .migrated            # 마이그레이션 완료 플래그
 ```
 
 ### 저장되는 설정 키 (catalog.db.settings)
