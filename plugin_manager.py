@@ -193,6 +193,99 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """plugins/metadata 루트 경로 반환"""
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+    def _get_data_dir(self):
+        """플러그인 영속 데이터 디렉터리 (../../data/plugin_manager/) — 업데이트/삭제 시에도 보존"""
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        data_dir = os.path.normpath(os.path.join(plugin_dir, "..", "..", "data", self.id))
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+        except Exception:
+            pass
+        return data_dir
+
+    def _get_catalog_db_path(self):
+        """카탈로그 SQLite DB 경로 (영속 저장소: ../../data/plugin_manager/catalog.db)"""
+        return os.path.join(self._get_data_dir(), "catalog.db")
+
+    def _get_sources_db_path(self):
+        """소스 메타 SQLite DB 경로 (영속 저장소: ../../data/plugin_manager/plugin_sources.db)"""
+        return os.path.join(self._get_data_dir(), "plugin_sources.db")
+
+    def __init__(self):
+        super().__init__()
+        if not hasattr(self.__class__, "_migration_done"):
+            self.__class__._migration_done = False
+        if not self.__class__._migration_done:
+            self._run_migration_once()
+            self.__class__._migration_done = True
+
+    def _run_migration_once(self):
+        """최초 1회 마이그레이션: 구 DB 복사 + 코어 DB 설정 → catalog.db.settings"""
+        data_dir = self._get_data_dir()
+        flag = os.path.join(data_dir, ".migrated")
+        if os.path.exists(flag):
+            return
+
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # 1. 구 catalog.db / plugin_sources.db 복사 (plugin_dir → data_dir)
+        for name in ("catalog.db", "plugin_sources.db"):
+            old = os.path.join(plugin_dir, name)
+            new = os.path.join(data_dir, name)
+            if os.path.exists(old) and not os.path.exists(new):
+                try:
+                    shutil.copy2(old, new)
+                except Exception:
+                    pass
+
+        # 2. 코어 DB 설정 → catalog.db.settings 마이그레이션
+        self._migrate_core_settings_to_catalog()
+
+        # 3. 플래그 생성
+        try:
+            with open(flag, "w") as f:
+                f.write("done")
+        except Exception:
+            pass
+
+    def _migrate_core_settings_to_catalog(self):
+        """코어 DB(gateway) 설정 읽어서 catalog.db.settings에 저장 — 모든 db_type 확인"""
+        keys = [
+            "PM_CATALOG_GITEA_SERVERS", "PM_CATALOG_TOPICS",
+            "PM_CATALOG_REFRESH_HOURS", "PM_ALLOW_INVALID_INSTALL",
+            "PM_AUTO_UPDATE", "PM_GITHUB_TOKEN"
+        ]
+        catalog_db = self._get_catalog_db_path()
+        with _CATALOG_DB_LOCK:
+            conn = sqlite3.connect(catalog_db, timeout=10)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )"""
+                )
+                # 모든 db_type에서 설정 조회 (세션별로 다를 수 있음)
+                for db_type in ("general", "adult", "audiobook", "video"):
+                    try:
+                        gateway = self.get_db_gateway(db_type)
+                        for key in keys:
+                            val = gateway.get_setting(key, default=None)
+                            if val is not None:
+                                # dict 반환 가능성 처리
+                                if isinstance(val, dict):
+                                    val = val.get("value", val)
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                                    (key, str(val))
+                                )
+                    except Exception:
+                        continue
+                conn.commit()
+            finally:
+                conn.close()
+
     def _list_plugins(self, db_type):
             """설치된 전체 메타데이터 플러그인 상세 정보 수집"""
             base_dir = self._get_plugins_base_dir()
@@ -2023,11 +2116,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # Plugin Source Meta (sqlite plugin_sources.db)
     # .git_source/.zip_source 파일 대신 소스 메타를 DB에 저장.
     # 설치 후 최초 1회 레거시 파일 → DB 마이그레이션 수행.
-    # ------------------------------------------------------------------
-
-    def _get_sources_db_path(self):
-        """소스 메타 SQLite DB 경로 (플러그인 폴더 내 plugin_sources.db — git 저장소에 미포함)"""
-        return os.path.join(self._get_plugins_base_dir(), "plugin_manager", "plugin_sources.db")
 
     def _sources_init_db(self):
         """plugin_sources.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _SOURCES_DB_LOCK"""
@@ -2239,11 +2327,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # Plugin Catalog (GitHub 토픽 기반 자동 수집 — 미설치 플러그인 발견)
     # 설정(간격/토픽)은 코어 DB(gateway → MariaDB), 조회 결과만 catalog.db(sqlite)
     # ------------------------------------------------------------------
-
-    def _get_catalog_db_path(self):
-        """카탈로그 SQLite DB 경로 (플러그인 폴더 내 catalog.db)"""
-        return os.path.join(self._get_plugins_base_dir(), "plugin_manager", "catalog.db")
-
     def _catalog_full_name_from_url(self, git_url):
         """git_url → full_name (owner/repo). GitHub가 아니면 None."""
         try:
@@ -2330,6 +2413,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     )
                     """
                 )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )""" 
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -2370,7 +2459,27 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, str(value))
         )
 
-    # ---- 설정 (코어 DB — gateway → MariaDB) ----
+    # ---- 설정 헬퍼 (catalog.db.settings 직접 사용) ----
+
+    def _catalog_get_setting(self, key, default=None):
+        """catalog.db.settings에서 설정 값 조회"""
+        try:
+            rows = self._catalog_db_query(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            )
+            if rows:
+                return rows[0]["value"]
+            return default
+        except Exception:
+            return default
+
+    def _catalog_set_setting(self, key, value):
+        """catalog.db.settings에 설정 값 저장"""
+        self._catalog_db_execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, str(value))
+        )
+
+    # ---- 설정 (catalog.db.settings — 세션 독립적) ----
 
     def _catalog_clamp_interval(self, raw):
         """갱신 간격 1~24 클램프 (파싱 불가/빈 값이면 기본 6)"""
@@ -2386,14 +2495,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _catalog_get_interval_hours(self, db_type):
         """PM_CATALOG_REFRESH_HOURS 조회 (클램프 재적용 — 외부 직접 수정 대비)"""
-        try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_CATALOG_REFRESH_HOURS", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            return self._catalog_clamp_interval(raw)
-        except Exception:
-            return _CATALOG_DEFAULT_INTERVAL_HOURS
+        raw = self._catalog_get_setting("PM_CATALOG_REFRESH_HOURS", default=None)
+        return self._catalog_clamp_interval(raw)
 
     def _catalog_normalize_topics(self, raw):
         """
@@ -2422,14 +2525,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _catalog_get_topics(self, db_type):
         """PM_CATALOG_TOPICS 조회 (쉼표 구분 문자열 → 정규화된 리스트)"""
-        try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_CATALOG_TOPICS", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            return self._catalog_normalize_topics(raw)
-        except Exception:
-            return list(_CATALOG_DEFAULT_TOPICS)
+        raw = self._catalog_get_setting("PM_CATALOG_TOPICS", default=None)
+        return self._catalog_normalize_topics(raw)
 
     # ---- Gitea 서버 설정 ----
 
@@ -2438,36 +2535,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         url은 https:// 강제, 중복 host 제거, 토큰은 빈 문자열 가능.
         설정 없으면 빈 목록 (Gitea 비활성).
         enabled가 없으면 True로 간주해 기존 설정과 호환한다."""
+        raw = self._catalog_get_setting("PM_CATALOG_GITEA_SERVERS", default=None)
+        if not raw:
+            return []
         try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_CATALOG_GITEA_SERVERS", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            if not raw:
-                return []
             data = json.loads(str(raw)) if isinstance(raw, str) else raw
-            if not isinstance(data, list):
-                return []
-            servers = []
-            seen_hosts = set()
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url") or "").strip().rstrip("/")
-                if not url.startswith("https://"):
-                    continue
-                host = re.sub(r"^https?://", "", url).split("/")[0]
-                if not host or host in seen_hosts:
-                    continue
-                seen_hosts.add(host)
-                token = str(item.get("token") or "").strip()
-                enabled = item.get("enabled", True)
-                if not isinstance(enabled, bool):
-                    enabled = True
-                servers.append({"url": url, "host": host, "token": token, "enabled": enabled})
-            return servers
         except Exception:
             return []
+        if not isinstance(data, list):
+            return []
+        servers = []
+        seen_hosts = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip().rstrip("/")
+            if not url.startswith("https://"):
+                continue
+            host = re.sub(r"^https?://", "", url).split("/")[0]
+            if not host or host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            token = str(item.get("token") or "").strip()
+            enabled = item.get("enabled", True)
+            if not isinstance(enabled, bool):
+                enabled = True
+            servers.append({"url": url, "host": host, "token": token, "enabled": enabled})
+        return servers
 
     def _catalog_get_gitea_servers(self, db_type):
         """활성화된 Gitea 서버만 반환 (카탈로그 조회/업데이트용)."""
@@ -2525,18 +2619,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # ---- GitHub 조회 ----
 
     def _catalog_get_github_token(self, db_type):
-        """PM_GITHUB_TOKEN 조회 (MariaDB 설정). 설정돼 있으면 Bearer 헤더로 사용.
+        """PM_GITHUB_TOKEN 조회 (catalog.db.settings). 설정돼 있으면 Bearer 헤더로 사용.
         토큰 사용 시 GitHub Search API 제한이 IP 기준이 아닌 계정 기준 5,000/hr가 되어
         공용/클라우드 IP 제한(403)에서 벗어난다."""
-        try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_GITHUB_TOKEN", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            tok = str(raw or "").strip()
-            return tok or None
-        except Exception:
-            return None
+        raw = self._catalog_get_setting("PM_GITHUB_TOKEN", default=None)
+        tok = str(raw or "").strip()
+        return tok or None
 
     def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None, force_q_fallback=False):
         """토픽 검색 (per_page=100). 응답 dict 반환 (예외 전파).
@@ -3153,25 +3241,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _catalog_get_allow_invalid_install(self, db_type):
         """검증 실패 플러그인 설치 허용 설정 (기본 OFF — 미설정이면 안전 기본값)"""
-        try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_ALLOW_INVALID_INSTALL", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            return str(raw).strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            return False
+        raw = self._catalog_get_setting("PM_ALLOW_INVALID_INSTALL", default=None)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _catalog_get_auto_update(self, db_type):
         """플러그인 자동 업데이트 설정 (기본 OFF — 실서버 자동 교체 기본 차단)"""
-        try:
-            gateway = self.get_db_gateway(db_type)
-            raw = gateway.get_setting("PM_AUTO_UPDATE", default=None)
-            if isinstance(raw, dict):
-                raw = raw.get("value")
-            return str(raw).strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            return False
+        raw = self._catalog_get_setting("PM_AUTO_UPDATE", default=None)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _catalog_run_auto_update(self, db_type):
         """자동 업데이트 실행 — ON일 때만 일괄 업데이트. 실패해도 상위 갱신 루프를 깨지 않게 이중 격리."""
@@ -3336,40 +3412,39 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             })
         return merged, self._catalog_meta_dict(db_type)
 
-    # ---- 설정 저장 (자체 save-config API — 코어 .plugin-config-form 우회) ----
+    # ---- 설정 저장 (자체 save-config API — catalog.db.settings 직접 저장) ----
 
     def _catalog_save_config(self, item_data, db_type):
         """
-        save_config — 간격(1~24 클램프)/토픽(정규화) 검증 후 gateway.set_setting → MariaDB.
-        catalog.db에는 저장하지 않음 (설정과 조회 결과 저장소 분리).
+        save_config — 간격(1~24 클램프)/토픽(정규화) 검증 후 catalog.db.settings에 저장.
+        db_type 파라미터는 호환용으로 유지하지만 실제로는 세션 독립적 저장소 사용.
         """
         try:
             item_data = item_data or {}
-            gateway = self.get_db_gateway(db_type)
 
             interval_raw = item_data.get("refresh_interval_hours")
             if interval_raw is None or str(interval_raw).strip() == "":
                 interval = _CATALOG_DEFAULT_INTERVAL_HOURS
             else:
                 interval = self._catalog_clamp_interval(interval_raw)
-            gateway.set_setting("PM_CATALOG_REFRESH_HOURS", str(interval))
+            self._catalog_set_setting("PM_CATALOG_REFRESH_HOURS", str(interval))
 
             topics = self._catalog_normalize_topics(item_data.get("topics"))
-            gateway.set_setting("PM_CATALOG_TOPICS", ",".join(topics))
+            self._catalog_set_setting("PM_CATALOG_TOPICS", ",".join(topics))
 
             allow_raw = item_data.get("allow_invalid_install")
             if allow_raw is None or str(allow_raw).strip() == "":
                 allow_val = self._catalog_get_allow_invalid_install(db_type)
             else:
                 allow_val = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
-            gateway.set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
+            self._catalog_set_setting("PM_ALLOW_INVALID_INSTALL", "1" if allow_val else "0")
 
             auto_raw = item_data.get("auto_update")
             if auto_raw is None or str(auto_raw).strip() == "":
                 auto_val = self._catalog_get_auto_update(db_type)
             else:
                 auto_val = str(auto_raw).strip().lower() in ("1", "true", "yes", "on")
-            gateway.set_setting("PM_AUTO_UPDATE", "1" if auto_val else "0")
+            self._catalog_set_setting("PM_AUTO_UPDATE", "1" if auto_val else "0")
 
             # Gitea 서버 목록 — 프론트가 보낸 마스킹 토큰(****)은 기존 값 유지
             gitea_raw = item_data.get("gitea_servers")
@@ -3402,7 +3477,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         continue
                     seen.add(host)
                     dedup.append(item)
-                gateway.set_setting(
+                self._catalog_set_setting(
                     "PM_CATALOG_GITEA_SERVERS",
                     json.dumps(dedup, ensure_ascii=False),
                 )
@@ -3410,11 +3485,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # GitHub 토큰 — 비어 있으면 기존 유지(보안: 실제 토큰을 프론트로 내려주지 않음),
             # clear_github_token=true면 삭제, 값이 있으면 새로 저장.
             if item_data.get("clear_github_token"):
-                gateway.set_setting("PM_GITHUB_TOKEN", "")
+                self._catalog_set_setting("PM_GITHUB_TOKEN", "")
             else:
                 raw_token = item_data.get("github_token")
                 if raw_token and str(raw_token).strip():
-                    gateway.set_setting("PM_GITHUB_TOKEN", str(raw_token).strip())
+                    self._catalog_set_setting("PM_GITHUB_TOKEN", str(raw_token).strip())
 
             return True, (
                 "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, 자동 업데이트 {3}, GitHub 토큰 {4} — 다음 갱신 주기부터 적용)"

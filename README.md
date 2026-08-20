@@ -25,104 +25,44 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 
 ---
 
-## 주요 기능
+## 데이터 영속성 아키텍처
 
-- **ZIP 업로드 설치** — 브라우저에서 `.zip` 파일 선택 → Base64 전송 → 서버 해제 후 설치
-- **Git 저장소 URL 설치** — GitHub/Gitea 저장소 URL 입력 → 소스 ZIP 다운로드 → `update_manifest` 기준 파일만 남기고 설치 (git 바이너리 불필요)
-- **플러그인 목록 조회** — 설치된 전체 플러그인의 버전, 활성화 상태, 업데이트 가능 여부, 설정 보유 여부 수집
-- **개별/일괄 업데이트** — `update_manifest` 선언된 플러그인에 대해 릴리즈 태그 우선(없으면 브랜치 raw) 최신 버전 다운로드·교체 후 hot reload
-- **활성화 토글** — `PLUGIN_ENABLED_<id>` 설정값으로 온/오프, hot reload 즉시 반영
-- **삭제** — 플러그인 디렉토리 영구 삭제 (시스템 플러그인 `plugin_manager` 자신은 삭제 불가)
-- **설정 모달** — 플러그인 `config_schema` 또는 커스텀 `settings_ui.html` 렌더링 후 저장
-- **자동 업데이트 감지** — GitHub 소스 플러그인은 `/releases/latest` 리다이렉트로 최신 릴리즈 태그 감지 (API 키 불필요), 태그 없으면 GitHub raw `VERSION` 브랜치 체크
-- **플러그인 카탈로그** — 설정된 GitHub 토픽(기본 `bookoasis-plugin`) 검색으로 공개 BookOasis 플러그인을 자동 수집, 설정된 간격(1~24시간, 기본 6시간)으로 백그라운드 갱신. 설치/미설치 통합 목록 + 필터 탭, 미설치 카드의 **설치** 버튼으로 원클릭 설치 (기존 `install_git` 재사용). 조회 결과는 `catalog.db`(SQLite), 설정(간격/토픽)는 코어 DB(MariaDB)에 저장
-- **Gitea 서버별 활성화/비활성화** — 설정 모달(⚙)의 Gitea 서버 목록에서 체크박스로 카탈로그 조회/버전 확인/저장소 변경 후보 포함 여부 제어. 비활성화 시 해당 서버의 모든 플러그인이 카탈로그/교체 후보에서 제외되며, 설정 저장 후 재오픈 시에도 각 서버의 enabled 상태와 마스킹 토큰이 그대로 복원됨
+플러그인 매니저는 **플러그인 폴더 밖의 별도 데이터 디렉토리**를 사용해 설정과 카탈로그를 저장합니다. 이를 통해 플러그인 업데이트·삭제·재설치 시에도 데이터가 보존됩니다.
 
----
-
-## 플러그인 토픽 등록 (자동 발견)
-
-BookOasis 호환 플러그인 저장소는 **GitHub 토픽**을 달아두면 자동으로 발견됩니다.
-플러그인 매니저 카탈로그는 기본적으로 `topic:bookoasis-plugin` 검색으로
-BookOasis 플러그인 목록을 수집하므로, **공개 배포하는 모든 플러그인 저장소**에
-아래 토픽을 등록해 주세요. (등록 토픽은 플러그인 매니저 ⚙ 설정에서 추가/변경 가능)
-
-| 토픽 | 용도 |
-| :--- | :--- |
-| `bookoasis-plugin` | BookOasis 플러그인 여부/유형 (필수) |
-
-### 웹 UI로 등록
-
-1. 저장소 페이지(예: `github.com/<owner>/<repo>`)의 오른쪽 사이드바 **About** 섹션에서 톱니바퀴(⚙) 클릭
-2. **Topics** 칸에 `bookoasis-plugin` 입력 후 Enter
-3. **Save changes** 클릭
-
-등록 직후 반영되며, 몇 분 내로 검색 인덱스에도 반영됩니다:
+### 디렉토리 구조
 
 ```text
-https://github.com/search?q=topic%3Abookoasis-plugin&type=repositories
+BookOasis/
+├── plugins/
+│   └── metadata/
+│       └── plugin_manager/          ← 플러그인 코드 (업데이트 시 교체)
+│           ├── plugin_manager.py
+│           ├── catalog.db           ← 레거시 위치 (마이그레이션 후 미사용)
+│           └── plugin_sources.db    ← 레거시 위치 (마이그레이션 후 미사용)
+└── data/
+    └── plugin_manager/              ← 영속 데이터 (../../data/plugin_manager/)
+        ├── catalog.db               # 카탈로그 인덱스(repos, meta) + 설정(settings)
+        ├── plugin_sources.db        # 소스 메타 (git_url, branch 등)
+        └── .migrated                # 마이그레이션 완료 플래그
 ```
 
-### API / CLI로 등록 (참고)
+### 저장되는 설정 키 (catalog.db.settings)
 
-```bash
-# GitHub API (PAT 필요)
-curl -X PATCH https://api.github.com/repos/{owner}/{repo} \
-  -H "Authorization: Bearer ***" \
-  -d '{"topics":["bookoasis-plugin"]}'
+| 키 | 설명 |
+|-----|------|
+| `PM_CATALOG_GITEA_SERVERS` | Gitea 서버 목록 (URL, 토큰, 활성화 상태) |
+| `PM_CATALOG_TOPICS` | 카탈로그 검색 토픽 (쉼표 구분) |
+| `PM_CATALOG_REFRESH_HOURS` | 카탈로그 갱신 간격 (1~24시간) |
+| `PM_ALLOW_INVALID_INSTALL` | 검증 실패 플러그인 설치 허용 여부 |
+| `PM_AUTO_UPDATE` | 플러그인 자동 업데이트 ON/OFF |
+| `PM_GITHUB_TOKEN` | GitHub API 토큰 (Bearer 인증용) |
 
-# GitHub CLI (gh auth login 필요)
-gh repo edit <owner>/<repo> --add-topic bookoasis-plugin
-```
+### 특징
 
-> 토픽 등록은 플러그인 코드와 무관한 저장소 설정이라 코드 변경/릴리즈가 필요 없습니다.
-
----
-
-## 파일 구성
-
-```text
-plugin_manager/
-  .github/workflows/release.yml  # VERSION bump 시 자동 릴리즈 생성 (GitHub Actions)
-  __init__.py          # PluginManagerMetadataProvider export
-  plugin_manager.py    # 플러그인 본체 (BaseMetadataProvider 상속)
-  VERSION              # 버전 파일 ("plugin version" 키)
-  index.html           # 풀페이지 UI 마크업
-  style.css            # 풀페이지 UI 스타일
-  script.js            # 풀페이지 UI 동작 (목록 로드, 카드 렌더링, 모달, API 호출)
-```
-
-외부 파이썬 패키지 의존성 없음 — 표준 라이브러리(`os`, `shutil`, `json`, `re`, `tempfile`, `urllib`, `zipfile`, `base64`)만 사용.
-
----
-
-## 백엔드 액션 (API)
-
-`/api/media/books/0/apply-metadata` 엔드포인트로 `item_data.action` 전달:
-
-| action | 설명 | 주요 파라미터 |
-| :--- | :--- | :--- |
-| `install_zip` | ZIP 파일 업로드 설치 | `zip_data` (Base64), `filename` |
-| `install_git` | Git 저장소 URL 설치 | `git_url` |
-| `update` | 특정 플러그인 업데이트 | `plugin_id` |
-| `update_all` | 설치된 전체 플러그인 일괄 업데이트 | — |
-| `delete` | 플러그인 디렉토리 영구 삭제 | `plugin_id` |
-| `toggle` | 활성화/비활성화 토글 | `plugin_id`, `enabled` (`"1"`/`"0"`) |
-
-데이터 조회는 `/api/media/dashboard/widgets/plugin_manager/data` (전체 목록) 및 `/api/media/metadata/plugins/manage` (설정 모달용 상세) 사용.
-
----
-
-## 보안
-
-- **경로 이탈 차단** — `_validate_plugin_path` 가 `plugins/metadata/` 경계 밖 접근 엄격 차단
-- **Zip Slip 차단** — ZIP 압축 해제 전 상위 경로(`..`, 절대경로) 멤버 검사 (업로드 ZIP/Git 다운로드 ZIP 공통)
-- **URL scheme 검증** — Git 설치 시 `http/https` URL만 허용 (`file://`, `git@`, `ssh://` 차단)
-- **manifest 경로 검증** — `update_manifest.files` 항목의 상위 경로 이탈(`..`, 절대경로) 사전 차단
-- **AST 안전 파싱** — 클론된 플러그인 코드의 `update_manifest` 를 코드 실행 없이 AST 로만 추출
-- **플러그인 ID 검증** — `^[a-zA-Z0-9_-]+$` 정규식으로 안전한 ID만 허용
-- **시스템 플러그인 보호** — `plugin_manager` 자신은 삭제/덮어쓰기 불가
-- **플러그인 핫 리로드** — 설치/삭제/토글/업데이트 후 `MetadataFactory.hot_reload_plugin()` 즉시 호출
+- **세션 독립적** — `general`/`adult`/`audiobook`/`video` 등 세션(db_type)과 무관하게 동일 설정 사용
+- **업데이트 시 자동 마이그레이션** — 플러그인 업데이트 후 최초 초기화 시 레거시 DB(`plugin_dir/catalog.db`, `plugin_sources.db`)를 새 위치로 복사하고, 코어 DB(MariaDB) 설정도 `catalog.db.settings`로 마이그레이션 (1회만 실행, `.migrated` 플래그로 관리)
+- **신규 설치 시** — 빈 DB 자동 생성, 마이그레이션 불필요
+- **토큰 보안** — Gitea/GitHub 토큰이 카탈로그 DB에 평문 저장되므로 파일 권한 관리 필요 (Docker 볼륨 마운트 권장)
 
 ---
 
