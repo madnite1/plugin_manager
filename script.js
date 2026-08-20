@@ -16,9 +16,18 @@
         if (!gitUrl) return 'local';
         const url = gitUrl.toLowerCase();
         if (url.includes('github.com')) return 'github';
-        // 설정된 Gitea 서버들 확인 (동적으로 추가 가능)
-        if (url.includes('git.madnite1.pe.kr') || url.includes('gitea.derekkoo.win')) return 'gitea';
-        // 기타 gitea 패턴 (gitea. 도메인 등)
+        // 설정된 Gitea 서버들에서 동적으로 확인
+        if (catalogMeta && Array.isArray(catalogMeta.giteaServers)) {
+            for (const srv of catalogMeta.giteaServers) {
+                if (srv.enabled !== false && srv.url) {
+                    try {
+                        const host = new URL(srv.url).host;
+                        if (url.includes(host)) return 'gitea';
+                    } catch (_) { /* ignore invalid URL */ }
+                }
+            }
+        }
+        // 기타 gitea 패턴 (gitea. 도메인 등) - fallback
         if (url.includes('gitea.')) return 'gitea';
         return 'github'; // 기본값
     }
