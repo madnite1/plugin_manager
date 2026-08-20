@@ -364,6 +364,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 if git_info:
                     git_url = str(git_info.get("git_url") or "").strip() or None
 
+                # 4-2. monorepo 서브디렉토리 플러그인은 update_manifest 있어도 업데이트 불가 처리
+                _is_monorepo_subdir = False
+                if update_manifest and isinstance(update_manifest, dict):
+                    _raw_url = str(update_manifest.get("raw_base_url") or "").strip().rstrip("/")
+                    _rp = self._parse_raw_base_url(_raw_url)
+                    _is_monorepo_subdir = bool(_rp and _rp[3])
+
                 plugins.append({
                     "id": plugin_id,
                     "name": name,
@@ -374,7 +381,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "is_searchable": is_searchable,
                     "is_category": bool(category_tab),
                     "is_widget": bool(dashboard_widget),
-                    "has_update_manifest": bool(update_manifest),
+                    "has_update_manifest": bool(update_manifest) and not _is_monorepo_subdir,
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
@@ -826,6 +833,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             spec = self._build_update_spec(plugin_id, update_manifest)
             if not spec:
                 return has_update, latest_version, "no_source"
+
+            # monorepo 서브디렉토리 플러그인 — 릴리즈 태그가 저장소 전체 기준이라
+            # 버전 비교가 불가능하므로 로컬 플러그인으로 취급하고 업데이트 체크 생략
+            raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
+            if raw_parsed and raw_parsed[3]:
+                return has_update, latest_version, "no_manifest"
 
             base_url = self._resolve_update_base_url(
                 plugin_id, spec["raw_base_url"], spec.get("files"), db_type
