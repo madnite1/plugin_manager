@@ -8,6 +8,39 @@
     let pendingDeletePluginId = null;
     let catalogMeta = null; // {last_refresh, refresh_interval_hours, topics, refresh_state, refresh_error}
 
+    // 소스 타입 감지: GitHub vs Gitea
+    function getSourceType(gitUrl, catalogSource) {
+        // catalog 데이터에 source가 있으면 우선 사용
+        if (catalogSource) return catalogSource;
+        // git_url로 판단
+        if (!gitUrl) return 'local';
+        const url = gitUrl.toLowerCase();
+        if (url.includes('github.com')) return 'github';
+        // 설정된 Gitea 서버들 확인 (동적으로 추가 가능)
+        if (url.includes('git.madnite1.pe.kr') || url.includes('gitea.derekkoo.win')) return 'gitea';
+        // 기타 gitea 패턴 (gitea. 도메인 등)
+        if (url.includes('gitea.')) return 'gitea';
+        return 'github'; // 기본값
+    }
+
+    function getSourceIcon(sourceType) {
+        switch (sourceType) {
+            case 'gitea': return 'fa-solid fa-server';
+            case 'local': return 'fa-solid fa-folder';
+            case 'github':
+            default: return 'fa-brands fa-github';
+        }
+    }
+
+    function getSourceLabel(sourceType) {
+        switch (sourceType) {
+            case 'gitea': return 'Gitea';
+            case 'local': return '로컬 플러그인';
+            case 'github':
+            default: return 'GitHub';
+        }
+    }
+
     // 🎨 테마 감지 (MutationObserver - 가이드 규격)
     function getCurrentTheme() {
         return document.documentElement.getAttribute('data-app-theme') || 'purple';
@@ -700,6 +733,10 @@
         const desc = cat.description
             ? '<p class="pm-catalog-desc">' + escapeHtml(cat.description) + '</p>'
             : '';
+        // 소스 타입 감지 (catalog.source 우선, 없으면 git_url로 판단)
+        const sourceType = getSourceType(p.git_url, cat.source);
+        const sourceIcon = getSourceIcon(sourceType);
+        const sourceLabel = getSourceLabel(sourceType);
 
         return `
             <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}"${installErr ? ` data-install-error="${escapeHtml(installErr)}"` : ''}>
@@ -707,7 +744,7 @@
                     <div class="pm-plugin-top">
                         <div class="pm-plugin-icon-title">
                             <div class="pm-plugin-avatar pm-catalog-avatar">
-                                <i class="fa-brands fa-github"></i>
+                                <i class="${sourceIcon}"></i>
                             </div>
                             <div>
                                 <h4 class="pm-plugin-name">${escapeHtml(displayName)}</h4>
@@ -728,7 +765,7 @@
                 <div class="pm-plugin-footer">
                     <div class="pm-catalog-meta">
                         <a href="${escapeHtml(p.git_url || '')}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(p.git_url || '')}" onclick="event.stopPropagation();">
-                            <i class="fa-brands fa-github"></i> 저장소 보기
+                            <i class="${sourceIcon}"></i> ${sourceLabel} 저장소 보기
                         </a>
                     </div>
                     <div class="pm-card-action-btns">
@@ -835,8 +872,13 @@
                 ? '<span class="pm-badge pm-badge-system">SYSTEM</span>'
                 : '';
 
+            // 소스 타입 감지 (git_url로 GitHub/Gitea/로컬 구분)
+            const sourceType = getSourceType(p.git_url);
+            const sourceIcon = getSourceIcon(sourceType);
+            const sourceLabel = getSourceLabel(sourceType);
+
             const originBadge = p.git_url
-                ? `<a class="pm-badge pm-badge-git" href="${escapeHtml(p.git_url)}" target="_blank" rel="noopener noreferrer" title="Git 저장소 열기 (${escapeHtml(p.git_url)})" onclick="event.stopPropagation();"><i class="fa-brands fa-github"></i> GitHub</a>`
+                ? `<a class="pm-badge pm-badge-git" href="${escapeHtml(p.git_url)}" target="_blank" rel="noopener noreferrer" title="Git 저장소 열기 (${escapeHtml(p.git_url)})" onclick="event.stopPropagation();"><i class="${sourceIcon}"></i> ${sourceLabel}</a>`
                 : '<span class="pm-badge pm-badge-local"><i class="fa-solid fa-folder"></i> 로컬 플러그인</span>';
 
             const categoryBadge = p.is_category
