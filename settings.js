@@ -186,20 +186,36 @@
             submitBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 저장 중...';
         }
 
+        const payload = {
+            type: 'general',
+            refresh_interval_hours: intervalVal,
+            topics: topicsVal,
+            allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+            auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+            github_token: tokenInput ? tokenInput.value.trim() : '',
+            gitea_servers: giteaServers
+        };
+
         try {
-            const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
+            let res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    type: 'general',
-                    refresh_interval_hours: intervalVal,
-                    topics: topicsVal,
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
-                    auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
-                    github_token: tokenInput ? tokenInput.value.trim() : '',
-                    gitea_servers: giteaServers
-                })
+                body: JSON.stringify(payload)
             });
+
+            // 라우트 미등록(404 등) 시 apply-metadata 엔드포인트로 즉시 폴백
+            if (!res.ok || res.status === 404) {
+                res = await fetch('/api/media/books/0/apply-metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'general',
+                        source: 'plugin_manager',
+                        item_data: Object.assign({ action: 'save_config' }, payload)
+                    })
+                });
+            }
+
             const data = await res.json();
             if (submitBtn) {
                 submitBtn.disabled = false;
@@ -211,6 +227,28 @@
                 showError(data.error || '설정 저장 실패');
             }
         } catch (err) {
+            // 통신 에러 시에도 1회 apply-metadata 로 폴백 시도
+            try {
+                const fbRes = await fetch('/api/media/books/0/apply-metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'general',
+                        source: 'plugin_manager',
+                        item_data: Object.assign({ action: 'save_config' }, payload)
+                    })
+                });
+                const fbData = await fbRes.json();
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = origHtml;
+                }
+                if (fbData.success) {
+                    showSuccess(fbData.message || '카탈로그 설정이 저장되었습니다.');
+                    return;
+                }
+            } catch (_) {}
+
             if (submitBtn) {
                 submitBtn.disabled = false;
                 submitBtn.innerHTML = origHtml;
@@ -272,11 +310,22 @@
             if (!tokenInput) return;
             if (typeof window.confirm === 'function' && !confirm('저장된 GitHub 토큰을 삭제할까요?')) return;
             try {
-                const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
+                let res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ type: 'general', clear_github_token: true })
                 });
+                if (!res.ok || res.status === 404) {
+                    res = await fetch('/api/media/books/0/apply-metadata', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            type: 'general',
+                            source: 'plugin_manager',
+                            item_data: { action: 'save_config', clear_github_token: true }
+                        })
+                    });
+                }
                 const data = await res.json();
                 if (data.success) {
                     tokenInput.value = '';
@@ -286,6 +335,24 @@
                     showError(data.error || '토큰 삭제 실패');
                 }
             } catch (err) {
+                try {
+                    const fbRes = await fetch('/api/media/books/0/apply-metadata', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            type: 'general',
+                            source: 'plugin_manager',
+                            item_data: { action: 'save_config', clear_github_token: true }
+                        })
+                    });
+                    const fbData = await fbRes.json();
+                    if (fbData.success) {
+                        tokenInput.value = '';
+                        tokenInput.placeholder = 'ghp_... (저장 안 됨)';
+                        showSuccess(fbData.message || 'GitHub 토큰이 삭제되었습니다.');
+                        return;
+                    }
+                } catch (_) {}
                 showError('통신 오류: ' + err.message);
             }
         });

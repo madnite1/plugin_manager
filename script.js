@@ -1257,19 +1257,34 @@
             if (typeof window.__pm_gitea_servers_get === 'function') {
                 giteaServers = window.__pm_gitea_servers_get() || [];
             }
-            const res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
+            const payload = {
+                type: 'general',
+                refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
+                topics: topicsInput ? topicsInput.value.trim() : '',
+                allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+                github_token: tokenInput ? tokenInput.value.trim() : '',
+                gitea_servers: giteaServers
+            };
+
+            let res = await fetch('/api/media/dashboard/widgets/plugin_manager/save-config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    type: 'general',
-                    refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
-                    topics: topicsInput ? topicsInput.value.trim() : '',
-                    allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
-                    auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
-                    github_token: tokenInput ? tokenInput.value.trim() : '',
-                    gitea_servers: giteaServers
-                })
+                body: JSON.stringify(payload)
             });
+
+            if (!res.ok || res.status === 404) {
+                res = await fetch('/api/media/books/0/apply-metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'general',
+                        source: 'plugin_manager',
+                        item_data: Object.assign({ action: 'save_config' }, payload)
+                    })
+                });
+            }
+
             const data = await res.json();
             if (saveBtn) {
                 saveBtn.disabled = false;
@@ -1283,6 +1298,36 @@
                 showAlert(data.error || '설정 저장 실패', true);
             }
         } catch (err) {
+            try {
+                const fbRes = await fetch('/api/media/books/0/apply-metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'general',
+                        source: 'plugin_manager',
+                        item_data: Object.assign({ action: 'save_config' }, {
+                            refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
+                            topics: topicsInput ? topicsInput.value.trim() : '',
+                            allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
+                            auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+                            github_token: tokenInput ? tokenInput.value.trim() : '',
+                            gitea_servers: giteaServers
+                        })
+                    })
+                });
+                const fbData = await fbRes.json();
+                if (saveBtn) {
+                    saveBtn.disabled = false;
+                    saveBtn.innerHTML = origHtml;
+                }
+                if (fbData.success) {
+                    showAlert(fbData.message || '카탈로그 설정이 저장되었습니다.');
+                    closeSettingsModal();
+                    loadPlugins();
+                    return;
+                }
+            } catch (_) {}
+
             if (saveBtn) {
                 saveBtn.disabled = false;
                 saveBtn.innerHTML = origHtml;

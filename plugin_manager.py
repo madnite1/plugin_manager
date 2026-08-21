@@ -218,6 +218,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not self.__class__._migration_done:
             self._run_migration_once()
             self.__class__._migration_done = True
+        self._ensure_catalog_routes()
 
     def _run_migration_once(self):
         """최초 1회 마이그레이션: 구 DB 복사 + 코어 DB 설정 → catalog.db.settings"""
@@ -3521,13 +3522,23 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             payload = request.get_json(silent=True) or {}
             db_type = str(payload.get("type") or "general").strip() or "general"
-            ok, msg = self._catalog_save_config(payload, db_type)
+            # 핫 리로드 등으로 현재 인스턴스가 최신이 아닐 수 있으므로 MetadataFactory 최신 provider로 위임 시도
+            target_inst = self
+            try:
+                from services.metadata_factory import MetadataFactory
+                latest = MetadataFactory.get_provider_by_id(self.id)
+                if latest and hasattr(latest, "_catalog_save_config"):
+                    target_inst = latest
+            except Exception:
+                pass
+
+            ok, msg = target_inst._catalog_save_config(payload, db_type)
             if not ok:
                 return jsonify({"success": False, "error": msg})
             return jsonify({
                 "success": True,
                 "message": msg,
-                "catalog_meta": self._catalog_meta_dict(db_type),
+                "catalog_meta": target_inst._catalog_meta_dict(db_type),
             })
         except Exception as e:
             return jsonify({"success": False, "error": "설정 저장 실패: {0}".format(e)})
@@ -3536,8 +3547,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """save-config 자체 라우트 1회 등록 (함정 2: add_url_rule 대신 url_map.add 직접 등록)"""
         global _CATALOG_ROUTES_REGISTERED
         with _CATALOG_ROUTES_LOCK:
-            if _CATALOG_ROUTES_REGISTERED:
-                return
             try:
                 from flask import current_app
                 from werkzeug.routing import Rule
@@ -3548,18 +3557,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         "/api/media/dashboard/widgets/plugin_manager/save-config",
                         endpoint=endpoint, methods=["POST"],
                     ))
-                    app.view_functions[endpoint] = self._save_config_route
+                # 핫 리로드 후에도 view_functions에 최신 메서드 핸들러 갱신
+                app.view_functions[endpoint] = self._save_config_route
                 _CATALOG_ROUTES_REGISTERED = True
             except Exception:
                 pass  # 첫 요청 이전 컨텍스트 부재 등 — 다음 호출에서 재시도
 
-# ── 플러그인 로드 시 백그라운드 카탈로그 갱신 스레드 자동 시작 (2026-08-14) ──
-# 코어는 플러그인을 lazy import — 첫 요청이 오면 모듈이 로드되는데, 그 시점에 스레드를
-# 시작하면 카탈로그 화면을 직접 열지 않아도 주기 갱신이 보장된다. 기존 get_dashboard_data의
-# _ensure_catalog_thread 호출은 _CATALOG_THREAD_STARTED 플래그 때문에 no-op — 중복 시작 없음.
-# 테스트 하네스(verify_catalog/verify_sources_db)는 exec로 실행하므로 _PM_SKIP_AUTO_START로 건너뜀.
+# ── 플러그인 로드 시 백그라운드 카탈로그 갱신 스레드 및 라우트 자동 시작 ──
 if not globals().get("_PM_SKIP_AUTO_START", False):
     try:
-        PluginManagerMetadataProvider()._ensure_catalog_thread("general")
+        _pm_inst = PluginManagerMetadataProvider()
+        _pm_inst._ensure_catalog_routes()
+        _pm_inst._ensure_catalog_thread("general")
     except Exception:
         pass  # import 실패로 플러그인 로드 전체가 죽는 것 방지
