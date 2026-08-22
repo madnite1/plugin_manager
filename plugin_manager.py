@@ -2940,9 +2940,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     gitea_errors.append("{0}: {1}".format(server.get("host", "?"), str(e)[:200]))
 
             # 2. repos upsert (검색 메타만 — is_valid/last_checked는 보존)
-            print(f"[DEBUG] Step 2: upserting {len(merged)} items")
             for (source, full_name), info in merged.items():
-                print(f"[DEBUG]   upsert: {full_name}")
                 self._catalog_db_execute(
                     """
                     INSERT INTO repos
@@ -2975,7 +2973,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 3. 검색에서 더 이상 조회되지 않는 미설치 저장소 정리 (DB 제거)
             #    설치된 플러그인은 검색과 무관하게 유지 (업데이트/정보 보존).
             #    모든 토픽 검색이 성공한 시점에만 실행 — GitHub 실패 시 위에서 raise 되어 도달 안 함.
-            print(f"[DEBUG] Step 3: cleaning up, merged has {len(merged)} items")
             removed = 0
             base_dir = self._get_plugins_base_dir()
             # 성공한 Gitea 서버의 base_url 집합 (실패한 서버 것은 보호 안 함)
@@ -2987,7 +2984,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         if key[0] == "gitea" and info.get("base_url") == server["url"]:
                             successful_gitea_base_urls.add(server["url"])
                             break
-            print(f"[DEBUG]   successful_gitea_base_urls: {successful_gitea_base_urls}")
             for r in self._catalog_db_query("SELECT full_name, plugin_id, source, base_url FROM repos"):
                 key = (str(r.get("source") or "github"), r["full_name"])
                 if key in merged:
@@ -2996,12 +2992,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 if r.get("source") == "gitea":
                     base_url = r.get("base_url")
                     if base_url and base_url in successful_gitea_base_urls:
-                        print(f"[DEBUG]   PROTECT: {r['full_name']} (from successful server {base_url})")
                         continue
                 plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
                 if os.path.isdir(os.path.join(base_dir, plugin_id)):
                     continue
-                print(f"[DEBUG]   DELETE: {r['full_name']} (key={key}, in_merged={key in merged})")
                 self._catalog_db_execute(
                     "DELETE FROM repos WHERE full_name=?", (r["full_name"],)
                 )
@@ -3034,7 +3028,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             for r in rows_to_check:
                 full_name = r["full_name"]
-                print(f"[DEBUG] Step 4: checking version for {full_name} (source={r.get('source')}, base_url={r.get('base_url')})")
                 is_valid, plugin_id, version, plugin_name = self._catalog_check_repo_version(
                     full_name,
                     r.get("default_branch") or "main",
@@ -3042,7 +3035,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     base_url=r.get("base_url"),
                     db_type=db_type,
                 )
-                print(f"[DEBUG] Step 4: result for {full_name} = {is_valid}, {plugin_id}, {version}, {plugin_name}")
                 self._catalog_db_execute(
                     "UPDATE repos SET is_valid=?, plugin_id=?, latest_version=?, plugin_name=?, last_checked=? WHERE full_name=?",
                     (is_valid, plugin_id or str(full_name).split("/")[-1], version, plugin_name, now, full_name),
@@ -3151,7 +3143,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _catalog_due_for_refresh(self, interval_hours):
         """last_refresh 기준 interval 경과 여부 — 재시작 후에도 정확 (타이머 리셋 무관).
-        last_refresh 없음(최초)이면 즉시 갱신 대상. 반환: (경과 시간 초, 경과 여부)
+        last_refresh 없음(최초)이면 즉시 갱신 대상. 반환: bool
         """
         try:
             interval_sec = max(60, int(interval_hours) * 3600)
@@ -3161,20 +3153,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             meta = self._catalog_read_meta()
             raw = meta.get("last_refresh") or ""
             if not raw:
-                return interval_sec, True
+                return True
             last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if last.tzinfo is None:
                 last = last.replace(tzinfo=timezone.utc)
             elapsed = (datetime.now(timezone.utc) - last).total_seconds()
             if meta.get("refresh_state") == "error":
                 # 실패 상태면 interval 무관하게 재시도 대상 — daemon의 쿨다운 게이트
-                # (10분)가 실제 동작하도록 due=True 반환. 최근 성공 직후 실패 시
+                # (10분)가 실제 동작하도록 True 반환. 최근 성공 직후 실패 시
                 # last_refresh가 최신이라 6시간 동안 error가 방치되는 문제 해결.
-                return elapsed, True
-            return elapsed, elapsed >= interval_sec
+                return True
+            return elapsed >= interval_sec
         except Exception:
             # 파싱 불가/오류 시 안전하게 즉시 갱신 (스택 방지)
-            return interval_sec, True
+            return True
 
     def _catalog_thread_is_alive(self):
         """백그라운드 스레드 실제 생존 여부 (전역 참조 스레드의 is_alive)"""
