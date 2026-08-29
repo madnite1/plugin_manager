@@ -1537,6 +1537,44 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         return False
 
+    def _extract_module_string_constants(self, tree):
+        """모듈 최상위의 단순 문자열 상수만 안전하게 수집한다.
+
+        예: PLUGIN_ID = "foo". 함수 호출/연산식/속성 접근은 해석하지 않는다.
+        """
+        constants = {}
+        try:
+            for stmt in getattr(tree, "body", []):
+                value_node = None
+                targets = []
+                if isinstance(stmt, ast.Assign):
+                    value_node = stmt.value
+                    targets = stmt.targets
+                elif isinstance(stmt, ast.AnnAssign):
+                    value_node = stmt.value
+                    targets = [stmt.target]
+                if not isinstance(value_node, ast.Constant) or not isinstance(value_node.value, str):
+                    continue
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = value_node.value
+        except Exception:
+            pass
+        return constants
+
+    def _resolve_static_string(self, value_node, module_constants=None):
+        """AST 노드를 코드 실행 없이 문자열로 해석한다.
+
+        문자열 리터럴 또는 모듈 최상위 단순 문자열 상수 참조만 허용한다.
+        """
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+            return value_node.value
+        if isinstance(value_node, ast.Name) and module_constants:
+            value = module_constants.get(value_node.id)
+            if isinstance(value, str):
+                return value
+        return None
+
     def _detect_plugin_id(self, plugin_dir, fallback_name=None):
         """디렉토리 내 파일에서 plugin_id 자동 감지"""
         # 1. VERSION 파일 내 정보 확인
@@ -1565,6 +1603,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                             tree = ast.parse(f.read(), filename=fpath)
                     except SyntaxError:
                         continue
+                    module_constants = self._extract_module_string_constants(tree)
                     for node in ast.walk(tree):
                         if not isinstance(node, ast.ClassDef):
                             continue
@@ -1581,10 +1620,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                                 value_node = stmt.value
                             if value_node is None:
                                 continue
-                            try:
-                                value = ast.literal_eval(value_node)
-                            except Exception:
-                                continue
+                            value = self._resolve_static_string(value_node, module_constants)
                             if isinstance(value, str):
                                 p_id = value.strip()
                                 if p_id and re.match(r'^[a-zA-Z0-9_-]+$', p_id):
@@ -1693,6 +1729,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
                 tree = ast.parse(content, filename=fpath)
+                module_constants = self._extract_module_string_constants(tree)
             except SyntaxError:
                 forbidden_hits.append(f"{fname}: 파이썬 구문 오류")
                 continue
@@ -1743,8 +1780,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                                 continue
                             val = stmt.value
                             if t.id == "id":
-                                if isinstance(val, ast.Constant) and isinstance(val.value, str):
-                                    cls_id = val.value
+                                resolved_id = self._resolve_static_string(val, module_constants)
+                                if isinstance(resolved_id, str):
+                                    cls_id = resolved_id
                             elif t.id == "name":
                                 if isinstance(val, ast.Constant) and isinstance(val.value, str):
                                     cls_fields.add("name")
