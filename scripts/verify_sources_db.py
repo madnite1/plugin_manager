@@ -499,6 +499,144 @@ try:
 except Exception as e:
     check("update_manifest.files 정합성", False, str(e))
 
+
+# =================================================================
+section("M. 온라인 업데이트 — ZIP 우선 + 최신 manifest + 제한적 raw fallback")
+online_id = "onlineplug"
+online_dir = os.path.join(BASE_DIR, online_id)
+os.makedirs(online_dir, exist_ok=True)
+old_manifest = {
+    "enabled": True,
+    "provider": "github-raw",
+    "raw_base_url": "https://raw.githubusercontent.com/owner/onlineplug/main",
+    "files": ["onlineplug.py", "__init__.py", "VERSION", "legacy.py"],
+    "version_file": "VERSION",
+    "version_key": "plugin version",
+}
+with open(os.path.join(online_dir, "onlineplug.py"), "w", encoding="utf-8") as f:
+    f.write(
+        "from plugins.metadata.base import BaseMetadataProvider\n\n"
+        "class OnlinePlug(BaseMetadataProvider):\n"
+        "    id = 'onlineplug'\n"
+        "    name = '온라인 테스트'\n"
+        "    is_searchable = False\n"
+        f"    update_manifest = {old_manifest!r}\n"
+    )
+with open(os.path.join(online_dir, "__init__.py"), "w", encoding="utf-8") as f:
+    f.write("from .onlineplug import OnlinePlug\n")
+with open(os.path.join(online_dir, "VERSION"), "w", encoding="utf-8") as f:
+    f.write('{"plugin version": "1.0.0"}\n')
+with open(os.path.join(online_dir, "legacy.py"), "w", encoding="utf-8") as f:
+    f.write("LEGACY = True\n")
+with open(os.path.join(online_dir, "runtime.db"), "w", encoding="utf-8") as f:
+    f.write("런타임 보존 데이터")
+P._sources_set(online_id, {
+    "git_url": "https://github.com/owner/onlineplug",
+    "branch": "main",
+    "installed_at": "2026-01-01T00:00:00",
+    "manifest_files": old_manifest["files"],
+})
+
+new_src = os.path.join(WORK, "online_update_src")
+os.makedirs(new_src, exist_ok=True)
+new_manifest = dict(old_manifest)
+new_manifest["files"] = ["onlineplug.py", "__init__.py", "VERSION", "new_module.py"]
+with open(os.path.join(new_src, "onlineplug.py"), "w", encoding="utf-8") as f:
+    f.write(
+        "from plugins.metadata.base import BaseMetadataProvider\n\n"
+        "class OnlinePlug(BaseMetadataProvider):\n"
+        "    id = 'onlineplug'\n"
+        "    name = '온라인 테스트'\n"
+        "    is_searchable = False\n"
+        "    config_schema = []\n"
+        f"    update_manifest = {new_manifest!r}\n"
+        "    def search(self, db_type, query):\n"
+        "        return []\n"
+        "    def apply(self, db_type, book_id, item_data):\n"
+        "        return False, 'noop'\n"
+    )
+with open(os.path.join(new_src, "__init__.py"), "w", encoding="utf-8") as f:
+    f.write("from .onlineplug import OnlinePlug\n")
+with open(os.path.join(new_src, "VERSION"), "w", encoding="utf-8") as f:
+    f.write('{"plugin version": "1.1.0"}\n')
+with open(os.path.join(new_src, "new_module.py"), "w", encoding="utf-8") as f:
+    f.write("NEW_MODULE = True\n")
+
+def _repo_zip_bytes(root, top="repo-main"):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as zf:
+        for base, _dirs, files in os.walk(root):
+            for fname in sorted(files):
+                full = os.path.join(base, fname)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                zf.write(full, f"{top}/{rel}")
+    return b.getvalue()
+
+class _OnlineCls:
+    update_manifest = old_manifest
+
+saved_download_zip = P._download_repository_zip
+saved_raw_update = P._update_plugin_raw_legacy
+saved_import_result = fake_metadata_factory._import_provider_module_and_class.return_value
+saved_providers = fake_metadata_factory.get_available_providers.return_value
+try:
+    fake_metadata_factory._import_provider_module_and_class.return_value = (None, _OnlineCls)
+    fake_metadata_factory.get_available_providers.return_value = [{"id": online_id}]
+    good_zip = _repo_zip_bytes(new_src)
+    P._download_repository_zip = lambda _url, _db: ({
+        "zip_bytes": good_zip,
+        "used_url": "https://codeload.github.com/owner/onlineplug/zip/refs/tags/v1.1.0",
+        "ref_type": "release",
+        "ref_name": "v1.1.0",
+        "branch": "v1.1.0",
+        "explicit_branch": False,
+    }, None)
+    ok, msg = P._update_plugin(online_id, "general")
+    check("온라인 업데이트 ZIP 우선 성공", ok and "v1.1.0" in str(msg), msg)
+    check("온라인 업데이트 최신 VERSION 적용",
+          P._read_local_plugin_version(online_dir, "VERSION", "plugin version") == "1.1.0")
+    check("온라인 업데이트 신규 관리 파일 추가", os.path.isfile(os.path.join(online_dir, "new_module.py")))
+    check("온라인 업데이트 제거 관리 파일 삭제", not os.path.exists(os.path.join(online_dir, "legacy.py")))
+    check("온라인 업데이트 런타임 데이터 보존",
+          open(os.path.join(online_dir, "runtime.db"), encoding="utf-8").read() == "런타임 보존 데이터")
+    src_info = P._sources_get(online_id)
+    check("소스 저장소 유지 + 최신 manifest_files 갱신",
+          src_info and src_info.get("git_url") == "https://github.com/owner/onlineplug"
+          and "new_module.py" in (src_info.get("manifest_files") or [])
+          and "legacy.py" not in (src_info.get("manifest_files") or []), f"got {src_info}")
+
+    # ZIP은 받았지만 plugin_id가 잘못된 경우 raw fallback을 절대 호출하지 않는다.
+    bad_src = os.path.join(WORK, "online_bad_id")
+    shutil.copytree(new_src, bad_src)
+    with open(os.path.join(bad_src, "onlineplug.py"), "r", encoding="utf-8") as f:
+        bad_code = f.read().replace("id = 'onlineplug'", "id = 'wrongplug'")
+    with open(os.path.join(bad_src, "onlineplug.py"), "w", encoding="utf-8") as f:
+        f.write(bad_code)
+    bad_zip = _repo_zip_bytes(bad_src)
+    P._download_repository_zip = lambda _url, _db: ({
+        "zip_bytes": bad_zip, "used_url": "bad", "ref_type": "release",
+        "ref_name": "v1.2.0", "branch": "v1.2.0", "explicit_branch": False,
+    }, None)
+    raw_calls = {"count": 0}
+    def _raw_probe(_pid, _db):
+        raw_calls["count"] += 1
+        return True, "raw 호출"
+    P._update_plugin_raw_legacy = _raw_probe
+    ok, msg = P._update_plugin(online_id, "general")
+    check("ZIP 패키지 검증 실패 시 업데이트 중단", not ok and "플러그인 ID" in str(msg), msg)
+    check("ZIP 패키지 검증 실패 시 raw fallback 금지", raw_calls["count"] == 0, f"calls={raw_calls['count']}")
+
+    # ZIP 자체를 받지 못한 경우에만 raw 호환 경로를 허용한다.
+    P._download_repository_zip = lambda _url, _db: (None, "저장소 ZIP 다운로드 실패: 404")
+    ok, msg = P._update_plugin(online_id, "general")
+    check("ZIP 다운로드 자체 실패 시 raw fallback 허용", ok and raw_calls["count"] == 1, msg)
+finally:
+    P._download_repository_zip = saved_download_zip
+    P._update_plugin_raw_legacy = saved_raw_update
+    fake_metadata_factory._import_provider_module_and_class.return_value = saved_import_result
+    fake_metadata_factory.get_available_providers.return_value = saved_providers
+
+
 print()
 if FAIL:
     print(f"결과: {FAIL}개 실패 / {PASS}개 통과")

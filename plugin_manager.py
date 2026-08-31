@@ -193,6 +193,25 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """plugins/metadata 루트 경로 반환"""
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+    def _get_plugin_data_dir(self, plugin_id, create=False):
+        """플러그인별 표준 영속 데이터 경로 `plugins/data/<plugin_id>`를 반환한다.
+
+        이 경로는 `plugins/metadata/<plugin_id>` 코드 설치/업데이트/삭제와 별도 생명주기를
+        가진다. Plugin Manager의 모든 코드 교체 작업은 이 경로를 삭제하거나 덮어쓰지 않는다.
+        """
+        pid = str(plugin_id or "").strip()
+        if not pid or not re.fullmatch(r"[A-Za-z0-9_-]+", pid):
+            return None
+        metadata_dir = os.path.realpath(self._get_plugins_base_dir())
+        plugins_dir = os.path.dirname(metadata_dir)
+        data_root = os.path.realpath(os.path.join(plugins_dir, "data"))
+        target = os.path.realpath(os.path.join(data_root, pid))
+        if not target.startswith(data_root + os.sep):
+            return None
+        if create:
+            os.makedirs(target, exist_ok=True)
+        return target
+
     def _get_data_dir(self):
         """플러그인 영속 데이터 디렉터리 (../../data/plugin_manager/) — 업데이트/삭제 시에도 보존"""
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -955,7 +974,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """동일 plugin_id ZIP을 기존 플러그인의 트랜잭션형 업데이트로 적용한다.
 
         update_manifest.files를 관리 파일 목록으로 사용해 코드/UI만 교체하고,
-        목록 밖의 런타임 데이터 파일은 보존한다. 로드 검증 실패 시 전체 백업으로 롤백한다.
+        목록 밖의 레거시 런타임 파일은 보존한다. 표준 `plugins/data/<plugin_id>` 영속
+        데이터 경로는 애초에 코드 폴더 밖이므로 어떤 업데이트/롤백에서도 건드리지 않는다.
+        로드 검증 실패 시 전체 코드 폴더 백업으로 롤백한다.
         """
         old_files, _old_manifest = self._extract_update_manifest_files(dest_dir)
         new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
@@ -1024,7 +1045,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             warns = [c["detail"] for c in source_checks if c.get("warn")]
             result_msg = (
                 f"동일 ID ZIP을 감지하여 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
-                f"(관리 파일 {len(new_managed)}개 갱신, 기존 런타임 데이터 보존, 검증 통과: {', '.join(passed)})"
+                f"(관리 파일 {len(new_managed)}개 갱신, plugins/data/{plugin_id} 영속 데이터 보존, 검증 통과: {', '.join(passed)})"
             )
             if force:
                 result_msg += " [경고] 검증 실패 항목을 무시하고 업데이트했습니다."
@@ -1160,6 +1181,97 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _download_repository_zip(self, git_url, db_type):
+        """저장소 소스 ZIP을 공통 정책으로 다운로드한다.
+
+        명시적 브랜치 URL은 해당 브랜치만 추적하고, 일반 저장소 URL은
+        최신 릴리즈를 우선한 뒤 main/master 브랜치로 폴백한다.
+        반환: (정보 dict, None) 또는 (None, 오류 문자열)
+        """
+        git_url = str(git_url or "").strip()
+        zip_url, branch = self._build_repo_zip_url(git_url)
+        if not zip_url:
+            return None, "Git 저장소 URL 형식을 인식할 수 없습니다."
+
+        parsed = self._parse_git_repo(git_url)
+        explicit_branch = ("/tree/" in git_url or "/src/branch/" in git_url)
+        candidates = list(self._zip_url_candidates(zip_url))
+        release_url = None
+        release_tag = None
+
+        if not explicit_branch and parsed:
+            if parsed.get("type") == "github":
+                release_tag = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
+                if release_tag:
+                    release_url = (
+                        f"https://codeload.github.com/{parsed['owner']}/{parsed['repo']}"
+                        f"/zip/refs/tags/{release_tag}"
+                    )
+            elif parsed.get("type") == "gitea":
+                token = self._gitea_token_for_host(db_type, parsed["host"])
+                release_tag = self._fetch_gitea_latest_release_tag(
+                    parsed["base"], parsed["owner"], parsed["repo"], token
+                )
+                if release_tag:
+                    release_url = (
+                        f"{parsed['base']}/{parsed['owner']}/{parsed['repo']}"
+                        f"/archive/{release_tag}.zip"
+                    )
+            if release_url and release_url not in candidates:
+                candidates.insert(0, release_url)
+
+        token = None
+        if parsed and parsed.get("type") == "gitea":
+            token = self._gitea_token_for_host(db_type, parsed["host"])
+
+        last_err = None
+        for cand_url in candidates:
+            try:
+                headers = {"User-Agent": "BookOasis/1.0"}
+                if token:
+                    headers["Authorization"] = f"token {token}"
+                req = Request(cand_url, headers=headers)
+                with urlopen(req, timeout=60) as resp:
+                    zip_bytes = resp.read()
+                is_release = bool(release_url and cand_url == release_url)
+                return {
+                    "zip_bytes": zip_bytes,
+                    "used_url": cand_url,
+                    "ref_type": "release" if is_release else "branch",
+                    "ref_name": release_tag if is_release else branch,
+                    "branch": release_tag if is_release else branch,
+                    "explicit_branch": explicit_branch,
+                }, None
+            except HTTPError as e:
+                last_err = f"{e.code} {e.reason}"
+            except Exception as e:
+                last_err = str(e)
+
+        return None, f"저장소 ZIP 다운로드 실패: {last_err or '알 수 없는 오류'}"
+
+    def _extract_repository_zip(self, zip_bytes, temp_dir):
+        """저장소 ZIP을 Zip Slip 검사 후 해제하고 플러그인 루트를 반환한다."""
+        import io
+        import zipfile
+
+        try:
+            zip_file = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        except zipfile.BadZipFile as e:
+            raise ValueError("다운로드된 저장소 ZIP이 손상되었습니다.") from e
+
+        for member in zip_file.namelist():
+            member_clean = os.path.normpath(member)
+            if (member_clean.startswith("..") or member_clean.startswith("/")
+                    or member_clean.startswith("\\\\")):
+                raise ValueError(
+                    f"보안 경고: 압축 파일 내 유효하지 않은 상위 경로가 포함되어 있습니다: {member}"
+                )
+        zip_file.extractall(temp_dir)
+        target_plugin_dir = self._find_plugin_root_dir(temp_dir)
+        if not target_plugin_dir:
+            raise ValueError("다운로드된 저장소에서 플러그인 디렉토리를 찾을 수 없습니다.")
+        return target_plugin_dir
+
     def _install_from_git(self, git_url, db_type, force=False, backup_dir=None):
         """
         GitHub/Gitea 저장소 URL 을 통한 플러그인 설치 (git 바이너리 불필요).
@@ -1191,69 +1303,21 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             import io
             import zipfile
 
-            # 1. ZIP 다운로드 (릴리즈 태그 우선 → 기본 브랜치 main → 실패 시 master 폴백)
-            #    GitHub 소스 + 브랜치 미지정(/tree/ 또는 /src/branch/ 없음)이면
-            #    최신 릴리즈 태그 ZIP을 최우선 후보로 사용 — 설치와 업데이트 소스 일치.
-            candidates = list(self._zip_url_candidates(zip_url))
-            release_zip_url = None
-            release_tag = None
-            if "/tree/" not in git_url and "/src/branch/" not in git_url:
-                repo = self._parse_github_repo(git_url)
-                if repo:
-                    release_tag = self._fetch_latest_release_tag(repo[0], repo[1])
-                    if release_tag:
-                        release_zip_url = (
-                            f"https://codeload.github.com/{repo[0]}/{repo[1]}"
-                            f"/zip/refs/tags/{release_tag}"
-                        )
-                        if release_zip_url not in candidates:
-                            candidates.insert(0, release_zip_url)
+            # 1. 설치/업데이트 공통 저장소 ZIP 획득 정책 사용
+            zip_info, zip_err = self._download_repository_zip(git_url, db_type)
+            if not zip_info:
+                return False, zip_err or "저장소 ZIP 다운로드 실패"
+            zip_bytes = zip_info["zip_bytes"]
+            used_url = zip_info["used_url"]
+            branch = zip_info["branch"]
+            release_tag = zip_info["ref_name"] if zip_info["ref_type"] == "release" else None
+            release_zip_url = used_url if zip_info["ref_type"] == "release" else None
 
-            zip_bytes = None
-            last_err = None
-            used_url = None
-            # Gitea 토큰 준비 (Gitea 호스트인 경우)
-            gitea_token = None
-            gitea_host = None
-            gitea_m = re.match(r'^https?://([^/]+)/', zip_url)
-            if gitea_m:
-                gitea_host = gitea_m.group(1)
-                gitea_token = self._gitea_token_for_host(db_type, gitea_host)
-            for cand_url in candidates:
-                try:
-                    headers = {"User-Agent": "BookOasis/1.0"}
-                    # Gitea 호스트인 경우 토큰 추가 (비공개 저장소 접근용)
-                    if gitea_token:
-                        headers["Authorization"] = f"token {gitea_token}"
-                    req = Request(cand_url, headers=headers)
-                    with urlopen(req, timeout=60) as resp:
-                        zip_bytes = resp.read()
-                    used_url = cand_url
-                    break
-                except HTTPError as e:
-                    last_err = f"{e.code} {e.reason}"
-                except Exception as e:
-                    last_err = str(e)
-            if not zip_bytes:
-                return False, f"저장소 ZIP 다운로드 실패: {last_err}"
-
-            # 릴리즈 태그로 설치한 경우 branch 메타를 태그명으로 기록 (업데이트 엔진 소스와 일치)
-            if release_zip_url and used_url == release_zip_url:
-                branch = release_tag
-
-            # 2. 압축 해제 (Zip Slip 차단)
-            zip_file = zipfile.ZipFile(io.BytesIO(zip_bytes))
-            for member in zip_file.namelist():
-                member_clean = os.path.normpath(member)
-                if (member_clean.startswith("..") or member_clean.startswith("/")
-                        or member_clean.startswith("\\")):
-                    return False, f"보안 경고: 압축 파일 내 유효하지 않은 상위 경로가 포함되어 있습니다: {member}"
-            zip_file.extractall(temp_dir)
-
-            # 3. 플러그인 루트 탐색 (단독 플러그인 저장소 가정: 루트가 플러그인 자체)
-            target_plugin_dir = self._find_plugin_root_dir(temp_dir)
-            if not target_plugin_dir:
-                return False, "다운로드된 저장소에서 플러그인 디렉토리를 찾을 수 없습니다."
+            # 2~3. 안전하게 압축 해제 + 플러그인 루트 탐색
+            try:
+                target_plugin_dir = self._extract_repository_zip(zip_bytes, temp_dir)
+            except ValueError as e:
+                return False, str(e)
 
             # 4. update_manifest.files 추출 + 플러그인 ID 감지
             manifest_files, manifest = self._extract_update_manifest_files(target_plugin_dir)
@@ -1323,7 +1387,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 except Exception as e:
                     return False, f"플러그인 파일 정리 중 오류가 발생했습니다: {str(e)}"
 
-            # 7. 이전 디렉토리 교체 후 복사 (manifest 없음 → ZIP 방식 ignore 패턴으로 전체 복사)
+            # 7. 이전 코드 디렉토리 교체 후 복사. plugins/data/<plugin_id>는 dest_dir 밖의
+            #    별도 영속 영역이므로 이 삭제의 영향을 받지 않는다.
+            #    (manifest 없음 → ZIP 방식 ignore 패턴으로 전체 복사)
             if os.path.exists(dest_dir):
                 shutil.rmtree(dest_dir)
             if has_manifest:
@@ -2130,8 +2196,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         all_ok = all(c.get("ok") for c in checks)
         return all_ok, checks
 
-    def _update_plugin(self, plugin_id, db_type):
-        """특정 플러그인 업데이트 실행 (릴리즈 태그 우선, 브랜치 폴백 — 코어 sample_update_plugin 미사용)"""
+    def _update_plugin_raw_legacy(self, plugin_id, db_type):
+        """구형 호환용 raw 파일 개별 다운로드 업데이트 경로.
+
+        저장소 ZIP 자체를 기술적으로 가져올 수 없는 경우에만 사용한다.
+        """
         pdir, err = self._validate_plugin_path(plugin_id)
         if err or not pdir:
             return False, err or "유효하지 않은 플러그인 ID입니다."
@@ -2210,6 +2279,138 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         source_label = "릴리즈 태그" if base_url != spec["raw_base_url"] else "브랜치(main)"
         return True, f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{remote_ver}, {source_label} 기준).{reload_warning}"
 
+
+    def _update_plugin(self, plugin_id, db_type):
+        """저장소 ZIP 우선으로 최신 manifest를 적용하는 안전한 온라인 업데이트."""
+        pdir, err = self._validate_plugin_path(plugin_id)
+        if err or not pdir:
+            return False, err or "유효하지 않은 플러그인 ID입니다."
+        if not os.path.isdir(pdir):
+            return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
+
+        # 현재 설치본 manifest는 로컬 버전과 raw fallback 계약 확인에만 사용한다.
+        try:
+            from services.metadata_factory import MetadataFactory
+            _, target_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
+        except Exception as e:
+            return False, f"플러그인 로드 실패: {e}"
+
+        old_manifest = getattr(target_cls, "update_manifest", None)
+        old_spec = self._build_update_spec(plugin_id, old_manifest)
+        if not old_spec:
+            return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
+
+        local_ver = self._read_local_plugin_version(
+            pdir, old_spec["version_file"], old_spec["version_key"]
+        )
+        if not local_ver:
+            return False, "현재 설치 버전을 확인할 수 없어 안전한 업데이트를 중단했습니다."
+
+        # 저장된 설치 소스를 우선하고, 없을 때만 기존 raw_base_url에서 추론한다.
+        git_info = self._read_git_source_info(plugin_id)
+        if not git_info:
+            git_info = self._ensure_git_source_from_raw_base_url(
+                plugin_id, old_spec["raw_base_url"], old_spec.get("files")
+            )
+        git_url = str((git_info or {}).get("git_url") or "").strip()
+
+        # 저장소 ZIP 경로를 구성할 수 없는 레거시/특수 소스만 기존 raw 경로 사용.
+        if not git_url or not self._build_repo_zip_url(git_url)[0]:
+            ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
+            if ok:
+                msg += " (저장소 ZIP 소스를 결정할 수 없어 raw 호환 경로 사용)"
+            return ok, msg
+
+        zip_info, zip_err = self._download_repository_zip(git_url, db_type)
+        if not zip_info:
+            # 네트워크/404/호스트 archive 미지원처럼 ZIP 자체를 얻지 못한 경우만 raw fallback.
+            ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
+            if ok:
+                msg += f" (ZIP 다운로드 실패로 raw 호환 경로 사용: {zip_err})"
+            elif zip_err:
+                msg = f"{zip_err}; raw 호환 업데이트도 실패했습니다: {msg}"
+            return ok, msg
+
+        # 여기부터는 ZIP을 정상 수신한 상태다. 패키지 검증 실패는 raw로 우회하지 않는다.
+        temp_dir = tempfile.mkdtemp(prefix="bo_plugin_update_zip_")
+        try:
+            try:
+                target_plugin_dir = self._extract_repository_zip(zip_info["zip_bytes"], temp_dir)
+            except ValueError as e:
+                return False, f"저장소 ZIP 검증 실패: {e} (raw fallback 하지 않음)"
+
+            remote_plugin_id = self._detect_plugin_id(target_plugin_dir)
+            if remote_plugin_id != plugin_id:
+                return False, (
+                    f"저장소 ZIP의 플러그인 ID가 현재 설치본과 다릅니다: "
+                    f"{remote_plugin_id or '알 수 없음'} != {plugin_id}. 업데이트를 중단했습니다."
+                )
+
+            new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
+            new_spec = self._build_update_spec(plugin_id, new_manifest)
+            if not new_files or not new_spec:
+                return False, (
+                    "저장소 ZIP의 최신 update_manifest가 없거나 유효하지 않습니다. "
+                    "원격 배포 패키지 오류로 판단하여 raw fallback 없이 중단했습니다."
+                )
+
+            # manifest에 선언된 모든 관리 파일이 ZIP에 실제 존재하는지 적용 전에 선검증한다.
+            missing = []
+            for rel in new_spec["files"]:
+                rel_clean = os.path.normpath(str(rel)).lstrip("./").lstrip("/")
+                if not os.path.isfile(os.path.join(target_plugin_dir, rel_clean)):
+                    missing.append(rel_clean)
+            if missing:
+                return False, (
+                    "최신 update_manifest.files에 선언됐지만 ZIP에 없는 파일이 있습니다: "
+                    + ", ".join(missing[:8])
+                    + ". raw fallback 없이 중단했습니다."
+                )
+
+            remote_ver = self._read_local_plugin_version(
+                target_plugin_dir, new_spec["version_file"], new_spec["version_key"]
+            )
+            if not remote_ver:
+                return False, "저장소 ZIP 내부 VERSION을 확인할 수 없어 업데이트를 중단했습니다."
+            if not self._can_update_to_version(local_ver, remote_ver):
+                return False, (
+                    f"업데이트 불가: ZIP 버전({remote_ver})이 현재 버전({local_ver})보다 "
+                    "낮거나 같습니다."
+                )
+
+            source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
+            if not source_ok:
+                details = [c.get("detail") for c in source_checks if not c.get("ok") and c.get("detail")]
+                return False, (
+                    "저장소 ZIP 정적 검증에 실패했습니다: "
+                    + "; ".join(details[:4])
+                    + " (raw fallback 하지 않음)"
+                )
+
+            ok, msg = self._update_existing_from_zip(
+                target_plugin_dir, pdir, plugin_id, source_checks, db_type, force=False
+            )
+            if not ok:
+                return False, msg
+
+            # 저장소/브랜치 정책은 그대로 유지하고 새 managed file 목록만 갱신한다.
+            if git_info:
+                refreshed = dict(git_info)
+                refreshed["manifest_files"] = list(new_spec["files"])
+                self._sources_set(plugin_id, refreshed)
+
+            source_label = (
+                f"릴리즈 {zip_info['ref_name']}"
+                if zip_info.get("ref_type") == "release"
+                else f"브랜치 {zip_info.get('ref_name') or '알 수 없음'}"
+            )
+            return True, (
+                f"'{plugin_id}' 플러그인이 저장소 ZIP의 최신 update_manifest 기준으로 "
+                f"v{remote_ver} 업데이트되었습니다 ({source_label})."
+            )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def _update_all_plugins(self, db_type):
         """설치된 모든 플러그인 일괄 업데이트"""
         plugins = self._list_plugins(db_type)
@@ -2247,7 +2448,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return target_path, None
 
     def _delete_plugin(self, plugin_id, db_type):
-        """플러그인 삭제 (플러그인 폴더 경계 이탈 엄격 차단)"""
+        """플러그인 코드 삭제. `plugins/data/<plugin_id>` 영속 데이터는 의도적으로 보존한다."""
         if plugin_id in ("plugin_manager", "base.py"):
             return False, "시스템 핵심 플러그인 매니저는 삭제할 수 없습니다."
 
@@ -2263,7 +2464,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             self._sources_delete(plugin_id)  # 소스 메타(sqlite)도 함께 정리
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
-            return True, f"플러그인 '{plugin_id}'가 성공적으로 삭제되었습니다."
+            return True, f"플러그인 '{plugin_id}' 코드가 삭제되었습니다. 영속 데이터(plugins/data/{plugin_id})는 보존됩니다."
         except Exception as e:
             return False, f"플러그인 삭제 실패: {str(e)}"
 

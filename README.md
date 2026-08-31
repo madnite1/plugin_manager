@@ -25,7 +25,7 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
   - 업데이트 전에 기존 플러그인 폴더를 임시 백업하고, 핫 리로드/로드 검증 실패 시 기존 버전으로 자동 복원합니다.
   - 기존 Git 소스 정보가 있는 플러그인은 ZIP 업데이트만으로 업데이트 원본 저장소가 바뀌지 않습니다.
 
-설치 후 자동 업데이트는 `update_manifest` 의 `raw_base_url`(GitHub raw)을 통해 동작합니다.
+설치 후 온라인 업데이트는 저장된 Git 소스를 기준으로 **저장소 ZIP을 우선 다운로드**하고, ZIP 내부의 최신 `VERSION`과 `update_manifest.files`를 검증한 뒤 적용합니다. 저장소 ZIP 자체를 받을 수 없는 레거시/특수 소스에 한해서만 기존 raw 파일 다운로드 경로를 호환용으로 사용합니다.
 
 ---
 
@@ -92,7 +92,7 @@ GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
 예외 조건:
 
 - `/tree/<branch>` 로 브랜치를 **명시한 URL** → 태그 조회 생략, 해당 브랜치 ZIP만 사용
-- **Gitea 등 GitHub 이외 호스트** → 태그 조회 자체를 하지 않음 (브랜치 ZIP만, `archive/{branch}.zip`)
+- **Gitea 저장소** → 일반 저장소 URL은 최신 릴리즈 태그를 우선 조회하고, 실패/미존재 시 `archive/{branch}.zip` 브랜치 ZIP으로 폴백
 - 태그 ZIP 다운로드가 404/오류여도 **자동으로 main → master 로 폴백** (후보 순차 시도 구조)
 
 설치 완료 시 사용된 소스가 표시됩니다 (`릴리즈 태그 1.0.0` 또는 `브랜치 main`).
@@ -136,6 +136,16 @@ GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
 ---
 
 ## 업데이트 메커니즘
+
+### ZIP 우선 온라인 업데이트 정책
+
+- 기존 설치 소스를 보존하고 저장소 ZIP을 먼저 받습니다.
+- 최신 ZIP 내부의 `plugin_id`, `VERSION`, `update_manifest.files`를 최종 기준으로 사용합니다.
+- 최신 manifest의 신규/삭제 파일을 반영하고, manifest 밖 런타임 데이터는 보존합니다.
+- ZIP 패키지 검증 실패는 raw로 우회하지 않고 중단합니다.
+- ZIP 자체 다운로드 실패에 한해서만 기존 raw 파일 업데이트를 호환용 fallback으로 사용합니다.
+- 업데이트 후 로드 검증 실패 시 전체 백업에서 자동 복원합니다.
+
 
 `update_manifest` 선언으로 자기 자신도 자동 업데이트 가능:
 
