@@ -923,6 +923,126 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
         return False, msg
 
+    def _copy_managed_file(self, source_root, dest_root, rel_path):
+        """관리 대상 파일 1개를 대상 플러그인 폴더로 복사한다."""
+        rel_clean = os.path.normpath(str(rel_path or "")).lstrip("./").lstrip("/")
+        if not rel_clean or rel_clean.startswith(".."):
+            raise ValueError("유효하지 않은 관리 파일 경로입니다: %s" % rel_path)
+        src = os.path.join(source_root, rel_clean)
+        dst = os.path.join(dest_root, rel_clean)
+        if not os.path.isfile(src):
+            raise FileNotFoundError("ZIP에 관리 파일이 없습니다: %s" % rel_clean)
+        os.makedirs(os.path.dirname(dst) or dest_root, exist_ok=True)
+        shutil.copy2(src, dst)
+
+    def _restore_plugin_backup(self, backup_dir, dest_dir, plugin_id):
+        """ZIP 업데이트 실패 시 기존 플러그인 폴더를 원상 복구한다."""
+        try:
+            if os.path.exists(dest_dir):
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            shutil.copytree(backup_dir, dest_dir)
+            try:
+                from services.metadata_factory import MetadataFactory
+                MetadataFactory.hot_reload_plugin(plugin_id)
+            except Exception:
+                logger.warning("ZIP 업데이트 롤백 후 플러그인 리로드 실패 (id=%s)", plugin_id, exc_info=True)
+            return True
+        except Exception:
+            logger.exception("ZIP 업데이트 롤백 실패 (id=%s)", plugin_id)
+            return False
+
+    def _update_existing_from_zip(self, target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=False):
+        """동일 plugin_id ZIP을 기존 플러그인의 트랜잭션형 업데이트로 적용한다.
+
+        update_manifest.files를 관리 파일 목록으로 사용해 코드/UI만 교체하고,
+        목록 밖의 런타임 데이터 파일은 보존한다. 로드 검증 실패 시 전체 백업으로 롤백한다.
+        """
+        old_files, _old_manifest = self._extract_update_manifest_files(dest_dir)
+        new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
+        if not new_files:
+            return False, (
+                f"기존 플러그인 '{plugin_id}'을 ZIP으로 업데이트하려면 update_manifest.files가 필요합니다. "
+                "기존 런타임 데이터를 보호하기 위해 전체 폴더 덮어쓰기는 수행하지 않았습니다."
+            )
+
+        new_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in new_files}
+        old_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in (old_files or [])}
+        if any((not p or p.startswith("..") or p.startswith("/")) for p in new_managed):
+            return False, "update_manifest.files에 유효하지 않은 경로가 포함되어 있습니다."
+
+        base_dir = self._get_plugins_base_dir()
+        backup_dir = os.path.join(base_dir, f".pm_zip_backup_{plugin_id}")
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+        old_git_info = None
+        try:
+            old_git_info = self._read_git_source_info(plugin_id)
+        except Exception:
+            old_git_info = None
+
+        try:
+            shutil.copytree(dest_dir, backup_dir)
+            for rel in sorted(old_managed - new_managed, reverse=True):
+                target = os.path.join(dest_dir, rel)
+                if os.path.isfile(target) or os.path.islink(target):
+                    os.remove(target)
+                elif os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
+
+            for rel in sorted(new_managed):
+                self._copy_managed_file(target_plugin_dir, dest_dir, rel)
+
+            self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
+            from services.metadata_factory import MetadataFactory
+            MetadataFactory.hot_reload_plugin(plugin_id)
+
+            loaded_ok = False
+            try:
+                providers = MetadataFactory.get_available_providers()
+                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
+            except Exception as e:
+                logger.warning("ZIP 업데이트 후 플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
+
+            if not loaded_ok:
+                restored = self._restore_plugin_backup(backup_dir, dest_dir, plugin_id)
+                return False, (
+                    f"검증 실패: '{plugin_id}' ZIP 업데이트 후 플러그인이 로드되지 않았습니다. "
+                    + ("기존 버전으로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
+                )
+
+            if not old_git_info:
+                try:
+                    raw_base_url = str((new_manifest or {}).get("raw_base_url") or "").strip().rstrip("/")
+                    if raw_base_url:
+                        self._ensure_git_source_from_raw_base_url(plugin_id, raw_base_url, list(new_managed))
+                except Exception:
+                    pass
+
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
+            warns = [c["detail"] for c in source_checks if c.get("warn")]
+            result_msg = (
+                f"동일 ID ZIP을 감지하여 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
+                f"(관리 파일 {len(new_managed)}개 갱신, 기존 런타임 데이터 보존, 검증 통과: {', '.join(passed)})"
+            )
+            if force:
+                result_msg += " [경고] 검증 실패 항목을 무시하고 업데이트했습니다."
+            if warns:
+                result_msg += " 경고: " + "; ".join(warns)
+            return True, result_msg
+        except Exception as e:
+            restored = False
+            if os.path.isdir(backup_dir):
+                restored = self._restore_plugin_backup(backup_dir, dest_dir, plugin_id)
+            return False, (
+                f"ZIP 플러그인 업데이트 중 오류가 발생했습니다: {str(e)} "
+                + ("(기존 버전 자동 복원 완료)" if restored else "(기존 버전 자동 복원 실패)")
+            )
+        finally:
+            if os.path.exists(backup_dir):
+                shutil.rmtree(backup_dir, ignore_errors=True)
+
     def _install_from_zip(self, zip_data_b64, filename, db_type, force=False):
         """Zip 압축 파일 업로드를 통한 플러그인 설치
         force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
@@ -974,9 +1094,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if err or not dest_dir:
                 return False, err or "유효하지 않은 플러그인 경로입니다."
 
-            # 이전 디렉토리 존재 시 교체
+            # 동일 ID가 이미 설치돼 있으면 신규 설치가 아니라 안전한 ZIP 업데이트로 처리한다.
             if os.path.exists(dest_dir):
-                shutil.rmtree(dest_dir)
+                return self._update_existing_from_zip(
+                    target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=force
+                )
 
             # 디렉토리 복사 (.git 및 macOS 쓰레기 파일 제외)
             shutil.copytree(

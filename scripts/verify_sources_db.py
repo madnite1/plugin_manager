@@ -90,7 +90,7 @@ sys.modules["services"] = fake_services
 sys.modules["services.plugin_service"] = fake_plugin_service
 sys.modules["services.metadata_factory"] = fake_metadata_factory
 
-spec = {}
+spec = {"__file__": SRC}
 spec["_PM_SKIP_AUTO_START"] = True  # 모듈 끝 자동 스레드 시작 차단 (하네스 실행 환경)
 stub_root = make_stub_base()
 sys.path.insert(0, stub_root)
@@ -101,6 +101,11 @@ PluginManager = spec["PluginManagerMetadataProvider"]
 def make_provider(base_dir):
     inst = PluginManager.__new__(PluginManager)
     inst._get_plugins_base_dir = lambda: base_dir
+    inst._get_data_dir = lambda: os.path.join(base_dir, "plugin_manager")
+    fake_gateway = mock.MagicMock()
+    fake_gateway.set_setting.return_value = None
+    fake_gateway.get_setting.return_value = None
+    inst.get_db_gateway = lambda _db_type: fake_gateway
     return inst
 
 # ── 검증 통과 미니 플러그인 소스 ─────────────────────────────────
@@ -301,6 +306,60 @@ check("manifest 있음 → git_url 저장", zip_info and zip_info.get("git_url")
       f"got {zip_info}")
 
 # =================================================================
+section("F2. 동일 ID ZIP 업데이트 — 런타임 데이터 보존 + 관리 파일 정리")
+installed = os.path.join(BASE_DIR, "testplugin")
+# 기존 설치본에 런타임 데이터와 구버전 관리 파일을 만든다.
+with open(os.path.join(installed, "runtime.db"), "w", encoding="utf-8") as f:
+    f.write("사용자 데이터")
+with open(os.path.join(installed, "legacy.py"), "w", encoding="utf-8") as f:
+    f.write("LEGACY = True\n")
+with open(os.path.join(installed, "testplugin.py"), "r", encoding="utf-8") as f:
+    old_src = f.read()
+old_src = old_src.replace(
+    "'files': ['testplugin.py', '__init__.py', 'VERSION']",
+    "'files': ['testplugin.py', '__init__.py', 'VERSION', 'legacy.py']",
+)
+with open(os.path.join(installed, "testplugin.py"), "w", encoding="utf-8") as f:
+    f.write(old_src)
+
+# 신규 ZIP은 legacy.py를 제거하고 new_module.py를 관리 파일로 추가한다.
+upd_src = os.path.join(WORK, "zip_update_src")
+write_test_plugin(upd_src, with_manifest=True)
+with open(os.path.join(upd_src, "testplugin.py"), "r", encoding="utf-8") as f:
+    upd_code = f.read()
+upd_code = upd_code.replace(
+    "'files': ['testplugin.py', '__init__.py', 'VERSION']",
+    "'files': ['testplugin.py', '__init__.py', 'VERSION', 'new_module.py']",
+)
+with open(os.path.join(upd_src, "testplugin.py"), "w", encoding="utf-8") as f:
+    f.write(upd_code)
+with open(os.path.join(upd_src, "new_module.py"), "w", encoding="utf-8") as f:
+    f.write("NEW_MODULE = True\n")
+
+ok, msg = P._install_from_zip(make_zip_bytes(upd_src), "testplugin.zip", "general")
+check("동일 ID ZIP을 업데이트로 처리", ok and "안전하게 업데이트" in str(msg), msg)
+check("런타임 데이터 보존", os.path.isfile(os.path.join(installed, "runtime.db"))
+      and open(os.path.join(installed, "runtime.db"), encoding="utf-8").read() == "사용자 데이터")
+check("신규 관리 파일 추가", os.path.isfile(os.path.join(installed, "new_module.py")))
+check("제거된 관리 파일 삭제", not os.path.exists(os.path.join(installed, "legacy.py")))
+check("ZIP 업데이트 백업 정리", not os.path.exists(os.path.join(BASE_DIR, ".pm_zip_backup_testplugin")))
+
+# 로드 검증 실패를 강제로 만들어 전체 롤백을 확인한다.
+with open(os.path.join(installed, "VERSION"), "r", encoding="utf-8") as f:
+    before_version = f.read()
+with open(os.path.join(installed, "runtime.db"), "r", encoding="utf-8") as f:
+    before_runtime = f.read()
+fake_metadata_factory.get_available_providers.return_value = []
+try:
+    ok, msg = P._install_from_zip(make_zip_bytes(upd_src), "testplugin.zip", "general")
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("로드 실패 시 업데이트 실패", not ok and "자동 복원" in str(msg), msg)
+check("로드 실패 시 VERSION 복원", open(os.path.join(installed, "VERSION"), encoding="utf-8").read() == before_version)
+check("로드 실패 시 런타임 데이터 복원", open(os.path.join(installed, "runtime.db"), encoding="utf-8").read() == before_runtime)
+check("롤백 후 백업 정리", not os.path.exists(os.path.join(BASE_DIR, ".pm_zip_backup_testplugin")))
+
+# =================================================================
 section("G. git 설치 — .git_source 파일 미생성 + DB 저장")
 git_src = os.path.join(WORK, "git_src")
 write_test_plugin(git_src, with_manifest=True)
@@ -354,20 +413,20 @@ check("삭제 안 한 플러그인 레코드 유지", P._sources_get("oldplug") 
 section("I. catalog.db와 분리")
 P._catalog_init_db()
 cat_tables = db_tables(CATALOG_DB)
-check("catalog.db 테이블 = repos, meta", cat_tables == {"repos", "meta"}, f"got {cat_tables}")
+check("catalog.db 테이블 = repos, meta, settings", cat_tables == {"repos", "meta", "settings"}, f"got {cat_tables}")
 check("catalog.db에 plugin_sources 없음", "plugin_sources" not in cat_tables)
 
 # =================================================================
 section("J. DB 파일 git 무시")
 try:
     r = subprocess.run(
-        ["git", "check-ignore", "--no-index", "-q", "plugin_sources.db"],
+        ["git", "-c", f"safe.directory={PLUGIN_DIR}", "check-ignore", "--no-index", "-q", "plugin_sources.db"],
         cwd=PLUGIN_DIR, capture_output=True, text=True, timeout=15,
     )
     check(".gitignore *.db 매칭 (plugin_sources.db)", r.returncode == 0,
           f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}")
     r2 = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "plugin_sources.db"],
+        ["git", "-c", f"safe.directory={PLUGIN_DIR}", "ls-files", "--error-unmatch", "plugin_sources.db"],
         cwd=PLUGIN_DIR, capture_output=True, text=True, timeout=15,
     )
     check("plugin_sources.db 미추적", r2.returncode != 0, "tracked!")
