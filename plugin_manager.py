@@ -970,6 +970,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             logger.exception("ZIP 업데이트 롤백 실패 (id=%s)", plugin_id)
             return False
 
+    def _validate_self_update_package(self, target_plugin_dir, dest_dir):
+        """Plugin Manager 자기 업데이트 패키지의 버전과 로드 계약을 선검증한다."""
+        new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
+        new_spec = self._build_update_spec("plugin_manager", new_manifest)
+        if not new_files or not new_spec:
+            return False, "Plugin Manager 자기 업데이트에는 유효한 update_manifest.files가 필요합니다.", None
+
+        old_files, old_manifest = self._extract_update_manifest_files(dest_dir)
+        old_spec = self._build_update_spec("plugin_manager", old_manifest)
+        if not old_files or not old_spec:
+            return False, "현재 Plugin Manager의 update_manifest를 확인할 수 없어 자기 업데이트를 중단했습니다.", None
+
+        local_ver = self._read_local_plugin_version(
+            dest_dir, old_spec["version_file"], old_spec["version_key"]
+        )
+        remote_ver = self._read_local_plugin_version(
+            target_plugin_dir, new_spec["version_file"], new_spec["version_key"]
+        )
+        if not local_ver or not remote_ver:
+            return False, "Plugin Manager 현재/대상 VERSION을 확인할 수 없어 자기 업데이트를 중단했습니다.", None
+        if not self._can_update_to_version(local_ver, remote_ver):
+            return False, (
+                f"Plugin Manager 자기 업데이트는 상위 버전만 허용합니다: "
+                f"현재 {local_ver}, 대상 {remote_ver}."
+            ), None
+        return True, None, remote_ver
+
     def _update_existing_from_zip(self, target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=False):
         """동일 plugin_id ZIP을 기존 플러그인의 트랜잭션형 업데이트로 적용한다.
 
@@ -985,6 +1012,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"기존 플러그인 '{plugin_id}'을 ZIP으로 업데이트하려면 update_manifest.files가 필요합니다. "
                 "기존 런타임 데이터를 보호하기 위해 전체 폴더 덮어쓰기는 수행하지 않았습니다."
             )
+
+        self_target_version = None
+        if plugin_id == "plugin_manager":
+            self_ok, self_err, self_target_version = self._validate_self_update_package(
+                target_plugin_dir, dest_dir
+            )
+            if not self_ok:
+                return False, self_err
 
         new_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in new_files}
         old_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in (old_files or [])}
@@ -1002,6 +1037,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             old_git_info = None
 
+        enabled_key = f"PLUGIN_ENABLED_{plugin_id}"
+        try:
+            enabled_raw = self.get_db_gateway('general').get_setting(enabled_key, default="1")
+            if isinstance(enabled_raw, dict):
+                old_enabled = str(enabled_raw.get("value", "1"))
+            else:
+                old_enabled = str(enabled_raw or "1")
+        except Exception:
+            old_enabled = "1"
+
         try:
             shutil.copytree(dest_dir, backup_dir)
             for rel in sorted(old_managed - new_managed, reverse=True):
@@ -1014,7 +1059,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             for rel in sorted(new_managed):
                 self._copy_managed_file(target_plugin_dir, dest_dir, rel)
 
-            self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
+            self.get_db_gateway('general').set_setting(enabled_key, old_enabled)
             from services.metadata_factory import MetadataFactory
             MetadataFactory.hot_reload_plugin(plugin_id)
 
@@ -1022,6 +1067,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             try:
                 providers = MetadataFactory.get_available_providers()
                 loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
+                if loaded_ok and plugin_id == "plugin_manager":
+                    _, reloaded_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
+                    loaded_ok = str(getattr(reloaded_cls, "id", "")) == plugin_id
+                    applied_ver = self._read_local_plugin_version(
+                        dest_dir, "VERSION", "plugin version"
+                    )
+                    loaded_ok = loaded_ok and applied_ver == self_target_version
             except Exception as e:
                 logger.warning("ZIP 업데이트 후 플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
 
@@ -1103,8 +1155,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
                 return False, f"유효하지 않은 플러그인 ID입니다 (영문/숫자/언더바/하이픈만 허용): {plugin_id}"
 
-            if plugin_id in ("base.py", "base", "__pycache__", "plugin_manager"):
-                return False, "시스템 예약어 또는 핵심 플러그인은 덮어쓸 수 없습니다."
+            if plugin_id in ("base.py", "base", "__pycache__"):
+                return False, "시스템 예약어는 덮어쓸 수 없습니다."
 
             # 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔)
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
@@ -1359,8 +1411,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
                 return False, f"유효하지 않은 플러그인 ID입니다 (영문/숫자/언더바/하이픈만 허용): {plugin_id}"
 
-            if plugin_id in ("base.py", "base", "__pycache__", "plugin_manager"):
-                return False, "시스템 예약어 또는 핵심 플러그인은 덮어쓸 수 없습니다."
+            if plugin_id in ("base.py", "base", "__pycache__"):
+                return False, "시스템 예약어는 덮어쓸 수 없습니다."
 
             dest_dir, err = self._validate_plugin_path(plugin_id)
             if err or not dest_dir:
@@ -1378,6 +1430,31 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
             if not source_ok and not force:
                 return self._validation_fail_response(source_checks, db_type)
+
+            # 이미 설치된 동일 ID는 폴더 삭제/재설치 대신 트랜잭션형 업데이트를 사용한다.
+            # Plugin Manager 자기 자신도 이 경로를 사용하므로 실행 중 코드 교체 실패 시 롤백 가능하다.
+            if os.path.isdir(dest_dir):
+                ok, msg = self._update_existing_from_zip(
+                    target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=force
+                )
+                if not ok:
+                    return False, msg
+                git_source_info = {
+                    "git_url": git_url,
+                    "branch": branch,
+                    "installed_at": datetime.now().isoformat(),
+                    "manifest_files": manifest_files,
+                }
+                self._sources_set(plugin_id, git_source_info)
+                source_label = (
+                    f"릴리즈 태그 {release_tag}"
+                    if (release_zip_url and used_url == release_zip_url)
+                    else f"브랜치 {branch}"
+                )
+                return True, (
+                    f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
+                    f"{msg}"
+                )
 
             # 6. manifest 있을 때만 목록 외 전부 삭제 (.git 등 포함 안전 처리)
             #    manifest 없음(폴백) → 전체 복사, prune 스킵 (빈 목록이면 전부 삭제 위험)
@@ -1497,8 +1574,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, err or "유효하지 않은 플러그인 ID입니다."
         if not os.path.isdir(pdir):
             return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
-        if plugin_id in ("plugin_manager", "base.py", "base"):
-            return False, "시스템 핵심 플러그인은 소스를 교체할 수 없습니다."
+        if plugin_id in ("base.py", "base"):
+            return False, "시스템 핵심 파일은 소스를 교체할 수 없습니다."
 
         # 1. 후보 검증: 카탈로그에 같은 plugin_id + 유효한 소스가 있는지
         candidates = self._catalog_replace_candidates(plugin_id, db_type)
@@ -2314,6 +2391,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
         git_url = str((git_info or {}).get("git_url") or "").strip()
 
+        # Plugin Manager 자기 업데이트는 공식 ZIP 패키지만 허용한다. raw fallback은 사용하지 않는다.
+        if plugin_id == "plugin_manager" and (not git_url or not self._build_repo_zip_url(git_url)[0]):
+            return False, "Plugin Manager 자기 업데이트용 저장소 ZIP 소스를 결정할 수 없어 업데이트를 중단했습니다."
+
         # 저장소 ZIP 경로를 구성할 수 없는 레거시/특수 소스만 기존 raw 경로 사용.
         if not git_url or not self._build_repo_zip_url(git_url)[0]:
             ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
@@ -2323,6 +2404,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         zip_info, zip_err = self._download_repository_zip(git_url, db_type)
         if not zip_info:
+            if plugin_id == "plugin_manager":
+                return False, (
+                    f"Plugin Manager 저장소 ZIP 다운로드에 실패했습니다: {zip_err or '알 수 없는 오류'}. "
+                    "자기 업데이트는 raw fallback 없이 중단합니다."
+                )
             # 네트워크/404/호스트 archive 미지원처럼 ZIP 자체를 얻지 못한 경우만 raw fallback.
             ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
             if ok:
@@ -2419,8 +2505,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         for p in plugins:
             pid = p['id']
-            if pid == 'plugin_manager':
-                continue
             if p.get('has_update_manifest'):
                 ok, msg = self._update_plugin(pid, db_type)
                 if ok:

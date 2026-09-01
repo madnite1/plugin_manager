@@ -637,6 +637,141 @@ finally:
     fake_metadata_factory.get_available_providers.return_value = saved_providers
 
 
+
+# =================================================================
+section("N. Plugin Manager 자기 업데이트 — ZIP/Git/버전/rollback 정책")
+self_base = os.path.join(WORK, "self_update_base")
+os.makedirs(self_base, exist_ok=True)
+PS = make_provider(self_base)
+self_dir = os.path.join(self_base, "plugin_manager")
+os.makedirs(self_dir, exist_ok=True)
+
+
+def write_self_plugin(root, version):
+    os.makedirs(root, exist_ok=True)
+    code = """from plugins.metadata.base import BaseMetadataProvider
+class PluginManagerMetadataProvider(BaseMetadataProvider):
+    id = 'plugin_manager'
+    name = 'Plugin Manager'
+    config_schema = [{'key': 'x'}]
+    update_manifest = {
+        'enabled': True,
+        'provider': 'github-raw',
+        'raw_base_url': 'https://raw.githubusercontent.com/madnite1/plugin_manager/main',
+        'files': ['plugin_manager.py', '__init__.py', 'VERSION'],
+        'version_file': 'VERSION',
+        'version_key': 'plugin version',
+    }
+    def search(self, db_type, query): return []
+    def apply(self, db_type, book_id, item_data): return True, 'ok'
+"""
+    with open(os.path.join(root, "plugin_manager.py"), "w", encoding="utf-8") as f:
+        f.write(code)
+    with open(os.path.join(root, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    with open(os.path.join(root, "VERSION"), "w", encoding="utf-8") as f:
+        json.dump({"plugin version": version}, f)
+
+
+write_self_plugin(self_dir, "1.14.6")
+self_up = os.path.join(WORK, "self_update_147")
+write_self_plugin(self_up, "1.14.7")
+self_same = os.path.join(WORK, "self_update_same")
+write_self_plugin(self_same, "1.14.6")
+self_down = os.path.join(WORK, "self_update_down")
+write_self_plugin(self_down, "1.14.5")
+
+ok, msg, ver = PS._validate_self_update_package(self_up, self_dir)
+check("자기 업데이트 상위 버전 허용", ok and ver == "1.14.7", msg)
+ok, msg, _ = PS._validate_self_update_package(self_same, self_dir)
+check("자기 업데이트 동일 버전 차단", not ok and "상위 버전만" in str(msg), msg)
+ok, msg, _ = PS._validate_self_update_package(self_down, self_dir)
+check("자기 업데이트 다운그레이드 차단", not ok and "상위 버전만" in str(msg), msg)
+
+# 실제 트랜잭션 적용 + 로드/버전 확인
+class _SelfReloaded:
+    id = "plugin_manager"
+
+fake_metadata_factory.get_available_providers.return_value = [{"id": "plugin_manager"}]
+fake_metadata_factory._import_provider_module_and_class.return_value = (None, _SelfReloaded)
+try:
+    ok, msg = PS._update_existing_from_zip(
+        self_up, self_dir, "plugin_manager", [], "general", force=False
+    )
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("자기 업데이트 ZIP 트랜잭션 성공", ok, msg)
+check("자기 업데이트 VERSION 적용", json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.7")
+check("자기 업데이트 백업 정리", not os.path.exists(os.path.join(self_base, ".pm_zip_backup_plugin_manager")))
+
+# 로드 검증 실패 시 rollback
+self_up2 = os.path.join(WORK, "self_update_148")
+write_self_plugin(self_up2, "1.14.8")
+before_self_version = open(os.path.join(self_dir, "VERSION"), encoding="utf-8").read()
+fake_metadata_factory.get_available_providers.return_value = []
+try:
+    ok, msg = PS._update_existing_from_zip(
+        self_up2, self_dir, "plugin_manager", [], "general", force=False
+    )
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("자기 업데이트 로드 실패 시 rollback", not ok and "자동 복원" in str(msg), msg)
+check("자기 업데이트 rollback VERSION 복원", open(os.path.join(self_dir, "VERSION"), encoding="utf-8").read() == before_self_version)
+
+# 온라인 자기 업데이트는 ZIP 획득 실패 시 raw fallback 금지
+class _SelfCurrentCls:
+    id = "plugin_manager"
+    update_manifest = {
+        "enabled": True,
+        "provider": "github-raw",
+        "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
+        "files": ["plugin_manager.py", "__init__.py", "VERSION"],
+        "version_file": "VERSION",
+        "version_key": "plugin version",
+    }
+
+PS._sources_set("plugin_manager", {
+    "git_url": "https://github.com/madnite1/plugin_manager",
+    "branch": "main",
+    "installed_at": "2026-01-01T00:00:00",
+    "manifest_files": ["plugin_manager.py", "__init__.py", "VERSION"],
+})
+raw_called = {"v": False}
+def _self_raw_probe(_pid, _db):
+    raw_called["v"] = True
+    return True, "raw"
+
+fake_metadata_factory._import_provider_module_and_class.return_value = (None, _SelfCurrentCls)
+with mock.patch.object(PS, "_download_repository_zip", return_value=(None, "archive 실패")), \
+     mock.patch.object(PS, "_update_plugin_raw_legacy", side_effect=_self_raw_probe):
+    ok, msg = PS._update_plugin("plugin_manager", "general")
+check("자기 온라인 업데이트 ZIP 실패 시 중단", not ok and "raw fallback 없이" in str(msg), msg)
+check("자기 온라인 업데이트 raw fallback 금지", not raw_called["v"])
+
+# Git URL로 기존 Plugin Manager 업데이트 시 폴더 삭제 대신 트랜잭션 경로 사용
+write_self_plugin(self_dir, "1.14.7")
+self_git_up = os.path.join(WORK, "self_git_148")
+write_self_plugin(self_git_up, "1.14.8")
+self_git_zip = _repo_zip_bytes(self_git_up, "plugin_manager-main")
+fake_metadata_factory.get_available_providers.return_value = [{"id": "plugin_manager"}]
+fake_metadata_factory._import_provider_module_and_class.return_value = (None, _SelfReloaded)
+try:
+    with mock.patch.object(PS, "_download_repository_zip", return_value=({
+            "zip_bytes": self_git_zip,
+            "used_url": "https://codeload.github.com/madnite1/plugin_manager/zip/refs/heads/main",
+            "ref_type": "branch",
+            "ref_name": "main",
+            "branch": "main",
+        }, None)), \
+         mock.patch.object(PS, "_validate_plugin_source", return_value=(True, [])):
+        ok, msg = PS._install_from_git("https://github.com/madnite1/plugin_manager", "general")
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("기존 Plugin Manager Git URL 업데이트 성공", ok and "안전하게 업데이트" in str(msg), msg)
+check("Git URL 자기 업데이트 VERSION 적용", json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.8")
+self_src_info = PS._sources_get("plugin_manager")
+check("Git URL 자기 업데이트 소스 메타 갱신", self_src_info and self_src_info.get("git_url") == "https://github.com/madnite1/plugin_manager", self_src_info)
+
 print()
 if FAIL:
     print(f"결과: {FAIL}개 실패 / {PASS}개 통과")

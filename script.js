@@ -548,7 +548,7 @@
                             p.update_blocked = true;
                             p.blocked_reason = r.blocked_reason;
                             p.replace_candidates = r.replace_candidates || [];
-                            if (p.replace_candidates.length > 0 && !p.is_system) {
+                            if (p.replace_candidates.length > 0) {
                                 patchCardReplace(p);
                             } else {
                                 patchCardBlocked(p);
@@ -556,7 +556,7 @@
                             return;
                         }
                         const autoOn = !!(catalogMeta && catalogMeta.auto_update);
-                        if (r.has_update && autoOn && !p.is_system) {
+                        if (r.has_update && autoOn) {
                             // 자동 업데이트 ON → 버튼 대신 순차 큐에 넣어 실제 교체
                             // patchCardUpdated가 새 버전 표시에 쓸 latest_version을 먼저 기록
                             p.latest_version = r.latest_version;
@@ -909,7 +909,7 @@
                 : '';
 
             // 소스 교체 필요 상태 (업데이트 차단 + 후보 존재)
-            const replaceBtnHtml = (p.update_blocked && Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0 && !p.is_system)
+            const replaceBtnHtml = (p.update_blocked && Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0)
                 ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 저장소로 변경 (업데이트 불가 상태 탈출)">
                     <i class="fa-solid fa-arrows-rotate"></i> 저장소 변경
                    </button>`
