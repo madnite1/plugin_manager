@@ -219,3 +219,11 @@ update_manifest = {
 | `category_tab` | `{"title": "플러그인 매니저", "icon": "fa-solid fa-boxes-stacked", "order": 99}` |
 
 `BaseMetadataProvider` 상속. `search()` 및 `apply()` 오버라이드.
+
+### 업데이트 후 사용자 롤백
+
+- 성공한 플러그인 업데이트의 직전 코드 버전을 1개 보관합니다.
+- 플러그인 카드의 **롤백** 버튼으로 직전 버전으로 되돌릴 수 있습니다.
+- 롤백도 로드 및 VERSION 검증을 수행하며, 실패하면 현재 버전으로 자동 복구합니다.
+- `plugins/data/<plugin_id>` 영속 데이터와 `update_manifest.files` 밖의 런타임 파일은 롤백하지 않고 현재 값을 보존합니다.
+- 롤백 성공 후에는 방금 사용하던 버전을 새 롤백 슬롯으로 교체하므로 다시 되돌릴 수 있습니다.

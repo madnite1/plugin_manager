@@ -91,7 +91,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """
         플러그인 액션 처리 엔드포인트
         item_data = {
-            'action': 'install_zip' | 'install_git' | 'update' | 'update_all' | 'delete' | 'toggle',
+            'action': 'install_zip' | 'install_git' | 'update' | 'rollback' | 'update_all' | 'delete' | 'toggle',
             ...
         }
         """
@@ -126,6 +126,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not plugin_id:
                 return False, "업데이트할 플러그인 ID가 누락되었습니다."
             return self._update_plugin(plugin_id, db_type)
+
+        elif action == "rollback":
+            plugin_id = str(item_data.get("plugin_id", "")).strip()
+            if not plugin_id:
+                return False, "롤백할 플러그인 ID가 누락되었습니다."
+            return self._rollback_plugin(plugin_id, db_type)
 
         elif action == "replace_git":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
@@ -390,6 +396,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     _raw_url = str(update_manifest.get("raw_base_url") or "").strip().rstrip("/")
                     _rp = self._parse_raw_base_url(_raw_url)
                     _is_monorepo_subdir = bool(_rp and _rp[3])
+
+                rollback_info = self._read_rollback_info(plugin_id)
 
                 plugins.append({
                     "id": plugin_id,
@@ -954,6 +962,135 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         os.makedirs(os.path.dirname(dst) or dest_root, exist_ok=True)
         shutil.copy2(src, dst)
 
+    def _rollback_root_dir(self):
+        root = os.path.join(self._get_data_dir(), "rollback")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _rollback_slot_dir(self, plugin_id):
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", str(plugin_id or "")):
+            return None
+        return os.path.join(self._rollback_root_dir(), plugin_id)
+
+    def _read_rollback_info(self, plugin_id):
+        slot = self._rollback_slot_dir(plugin_id)
+        if not slot:
+            return None
+        meta_path = os.path.join(slot, "metadata.json")
+        code_dir = os.path.join(slot, "previous")
+        if not os.path.isdir(code_dir) or not os.path.isfile(meta_path):
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict) or str(meta.get("plugin_id") or "") != plugin_id:
+                return None
+            meta["code_dir"] = code_dir
+            return meta
+        except Exception:
+            return None
+
+    def _write_rollback_snapshot(self, plugin_id, source_dir, from_version, to_version, source_info=None):
+        slot = self._rollback_slot_dir(plugin_id)
+        if not slot or not os.path.isdir(source_dir):
+            return False
+        tmp = slot + ".tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            os.makedirs(tmp, exist_ok=True)
+            shutil.copytree(source_dir, os.path.join(tmp, "previous"))
+            meta = {
+                "plugin_id": plugin_id,
+                "from_version": from_version,
+                "to_version": to_version,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_info": source_info if isinstance(source_info, dict) else None,
+            }
+            with open(os.path.join(tmp, "metadata.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            shutil.rmtree(slot, ignore_errors=True)
+            os.replace(tmp, slot)
+            return True
+        except Exception:
+            logger.exception("롤백 스냅샷 저장 실패 (id=%s)", plugin_id)
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+
+    def _rollback_plugin(self, plugin_id, db_type):
+        dest_dir, err = self._validate_plugin_path(plugin_id)
+        if err or not dest_dir or not os.path.isdir(dest_dir):
+            return False, err or f"플러그인을 찾을 수 없습니다: {plugin_id}"
+        info = self._read_rollback_info(plugin_id)
+        if not info:
+            return False, "사용 가능한 이전 버전 백업이 없습니다."
+
+        previous_dir = info["code_dir"]
+        current_version = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version") or "알 수 없음"
+        previous_version = str(info.get("from_version") or "알 수 없음")
+        current_source = self._read_git_source_info(plugin_id)
+        swap_dir = os.path.join(self._get_plugins_base_dir(), f".pm_rollback_swap_{plugin_id}")
+        shutil.rmtree(swap_dir, ignore_errors=True)
+        recovered = False
+        try:
+            shutil.copytree(dest_dir, swap_dir)
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            shutil.copytree(previous_dir, dest_dir)
+
+            # 코드 관리 목록 밖의 런타임 파일은 롤백 전 현재 값을 유지한다.
+            current_files, _ = self._extract_update_manifest_files(swap_dir)
+            previous_files, _ = self._extract_update_manifest_files(previous_dir)
+            managed_union = {
+                os.path.normpath(str(x)).lstrip("./").lstrip("/")
+                for x in list(current_files or []) + list(previous_files or [])
+            }
+            for walk_root, _dirs, files in os.walk(swap_dir):
+                for fname in files:
+                    src = os.path.join(walk_root, fname)
+                    rel = os.path.normpath(os.path.relpath(src, swap_dir))
+                    if rel in managed_union:
+                        continue
+                    dst = os.path.join(dest_dir, rel)
+                    os.makedirs(os.path.dirname(dst) or dest_dir, exist_ok=True)
+                    shutil.copy2(src, dst)
+
+            previous_source = info.get("source_info")
+            if isinstance(previous_source, dict) and previous_source.get("git_url"):
+                self._sources_set(plugin_id, previous_source)
+            elif previous_source is None:
+                self._sources_delete(plugin_id)
+
+            from services.metadata_factory import MetadataFactory
+            MetadataFactory.hot_reload_plugin(plugin_id)
+            providers = MetadataFactory.get_available_providers()
+            loaded_ok = any(str(x.get("id")) == plugin_id for x in providers)
+            restored_ver = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version")
+            if not loaded_ok or (previous_version != "알 수 없음" and restored_ver != previous_version):
+                raise RuntimeError(f"롤백 후 검증 실패 (기대 {previous_version}, 실제 {restored_ver or '알 수 없음'})")
+
+            self._write_rollback_snapshot(plugin_id, swap_dir, current_version, previous_version, current_source)
+            return True, (
+                f"'{plugin_id}' 플러그인을 v{current_version}에서 v{previous_version}으로 롤백했습니다. "
+                f"plugins/data/{plugin_id} 영속 데이터는 변경하지 않았습니다."
+            )
+        except Exception as e:
+            try:
+                if os.path.exists(dest_dir):
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                if os.path.isdir(swap_dir):
+                    shutil.copytree(swap_dir, dest_dir)
+                if current_source and current_source.get("git_url"):
+                    self._sources_set(plugin_id, current_source)
+                elif current_source is None:
+                    self._sources_delete(plugin_id)
+                from services.metadata_factory import MetadataFactory
+                MetadataFactory.hot_reload_plugin(plugin_id)
+                recovered = True
+            except Exception:
+                logger.exception("롤백 실패 후 현재 버전 복구 실패 (id=%s)", plugin_id)
+            return False, f"롤백 실패: {e}. " + ("현재 버전으로 자동 복구했습니다." if recovered else "현재 버전 자동 복구에도 실패했습니다.")
+        finally:
+            shutil.rmtree(swap_dir, ignore_errors=True)
+
     def _restore_plugin_backup(self, backup_dir, dest_dir, plugin_id):
         """ZIP 업데이트 실패 시 기존 플러그인 폴더를 원상 복구한다."""
         try:
@@ -1037,6 +1174,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             old_git_info = None
 
+        old_version = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version") or "알 수 없음"
+        new_version = self._read_local_plugin_version(target_plugin_dir, "VERSION", "plugin version") or "알 수 없음"
+
         enabled_key = f"PLUGIN_ENABLED_{plugin_id}"
         try:
             enabled_raw = self.get_db_gateway('general').get_setting(enabled_key, default="1")
@@ -1092,6 +1232,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 except Exception:
                     pass
 
+            rollback_saved = self._write_rollback_snapshot(
+                plugin_id, backup_dir, old_version, new_version, old_git_info
+            )
             shutil.rmtree(backup_dir, ignore_errors=True)
             passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
             warns = [c["detail"] for c in source_checks if c.get("warn")]
@@ -1101,6 +1244,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
             if force:
                 result_msg += " [경고] 검증 실패 항목을 무시하고 업데이트했습니다."
+            if rollback_saved:
+                result_msg += f" 이전 버전(v{old_version}) 롤백 백업을 보관했습니다."
+            else:
+                result_msg += " 경고: 업데이트는 성공했지만 롤백 백업 저장에 실패했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
             return True, result_msg
@@ -1149,7 +1296,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             target_plugin_dir = self._find_plugin_root_dir(temp_dir)
             plugin_id = self._detect_plugin_id(target_plugin_dir, fallback_name=filename)
             if not plugin_id:
-                return False, "플러그인 ID를 식별할 수 없습니다. (BaseMetadataProvider 클래스 또는 VERSION 파일 필요)"
+                return False, "플러그인 ID를 식별할 수 없습니다. (Provider 클래스의 공식 id 필드 필요)"
 
             # 안전성 검증
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
@@ -1406,7 +1553,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 # force=True (사용자 confirm 통과) → 아래 폴백 경로로 진행 (전체 복사 설치)
             plugin_id = self._detect_plugin_id(target_plugin_dir)
             if not plugin_id:
-                return False, "플러그인 ID를 식별할 수 없습니다. (BaseMetadataProvider 클래스 또는 VERSION 파일 필요)"
+                return False, "플러그인 ID를 식별할 수 없습니다. (Provider 클래스의 공식 id 필드 필요)"
 
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
                 return False, f"유효하지 않은 플러그인 ID입니다 (영문/숫자/언더바/하이픈만 허용): {plugin_id}"
@@ -1841,20 +1988,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return None
 
     def _detect_plugin_id(self, plugin_dir, fallback_name=None):
-        """디렉토리 내 파일에서 plugin_id 자동 감지"""
-        # 1. VERSION 파일 내 정보 확인
-        vpath = os.path.join(plugin_dir, "VERSION")
-        if os.path.isfile(vpath):
-            try:
-                with open(vpath, "r", encoding="utf-8") as f:
-                    vdata = json.load(f)
-                    p_id = vdata.get("id") or vdata.get("plugin_id")
-                    if p_id and re.match(r'^[a-zA-Z0-9_-]+$', str(p_id).strip()):
-                        return str(p_id).strip()
-            except Exception:
-                pass
-
-        # 2. Python 코드에서 id = "..." 검색 (AST 기반 — docstring/주석/문자열 내
+        """Provider Python 소스의 공식 `id` 계약에서 plugin_id를 자동 감지한다."""
+        # Python 코드에서 id = "..." 검색 (AST 기반 — docstring/주석/문자열 내
         #    `id="..."` 패턴(예: HTML script 태그, JSON 예시)을 실제 클래스 속성으로
         #    오인하지 않도록 실제 클래스 본문의 id 속성만 추출)
         try:
@@ -1945,12 +2080,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             try:
                 with open(vpath, "r", encoding="utf-8") as f:
                     vdata = json.load(f)
-                vkey = vdata.get("plugin version") or vdata.get("version")
-                if vkey:
-                    vfile_ok = True
-                    vdetail = "버전 %s" % vkey
+                if not isinstance(vdata, dict):
+                    vdetail = "VERSION 최상위 형식은 JSON 객체여야 합니다"
+                elif "plugin version" not in vdata:
+                    vdetail = "공식 'plugin version' 키가 없습니다"
                 else:
-                    vdetail = "'plugin version' 키가 없습니다 (업데이트 체크 불가)"
+                    vkey = str(vdata.get("plugin version") or "").strip()
+                    if not vkey:
+                        vdetail = "'plugin version' 값이 비어 있습니다"
+                    elif not self._VERSION_RE.match(vkey):
+                        vdetail = "'plugin version' 값이 x.y.z 형식이 아닙니다: %s" % vkey
+                    else:
+                        vfile_ok = True
+                        vdetail = "버전 %s" % vkey
             except Exception:
                 vdetail = "VERSION 형식이 표준 JSON이 아닙니다 (업데이트 체크 불가)"
         else:
@@ -3207,9 +3349,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _catalog_check_repo_version(self, full_name, default_branch, source="github", base_url=None, db_type=None):
         """
-        raw VERSION 조회 → (is_valid, plugin_id, latest_version, plugin_name).
+        VERSION에서는 공식 계약인 `plugin version`만 버전 정보로 사용한다.
+        plugin_id/name은 VERSION에서 읽지 않고 Provider Python 소스의 공식 클래스 필드에서 확인한다.
         GitHub: raw.githubusercontent.com, Gitea: {base}/raw/branch/{branch}/VERSION (토큰 필요 시 사용).
-        name은 VERSION JSON 키 → 없으면 코드 raw fetch 후 AST(name 클래스 속성) 추출.
         404/비JSON/네트워크 오류 → invalid (다음 주기 재판정).
         """
         branch = str(default_branch or "main").strip() or "main"
@@ -3222,13 +3364,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if source == "gitea" and base_url:
                 token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
             text = self._fetch_text(url, timeout=15, token=token)
-            version, plugin_id, name = self._catalog_parse_remote_version_meta(text)
+            version = self._parse_remote_version(text, "plugin version")
             if not version:
                 return "invalid", None, None, None
-            if not plugin_id:
-                plugin_id = str(full_name).split("/")[-1]
-            if not name:
-                name = self._catalog_fetch_plugin_name(full_name, branch, plugin_id, source, base_url, db_type)
+            fallback_id = str(full_name).split("/")[-1]
+            provider_id, name = self._catalog_fetch_plugin_meta(
+                full_name, branch, fallback_id, source, base_url, db_type
+            )
+            plugin_id = provider_id or fallback_id
             return "valid", plugin_id, version, name
         except Exception:
             return "invalid", None, None, None
@@ -3240,66 +3383,92 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return ""
 
-    def _catalog_parse_remote_version_meta(self, text):
-        """VERSION 텍스트 → (version, plugin_id, name). JSON dict의 id/plugin_id/name 키 최우선."""
-        version, plugin_id, name = None, None, None
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                for key in ("plugin version", "plugin_version", "version"):
-                    if data.get(key):
-                        version = str(data[key]).strip()
-                        break
-                pid = data.get("id") or data.get("plugin_id")
-                if pid:
-                    plugin_id = str(pid).strip()
-                pname = data.get("name") or data.get("plugin_name")
-                if pname:
-                    name = str(pname).strip()
-        except Exception:
-            pass
-        if not version:
-            version = self._parse_remote_version(text)
-        return version, plugin_id, name
+    def _catalog_fetch_plugin_meta(self, full_name, branch, candidate_id, source="github", base_url=None, db_type=None):
+        """Provider Python 소스에서 공식 클래스 필드 `id`와 `name`을 AST로 추출한다.
 
-    def _catalog_fetch_plugin_name(self, full_name, branch, plugin_id, source="github", base_url=None, db_type=None):
-        """코드 raw 파일에서 BaseMetadataProvider name 클래스 속성 추출 (없으면 None).
-        GitHub: raw.githubusercontent.com, Gitea: {base}/raw/branch/{branch}"""
-        try:
-            if source == "gitea" and base_url:
-                src_url = "{0}/{1}/raw/branch/{2}/{3}.py".format(
-                    base_url, full_name, branch, plugin_id
-                )
-                token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
-            else:
-                src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}.py".format(
-                    full_name, branch, plugin_id
-                )
-                token = None
-            source_text = self._fetch_text(src_url, timeout=15, token=token)
-        except Exception:
-            return None
-        if not source_text:
-            return None
-        try:
-            tree = ast.parse(source_text)
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.ClassDef):
-                    continue
-                for stmt in node.body:
-                    if not isinstance(stmt, ast.Assign):
+        VERSION의 비공식 id/name 메타데이터는 사용하지 않는다. 저장소 이름과 `provider.py`는
+        원격 소스 파일을 찾기 위한 후보로만 사용하며, 실제 식별값은 Provider 클래스에서 읽는다.
+        반환: (plugin_id, plugin_name). 찾지 못하면 각각 None.
+        """
+        filenames = []
+        candidate = str(candidate_id or "").strip()
+        if candidate:
+            filenames.append(candidate + ".py")
+        if "provider.py" not in filenames:
+            filenames.append("provider.py")
+
+        token = None
+        if source == "gitea" and base_url:
+            token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
+
+        for filename in filenames:
+            try:
+                if source == "gitea" and base_url:
+                    src_url = "{0}/{1}/raw/branch/{2}/{3}".format(
+                        base_url, full_name, branch, filename
+                    )
+                else:
+                    src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}".format(
+                        full_name, branch, filename
+                    )
+                source_text = self._fetch_text(src_url, timeout=15, token=token)
+            except Exception:
+                continue
+            if not source_text:
+                continue
+
+            try:
+                tree = ast.parse(source_text)
+                module_constants = self._extract_module_string_constants(tree)
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.ClassDef):
                         continue
-                    if not any(isinstance(t, ast.Name) and t.id == "name" for t in stmt.targets):
+
+                    bases = []
+                    for base in node.bases:
+                        try:
+                            bases.append(ast.unparse(base))
+                        except Exception:
+                            bases.append("")
+
+                    provider_id = None
+                    provider_name = None
+                    for stmt in node.body:
+                        value_node = None
+                        targets = []
+                        if isinstance(stmt, ast.Assign):
+                            value_node = stmt.value
+                            targets = stmt.targets
+                        elif isinstance(stmt, ast.AnnAssign):
+                            value_node = stmt.value
+                            targets = [stmt.target]
+                        if value_node is None:
+                            continue
+                        for target in targets:
+                            if not isinstance(target, ast.Name):
+                                continue
+                            if target.id == "id":
+                                value = self._resolve_static_string(value_node, module_constants)
+                                if isinstance(value, str) and value.strip():
+                                    provider_id = value.strip()
+                            elif target.id == "name":
+                                value = self._resolve_static_string(value_node, module_constants)
+                                if isinstance(value, str) and value.strip():
+                                    provider_name = value.strip()
+
+                    is_provider = any("BaseMetadataProvider" in base for base in bases)
+                    if not is_provider and provider_id is not None:
+                        is_provider = True
+                    if not is_provider:
                         continue
-                    try:
-                        val = ast.literal_eval(stmt.value)
-                    except Exception:
-                        continue
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
-        except Exception:
-            pass
-        return None
+                    if provider_id and not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
+                        provider_id = None
+                    if provider_id or provider_name:
+                        return provider_id, provider_name
+            except Exception:
+                continue
+
+        return None, None
 
     # ---- 갱신 로직 ----
 

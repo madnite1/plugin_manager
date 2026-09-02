@@ -326,18 +326,14 @@ with mock.patch.object(P, "_catalog_search_topic", side_effect=fake_search), \
 check("다음 주기 재시도 성공 (error → idle)", ok and P._catalog_read_meta().get("refresh_state") == "idle")
 
 # =================================================================
-section("E-2. 플러그인 이름 수집 (VERSION 키 → 코드 AST 폴백 → 구버전 DB ALTER)")
+section("E-2. 플러그인 메타 수집 (VERSION 버전 전용 + Provider AST)")
 # -----------------------------------------------------------------
-# 1) VERSION JSON의 name 키 파싱
-v, pid, nm = P._catalog_parse_remote_version_meta(
-    '{"plugin version": "2.0.0", "id": "testplug", "name": "테스트 플러그인"}')
-check("VERSION name 키 파싱", v == "2.0.0" and pid == "testplug" and nm == "테스트 플러그인",
-      f"got {(v, pid, nm)}")
-v, pid, nm = P._catalog_parse_remote_version_meta('{"plugin version": "2.0.0"}')
-check("VERSION name 없으면 None", v == "2.0.0" and pid is None and nm is None)
+# 1) VERSION은 공식 `plugin version` 값만 버전 정보로 사용
+v = P._parse_remote_version('{"plugin version": "2.0.0"}', "plugin version")
+check("VERSION plugin version 파싱", v == "2.0.0", f"got {v}")
 
-# 2) 코드 소스 AST에서 name 클래스 속성 추출
-def fake_fetch_src(url, timeout=15):
+# 2) Provider Python 소스 AST에서 공식 id/name 클래스 속성 추출
+def fake_fetch_src(url, timeout=15, token=None):
     return (
         "from plugins.metadata.base import BaseMetadataProvider\n"
         "class SamplePlugin(BaseMetadataProvider):\n"
@@ -347,23 +343,23 @@ def fake_fetch_src(url, timeout=15):
         "        return []\n"
     )
 with mock.patch.object(P, "_fetch_text", side_effect=fake_fetch_src):
-    nm2 = P._catalog_fetch_plugin_name("owner/sample", "main", "sample")
-check("코드 AST name 추출", nm2 == "샘플 위젯", f"got {nm2}")
+    pid2, nm2 = P._catalog_fetch_plugin_meta("owner/sample", "main", "sample")
+check("Provider AST id/name 추출", pid2 == "sample" and nm2 == "샘플 위젯", f"got {(pid2, nm2)}")
 
-# 3) name 없는 코드 → None (폴백 동작)
-def fake_fetch_none(url, timeout=15):
+# 3) name 없는 Provider → id만 사용
+def fake_fetch_none(url, timeout=15, token=None):
     return "class X:\n    id = 'x'\n    pass\n"
 with mock.patch.object(P, "_fetch_text", side_effect=fake_fetch_none):
-    nm3 = P._catalog_fetch_plugin_name("owner/x", "main", "x")
-check("name 없는 코드 → None", nm3 is None, f"got {nm3}")
+    pid3, nm3 = P._catalog_fetch_plugin_meta("owner/x", "main", "x")
+check("Provider name 없음 → id만 추출", pid3 == "x" and nm3 is None, f"got {(pid3, nm3)}")
 
-# 4) check_repo_version 통합 — VERSION name 키 없으면 코드 폴백
+# 4) check_repo_version 통합 — VERSION에서는 버전, Provider 소스에서는 id/name 수집
 with mock.patch.object(P, "_fetch_text", side_effect=[
-    '{"plugin version": "1.2.0", "id": "plugb"}',                 # VERSION (name 없음)
-    "class B(BaseMetadataProvider):\n    id='plugb'\n    name='플러그 비'\n",  # 코드
+    '{"plugin version": "1.2.0"}',
+    "class B(BaseMetadataProvider):\n    id='plugb'\n    name='플러그 비'\n",
 ]):
     rv = P._catalog_check_repo_version("owner/plugb", "main")
-check("check_repo_version: 코드 폴백 name", rv == ("valid", "plugb", "1.2.0", "플러그 비"),
+check("check_repo_version: VERSION/Provider 계약 분리", rv == ("valid", "plugb", "1.2.0", "플러그 비"),
       f"got {rv}")
 
 # 5) 구버전 스키마(plugin_name 없음) → ALTER 자동 추가

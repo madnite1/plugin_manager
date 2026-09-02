@@ -91,7 +91,7 @@
         if (a === 'toggle') return actionData.enabled === '1' ? 'active' : 'inactive';
         if (a === 'install_git' || a === 'install_zip') return 'install';
         if (a === 'delete') return 'delete';
-        if (a === 'update') return 'update';
+        if (a === 'update' || a === 'rollback') return 'update';
         return null; // 조회성 액션(check_update/list_all 등)은 이벤트 없음
     }
 
@@ -918,6 +918,7 @@
             const blockedBadge = p.update_blocked
                 ? '<span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>'
                 : '';
+
 
             const deleteBtnHtml = p.is_system
                 ? ''

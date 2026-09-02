@@ -643,6 +643,8 @@ section("N. Plugin Manager 자기 업데이트 — ZIP/Git/버전/rollback 정�
 self_base = os.path.join(WORK, "self_update_base")
 os.makedirs(self_base, exist_ok=True)
 PS = make_provider(self_base)
+# 실제 운영처럼 코드(metadata/plugin_manager)와 영속 데이터(data/plugin_manager)를 분리한다.
+PS._get_data_dir = lambda: os.path.join(self_base, "_data", "plugin_manager")
 self_dir = os.path.join(self_base, "plugin_manager")
 os.makedirs(self_dir, exist_ok=True)
 
@@ -771,6 +773,86 @@ check("기존 Plugin Manager Git URL 업데이트 성공", ok and "안전하게 
 check("Git URL 자기 업데이트 VERSION 적용", json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.8")
 self_src_info = PS._sources_get("plugin_manager")
 check("Git URL 자기 업데이트 소스 메타 갱신", self_src_info and self_src_info.get("git_url") == "https://github.com/madnite1/plugin_manager", self_src_info)
+
+# 성공 업데이트 직전 버전 롤백 슬롯 + 양방향 복원 검증
+rollback_info = PS._read_rollback_info("plugin_manager")
+check("성공 업데이트 후 롤백 슬롯 생성", rollback_info is not None)
+check("롤백 슬롯 직전 버전 기록", rollback_info and rollback_info.get("from_version") == "1.14.7", rollback_info)
+with open(os.path.join(self_dir, "runtime.keep"), "w", encoding="utf-8") as f:
+    f.write("현재 런타임 데이터")
+fake_metadata_factory.get_available_providers.return_value = [{"id": "plugin_manager"}]
+try:
+    ok, msg = PS._rollback_plugin("plugin_manager", "general")
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("사용자 롤백 성공", ok and "1.14.7" in str(msg), msg)
+check("사용자 롤백 VERSION 복원", json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.7")
+check("롤백 시 관리 밖 런타임 파일 보존", open(os.path.join(self_dir, "runtime.keep"), encoding="utf-8").read() == "현재 런타임 데이터")
+rollback_info2 = PS._read_rollback_info("plugin_manager")
+check("롤백 성공 후 현재 버전을 재복구 슬롯으로 교체", rollback_info2 and rollback_info2.get("from_version") == "1.14.8", rollback_info2)
+fake_metadata_factory.get_available_providers.return_value = [{"id": "plugin_manager"}]
+try:
+    ok2, msg2 = PS._rollback_plugin("plugin_manager", "general")
+finally:
+    fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
+check("롤백 후 다시 최신 버전 복구", ok2 and json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.8", msg2)
+
+
+# =================================================================
+section("O. VERSION 공식 규약 — plugin version + x.y.z")
+version_base = os.path.join(WORK, "version_contract")
+os.makedirs(version_base, exist_ok=True)
+PV = make_provider(version_base)
+
+
+def write_version_contract_plugin(root, version_payload):
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "sample.py"), "w", encoding="utf-8") as f:
+        f.write("""from plugins.metadata.base import BaseMetadataProvider
+class SampleProvider(BaseMetadataProvider):
+    id = 'sample'
+    name = '샘플'
+    is_searchable = False
+    config_schema = []
+    update_manifest = {
+        'enabled': True,
+        'provider': 'github-raw',
+        'raw_base_url': 'https://raw.githubusercontent.com/example/sample/main',
+        'files': ['sample.py', '__init__.py', 'VERSION'],
+        'version_file': 'VERSION',
+        'version_key': 'plugin version',
+    }
+    def search(self, db_type, query): return []
+    def apply(self, db_type, book_id, item_data): return True, 'ok'
+""")
+    with open(os.path.join(root, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    with open(os.path.join(root, "VERSION"), "w", encoding="utf-8") as f:
+        if isinstance(version_payload, str):
+            f.write(version_payload)
+        else:
+            json.dump(version_payload, f, ensure_ascii=False)
+
+
+def version_check(payload):
+    root = os.path.join(version_base, "case")
+    if os.path.isdir(root):
+        shutil.rmtree(root)
+    write_version_contract_plugin(root, payload)
+    ok, checks = PV._validate_plugin_source(root, "sample")
+    vc = next((c for c in checks if c.get("name") == "VERSION"), {})
+    return ok, vc
+
+ok, vc = version_check({"plugin version": "1.2.3"})
+check("VERSION 공식 plugin version 허용", ok and vc.get("ok") is True, vc)
+ok, vc = version_check({"version": "1.2.3"})
+check("VERSION 비공식 version 키 거부", not ok and vc.get("ok") is False and "plugin version" in str(vc.get("detail")), vc)
+ok, vc = version_check({"plugin version": "abc"})
+check("VERSION 비표준 버전 문자열 거부", not ok and vc.get("ok") is False and "x.y.z" in str(vc.get("detail")), vc)
+ok, vc = version_check(["1.2.3"])
+check("VERSION JSON 객체 아닌 형식 거부", not ok and vc.get("ok") is False and "JSON 객체" in str(vc.get("detail")), vc)
+ok, vc = version_check({"plugin version": "v1.2.3-beta.1"})
+check("VERSION v 접두사/프리릴리즈 허용", ok and vc.get("ok") is True, vc)
 
 print()
 if FAIL:
