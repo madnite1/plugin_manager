@@ -778,6 +778,13 @@ check("Git URL 자기 업데이트 소스 메타 갱신", self_src_info and self
 rollback_info = PS._read_rollback_info("plugin_manager")
 check("성공 업데이트 후 롤백 슬롯 생성", rollback_info is not None)
 check("롤백 슬롯 직전 버전 기록", rollback_info and rollback_info.get("from_version") == "1.14.7", rollback_info)
+# 기본 OFF에서는 롤백 액션을 차단하고, 설정 ON 후에만 허용한다.
+check("롤백 기능 기본 OFF", not PS._catalog_get_rollback_enabled("general"))
+off_ok, off_msg = PS._rollback_plugin("plugin_manager", "general")
+check("롤백 기능 OFF 액션 차단", not off_ok and "비활성화" in str(off_msg), off_msg)
+saved_rollback_enabled = PS._catalog_get_rollback_enabled
+PS._catalog_get_rollback_enabled = lambda _db: True
+check("롤백 기능 설정 ON", PS._catalog_get_rollback_enabled("general"))
 with open(os.path.join(self_dir, "runtime.keep"), "w", encoding="utf-8") as f:
     f.write("현재 런타임 데이터")
 fake_metadata_factory.get_available_providers.return_value = [{"id": "plugin_manager"}]
@@ -796,6 +803,7 @@ try:
 finally:
     fake_metadata_factory.get_available_providers.return_value = [{"id": "testplugin"}]
 check("롤백 후 다시 최신 버전 복구", ok2 and json.load(open(os.path.join(self_dir, "VERSION"), encoding="utf-8"))["plugin version"] == "1.14.8", msg2)
+PS._catalog_get_rollback_enabled = saved_rollback_enabled
 
 
 # =================================================================

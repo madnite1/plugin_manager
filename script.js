@@ -920,6 +920,13 @@
                 : '';
 
 
+
+            const rollbackBtnHtml = p.has_rollback
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-rollback" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" data-version="${escapeHtmlAttr(p.rollback_version || '')}" title="이전 버전으로 롤백${p.rollback_version ? ` (v${escapeHtmlAttr(p.rollback_version)})` : ''}">
+                    <i class="fa-solid fa-rotate-left"></i> 롤백
+                   </button>`
+                : '';
+
             const deleteBtnHtml = p.is_system
                 ? ''
                 : `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-delete" data-id="${p.id}" data-name="${p.name}" title="삭제">
@@ -970,6 +977,7 @@
                         </div>
                         <div class="pm-card-action-btns">
                             ${updateBtnHtml}
+                            ${rollbackBtnHtml}
                             ${deleteBtnHtml}
                         </div>
                     </div>
@@ -1015,6 +1023,34 @@
 
         // Update Button
         document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
+
+
+        // Rollback Button
+        document.querySelectorAll('.pm-btn-rollback').forEach(btn => {
+            btn.addEventListener('click', async function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const pluginId = this.getAttribute('data-id');
+                const pluginName = this.getAttribute('data-name') || pluginId;
+                const version = this.getAttribute('data-version');
+                if (!pluginId) return;
+                if (!confirm(`${pluginName}${version ? `을(를) v${version}` : '을(를) 이전 버전'}으로 롤백하시겠습니까?\n영속 데이터는 되돌리지 않습니다.`)) return;
+                this.disabled = true;
+                try {
+                    const res = await callPluginAction({ action: 'rollback', plugin_id: pluginId });
+                    if (res.success) {
+                        showAlert(res.message || '롤백했습니다.');
+                        loadPlugins();
+                    } else {
+                        showAlert(res.error || '롤백 실패', true);
+                    }
+                } catch (err) {
+                    showAlert('롤백 중 통신 오류: ' + err.message, true);
+                } finally {
+                    this.disabled = false;
+                }
+            });
+        });
 
         // Catalog Install Button (미설치 카드)
         document.querySelectorAll('.pm-btn-install').forEach(bindInstallButton);
@@ -1234,6 +1270,7 @@
         const topicsInput = document.getElementById('pm-catalog-topics');
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
         const autoUpdateInput = document.getElementById('pm-auto-update');
+        const rollbackEnabledInput = document.getElementById('pm-rollback-enabled');
         const tokenInput = document.getElementById('pm-github-token');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
@@ -1264,6 +1301,7 @@
                 topics: topicsInput ? topicsInput.value.trim() : '',
                 allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                 auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+                rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
                 github_token: tokenInput ? tokenInput.value.trim() : '',
                 gitea_servers: giteaServers
             };
@@ -1311,6 +1349,7 @@
                             topics: topicsInput ? topicsInput.value.trim() : '',
                             allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                             auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+                            rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
                             github_token: tokenInput ? tokenInput.value.trim() : '',
                             gitea_servers: giteaServers
                         })

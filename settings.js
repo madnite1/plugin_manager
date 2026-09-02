@@ -20,6 +20,7 @@
     const topicsInput = root.querySelector('#pm-catalog-topics');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
     const autoUpdateInput = root.querySelector('#pm-auto-update');
+    const rollbackEnabledInput = root.querySelector('#pm-rollback-enabled');
     const tokenInput = root.querySelector('#pm-github-token');
     const tokenClearBtn = root.querySelector('#pm-token-clear');
     const giteaUrlInput = root.querySelector('#pm-gitea-url');
@@ -120,6 +121,9 @@
             if (autoUpdateInput && !autoUpdateInput.dataset.touched) {
                 autoUpdateInput.checked = !!meta.auto_update;
             }
+            if (rollbackEnabledInput && !rollbackEnabledInput.dataset.touched) {
+                rollbackEnabledInput.checked = !!meta.rollback_enabled;
+            }
             if (tokenInput) {
                 // 실제 토큰은 절대 내려주지 않음 — 저장 여부만 표시
                 tokenInput.placeholder = meta.github_token_set ? '토큰 저장됨 (변경 시 새 값 입력)' : 'ghp_... (저장 안 됨)';
@@ -192,6 +196,7 @@
             topics: topicsVal,
             allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
             auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
+            rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
             github_token: tokenInput ? tokenInput.value.trim() : '',
             gitea_servers: giteaServers
         };

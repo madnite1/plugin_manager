@@ -397,7 +397,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     _rp = self._parse_raw_base_url(_raw_url)
                     _is_monorepo_subdir = bool(_rp and _rp[3])
 
-                rollback_info = self._read_rollback_info(plugin_id)
+                rollback_enabled = self._catalog_get_rollback_enabled(db_type)
+                rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
 
                 plugins.append({
                     "id": plugin_id,
@@ -413,6 +414,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
+                    "has_rollback": bool(rollback_info) if rollback_enabled else False,
+                    "rollback_version": (rollback_info or {}).get("from_version") if rollback_enabled else None,
                     "is_installed": True,
                 })
 
@@ -1017,6 +1020,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False
 
     def _rollback_plugin(self, plugin_id, db_type):
+        if not self._catalog_get_rollback_enabled(db_type):
+            return False, "롤백 기능이 비활성화되어 있습니다. 플러그인 매니저 설정에서 먼저 활성화하세요."
+
         dest_dir, err = self._validate_plugin_path(plugin_id)
         if err or not dest_dir or not os.path.isdir(dest_dir):
             return False, err or f"플러그인을 찾을 수 없습니다: {plugin_id}"
@@ -3855,6 +3861,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
             "auto_update": self._catalog_get_auto_update(db_type),
+            "rollback_enabled": self._catalog_get_rollback_enabled(db_type),
             "github_token_set": bool(self._catalog_get_github_token(db_type)),
             "gitea_servers": gitea_servers,
         }
@@ -3867,6 +3874,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _catalog_get_auto_update(self, db_type):
         """플러그인 자동 업데이트 설정 (기본 OFF — 실서버 자동 교체 기본 차단)"""
         raw = self._catalog_get_setting("PM_AUTO_UPDATE", default=None)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    def _catalog_get_rollback_enabled(self, db_type):
+        """사용자 롤백 기능 설정 (기본 OFF — 백업은 유지하되 UI/액션은 숨김)."""
+        raw = self._catalog_get_setting("PM_ROLLBACK_ENABLED", default=None)
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _catalog_run_auto_update(self, db_type):
@@ -4065,6 +4077,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             else:
                 auto_val = str(auto_raw).strip().lower() in ("1", "true", "yes", "on")
             self._catalog_set_setting("PM_AUTO_UPDATE", "1" if auto_val else "0")
+
+            rollback_raw = item_data.get("rollback_enabled")
+            if rollback_raw is None or str(rollback_raw).strip() == "":
+                rollback_val = self._catalog_get_rollback_enabled(db_type)
+            else:
+                rollback_val = str(rollback_raw).strip().lower() in ("1", "true", "yes", "on")
+            self._catalog_set_setting("PM_ROLLBACK_ENABLED", "1" if rollback_val else "0")
 
             # Gitea 서버 목록 — 프론트가 보낸 마스킹 토큰(****)은 기존 값 유지
             gitea_raw = item_data.get("gitea_servers")

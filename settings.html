@@ -118,4 +118,20 @@
             </div>
         </div>
 
+        <!-- 5. 롤백 기능 -->
+        <div style="display: flex; align-items: flex-start; gap: 0.6rem; margin-top: 1.2rem;">
+            <input type="checkbox" id="pm-rollback-enabled" class="pm-catalog-input"
+                   style="width: 18px; height: 18px; margin-top: 0.15rem; accent-color: var(--app-accent, #8b5cf6); cursor: pointer;" />
+            <div>
+                <label for="pm-rollback-enabled" style="font-weight: 700; color: var(--app-text-primary, #fff); font-size: 0.88rem; cursor: pointer;">
+                    <i class="fa-solid fa-clock-rotate-left" style="color: var(--app-accent, #8b5cf6); margin-right: 0.3rem;"></i> 업데이트 롤백 기능
+                </label>
+                <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.3rem 0 0 0;">
+                    켜면 플러그인 카드에 직전 성공 업데이트 이전 버전으로 되돌리는 롤백 버튼을 표시합니다.
+                    <strong style="color: var(--app-accent-hover, #f59e0b);">기본 OFF</strong> — 꺼져 있어도 업데이트 전 코드 백업은 유지되며,
+                    영속 데이터는 롤백하지 않습니다.
+                </p>
+            </div>
+        </div>
+
 </div>
