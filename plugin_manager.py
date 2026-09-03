@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 _RELEASE_TAG_CACHE = {}
 _RELEASE_TAG_CACHE_TTL = 300  # 초
 
+# Provider 클래스 discovery 결과 캐시.
+# 목록 로드 직후 개별 업데이트 체크가 수십 번 연속 호출되므로 매 요청마다
+# MetadataFactory._discover_provider_classes()로 전체 플러그인을 다시 스캔하지 않는다.
+_PROVIDER_CLASS_CACHE = {}
+_PROVIDER_CLASS_CACHE_AT = 0.0
+_PROVIDER_CLASS_CACHE_TTL = 60  # 초
+_PROVIDER_CLASS_CACHE_LOCK = threading.Lock()
+
+# 원격 VERSION 짧은 TTL 캐시. 화면 재진입/카탈로그 폴링 직후 동일 URL을
+# 다시 요청하는 것을 막되 업데이트 반영 지연은 짧게 유지한다.
+_REMOTE_VERSION_CACHE = {}
+_REMOTE_VERSION_CACHE_TTL = 60  # 초
+_REMOTE_VERSION_CACHE_LOCK = threading.Lock()
+
 # ── 플러그인 카탈로그 (GitHub 토픽 기반 자동 수집) ──────────────────────────
 # 백그라운드 갱신 스레드 보장 (gunicorn 1워커 전제 — is_alive()로 사망 감지 후 재시작)
 _CATALOG_THREAD_LOCK = threading.Lock()
@@ -312,6 +326,37 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             finally:
                 conn.close()
 
+    def _discover_provider_map(self, refresh=False):
+        """설치된 Provider 클래스를 ID 기준 dict로 반환한다.
+
+        목록 로드에서는 refresh=True로 실제 discovery를 1회 수행하고, 곧이어 발생하는
+        개별 업데이트 체크 요청들은 캐시를 재사용한다.
+        """
+        global _PROVIDER_CLASS_CACHE, _PROVIDER_CLASS_CACHE_AT
+        now = time.monotonic()
+        with _PROVIDER_CLASS_CACHE_LOCK:
+            if (
+                not refresh
+                and _PROVIDER_CLASS_CACHE
+                and (now - _PROVIDER_CLASS_CACHE_AT) < _PROVIDER_CLASS_CACHE_TTL
+            ):
+                return dict(_PROVIDER_CLASS_CACHE)
+
+            discovered_classes = {}
+            try:
+                from services.metadata_factory import MetadataFactory
+                for p_name, target_cls in MetadataFactory._discover_provider_classes():
+                    p_id = getattr(target_cls, "id", p_name)
+                    discovered_classes[p_id] = target_cls
+            except Exception as e:
+                print(f"[PluginManager] Discover provider classes error: {e}")
+                if _PROVIDER_CLASS_CACHE:
+                    return dict(_PROVIDER_CLASS_CACHE)
+
+            _PROVIDER_CLASS_CACHE = discovered_classes
+            _PROVIDER_CLASS_CACHE_AT = now
+            return dict(discovered_classes)
+
     def _list_plugins(self, db_type):
             """설치된 전체 메타데이터 플러그인 상세 정보 수집"""
             base_dir = self._get_plugins_base_dir()
@@ -320,16 +365,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not os.path.exists(base_dir):
                 return plugins
 
-            from services.metadata_factory import MetadataFactory
-            discovered_classes = {}
-            try:
-                for p_name, target_cls in MetadataFactory._discover_provider_classes():
-                    p_id = getattr(target_cls, 'id', p_name)
-                    discovered_classes[p_id] = target_cls
-            except Exception as e:
-                print(f"[PluginManager] Discover provider classes error: {e}")
+            # 목록 로드 시 discovery를 딱 한 번 갱신한다. 이후 check_update 배치는 이 캐시를 재사용한다.
+            discovered_classes = self._discover_provider_map(refresh=True)
 
             gateway = self.get_db_gateway(db_type)
+            # 모든 카드에 동일한 설정값이므로 플러그인마다 catalog.db를 다시 조회하지 않는다.
+            rollback_enabled = self._catalog_get_rollback_enabled(db_type)
 
             for entry in sorted(os.listdir(base_dir)):
                 full_path = os.path.join(base_dir, entry)
@@ -397,7 +438,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     _rp = self._parse_raw_base_url(_raw_url)
                     _is_monorepo_subdir = bool(_rp and _rp[3])
 
-                rollback_enabled = self._catalog_get_rollback_enabled(db_type)
                 rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
 
                 plugins.append({
@@ -751,13 +791,27 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return None
 
     def _fetch_remote_plugin_version(self, base_url, version_file="VERSION", version_key="plugin version", token=None):
-        """원격 VERSION 조회 (실패/파싱 불가 시 None — 체크는 조용히 실패)
-        token은 Gitea 인증용 (비공개 저장소)."""
+        """원격 VERSION 조회. 같은 URL의 최근 성공 결과는 짧게 재사용한다.
+
+        token은 Gitea 인증용이며 캐시 키에는 토큰 자체를 포함하지 않는다.
+        """
+        url = f"{base_url.rstrip('/')}/{version_file}"
+        cache_key = (url, str(version_key or "plugin version"))
+        now = time.monotonic()
+        with _REMOTE_VERSION_CACHE_LOCK:
+            cached = _REMOTE_VERSION_CACHE.get(cache_key)
+            if cached and (now - cached[0]) < _REMOTE_VERSION_CACHE_TTL:
+                return cached[1]
+
         try:
-            url = f"{base_url.rstrip('/')}/{version_file}"
-            return self._parse_remote_version(self._fetch_text(url, token=token), version_key)
+            remote_version = self._parse_remote_version(self._fetch_text(url, token=token), version_key)
         except Exception:
             return None
+
+        if remote_version:
+            with _REMOTE_VERSION_CACHE_LOCK:
+                _REMOTE_VERSION_CACHE[cache_key] = (now, remote_version)
+        return remote_version
 
     def _check_update_action(self, plugin_id, db_type):
         """단일 플러그인 업데이트 여부 비동기 조회 (check_update 액션)"""
@@ -779,16 +833,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception:
                 pass
 
-        # provider 클래스 조회
-        cls_obj = None
-        try:
-            from services.metadata_factory import MetadataFactory
-            for p_name, target_cls in MetadataFactory._discover_provider_classes():
-                if getattr(target_cls, 'id', p_name) == plugin_id:
-                    cls_obj = target_cls
-                    break
-        except Exception as e:
-            print(f"[PluginManager] check_update discover error: {e}")
+        # 목록 로드에서 만든 Provider 맵을 재사용해 전체 플러그인 재스캔을 피한다.
+        cls_obj = self._discover_provider_map(refresh=False).get(plugin_id)
 
         result = {
             "plugin_id": plugin_id,
