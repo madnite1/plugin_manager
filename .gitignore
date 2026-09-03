@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 catalog.db*
 .hermes/
+/scripts/
