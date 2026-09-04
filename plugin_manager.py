@@ -193,7 +193,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """
         try:
             self._ensure_catalog_routes()
-            self._ensure_catalog_thread(db_type)
+            self._ensure_catalog_thread("general")
             plugins = self._list_plugins(db_type)
             plugins, catalog_meta = self._merge_catalog_plugins(plugins, db_type)
             return {
@@ -258,6 +258,31 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             self._run_migration_once()
             self.__class__._migration_done = True
         self._ensure_catalog_routes()
+
+    def start_background_service(self, db_type):
+        """BookOasis 기동 시 플러그인 매니저의 상시 작업을 시작한다.
+
+        플러그인 import 자체에는 부작용을 만들지 않고, 코어가 활성 플러그인에 대해
+        호출하는 공식 생명주기 훅에서만 레거시 파일 정리와 백그라운드 스레드를 시작한다.
+        카탈로그는 전역 관리 기능이므로 세션 종류와 무관하게 general 기준으로 동작한다.
+        """
+        self._cleanup_legacy_scripts_dir()
+        self._ensure_catalog_routes()
+        self._ensure_catalog_thread("general")
+
+    def _cleanup_legacy_scripts_dir(self):
+        """구버전 배포에서 남을 수 있는 플러그인 코드 폴더의 scripts 경로를 제거한다."""
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        scripts_dir = os.path.join(plugin_dir, "scripts")
+        try:
+            if os.path.islink(scripts_dir):
+                os.unlink(scripts_dir)
+            elif os.path.isdir(scripts_dir):
+                shutil.rmtree(scripts_dir)
+            elif os.path.exists(scripts_dir):
+                os.remove(scripts_dir)
+        except Exception as e:
+            logger.warning("레거시 scripts 경로 정리 실패 (%s): %s", scripts_dir, e)
 
     def _run_migration_once(self):
         """최초 1회 마이그레이션: 구 DB 복사 + 코어 DB 설정 → catalog.db.settings"""
@@ -4233,12 +4258,3 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 _CATALOG_ROUTES_REGISTERED = True
             except Exception:
                 pass  # 첫 요청 이전 컨텍스트 부재 등 — 다음 호출에서 재시도
-
-# ── 플러그인 로드 시 백그라운드 카탈로그 갱신 스레드 및 라우트 자동 시작 ──
-if not globals().get("_PM_SKIP_AUTO_START", False):
-    try:
-        _pm_inst = PluginManagerMetadataProvider()
-        _pm_inst._ensure_catalog_routes()
-        _pm_inst._ensure_catalog_thread("general")
-    except Exception:
-        pass  # import 실패로 플러그인 로드 전체가 죽는 것 방지
