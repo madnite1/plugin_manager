@@ -128,8 +128,8 @@
                 </label>
                 <p style="font-size: 0.76rem; color: var(--app-text-muted, #94a3b8); margin: 0.3rem 0 0 0;">
                     켜면 플러그인 카드에 직전 성공 업데이트 이전 버전으로 되돌리는 롤백 버튼을 표시합니다.
-                    <strong style="color: var(--app-accent-hover, #f59e0b);">기본 OFF</strong> — 꺼져 있어도 업데이트 전 코드 백업은 유지되며,
-                    영속 데이터는 롤백하지 않습니다.
+                    <strong style="color: var(--app-accent-hover, #f59e0b);">기본 OFF</strong> — 꺼져 있어도 업데이트 전 코드와
+                    <code>plugins/data/&lt;plugin_id&gt;</code> 영속 데이터 백업은 유지됩니다. 롤백 백업은 업데이트 때만 생성되고 성공한 롤백에서 1회 소비되어 삭제됩니다. 데이터가 큰 플러그인은 업데이트 시간이 길어지고 백업 용량이 증가할 수 있습니다.
                 </p>
             </div>
         </div>

@@ -41,16 +41,17 @@ BookOasis/
     ├── metadata/
     │   └── plugin_manager/          ← 플러그인 코드 (업데이트 시 교체)
     │       ├── plugin_manager.py
-    │       ├── catalog.db           ← 레거시 위치 (마이그레이션 후 미사용)
-    │       └── plugin_sources.db    ← 레거시 위치 (마이그레이션 후 미사용)
+    │       ├── catalog.db           ← 구버전 레거시 위치
+    │       └── plugin_sources.db    ← 구버전 레거시 위치
     └── data/
         └── plugin_manager/          ← 영속 데이터 (../../data/plugin_manager/)
-            ├── catalog.db           # 카탈로그 인덱스(repos, meta) + 설정(settings)
-            ├── plugin_sources.db    # 소스 메타 (git_url, branch 등)
-            └── .migrated            # 마이그레이션 완료 플래그
+            ├── plugin_manager.db    # 카탈로그·설정·소스 메타 통합 DB
+            ├── catalog.db.bak       # 통합 마이그레이션 후 구 카탈로그 DB 백업
+            ├── plugin_sources.db.bak # 통합 마이그레이션 후 구 소스 DB 백업
+            └── .migrated            # 구버전 설정 마이그레이션 완료 플래그
 ```
 
-### 저장되는 설정 키 (catalog.db.settings)
+### 저장되는 설정 키 (plugin_manager.db.settings)
 
 | 키 | 설명 |
 |-----|------|
@@ -64,9 +65,9 @@ BookOasis/
 ### 특징
 
 - **세션 독립적** — `general`/`adult`/`audiobook`/`video` 등 세션(db_type)과 무관하게 동일 설정 사용
-- **업데이트 시 자동 마이그레이션** — 플러그인 업데이트 후 최초 초기화 시 레거시 DB(`plugin_dir/catalog.db`, `plugin_sources.db`)를 새 위치로 복사하고, 코어 DB(MariaDB) 설정도 `catalog.db.settings`로 마이그레이션 (1회만 실행, `.migrated` 플래그로 관리)
-- **신규 설치 시** — 빈 DB 자동 생성, 마이그레이션 불필요
-- **토큰 보안** — Gitea/GitHub 토큰이 카탈로그 DB에 평문 저장되므로 파일 권한 관리 필요 (Docker 볼륨 마운트 권장)
+- **업데이트 시 자동 마이그레이션** — 기존 `catalog.db`와 `plugin_sources.db`의 사용 중인 데이터를 `plugin_manager.db` 하나로 통합하고, 성공 후 원본 두 DB는 `.bak`으로 보존합니다. 아주 오래된 버전의 코어 DB 설정도 자체 DB `settings`로 1회 가져옵니다.
+- **신규 설치 시** — `plugin_manager.db`가 자동 생성되며 별도 마이그레이션이 필요하지 않습니다.
+- **토큰 보안** — Gitea/GitHub 토큰이 통합 DB에 평문 저장되므로 파일 권한 관리가 필요합니다. (Docker 볼륨 마운트 권장)
 
 ---
 
@@ -104,7 +105,7 @@ GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
 4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
 
-설치 시 소스 메타가 `plugin_manager/plugin_sources.db`(sqlite)에 저장됩니다. 설치는 zip/git
+설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 설치는 zip/git
 어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다 — 유효한 GitHub 루트
 주소면 `git_url` / `branch`(릴리즈 태그 설치 시 태그명) / `manifest_files` 이력이 남아 자동
 업데이트·GitHub 배지가 활성화되고, manifest가 없거나 monorepo 서브디렉토리면 레코드가 없어
@@ -176,7 +177,7 @@ update_manifest = {
 
 ### 우선순위 (자체 업데이트 엔진, 코어 PluginService 미사용)
 
-1. **릴리즈 태그 (우선)** — 설치 시 저장된 소스 메타(`plugin_sources.db`)의 `git_url`이 GitHub 소스이면
+1. **릴리즈 태그 (우선)** — 설치 시 저장된 소스 메타(`plugin_manager.db`의 `plugin_sources` 테이블)의 `git_url`이 GitHub 소스이면
    `/releases/latest` 리다이렉트로 최신 릴리즈 태그를 추출(API 키 불필요, 5분 TTL 캐시)하고
    해당 태그의 raw URL에서 `VERSION` 비교 → 파일 다운로드/교체 → hot reload.
    릴리즈를 안 만든 커밋의 VERSION bump는 무시되므로 개발 중 실수 감지를 방지.
@@ -222,8 +223,11 @@ update_manifest = {
 
 ### 업데이트 후 사용자 롤백
 
-- 성공한 플러그인 업데이트의 직전 코드 버전을 1개 보관합니다.
-- 플러그인 카드의 **롤백** 버튼으로 직전 버전으로 되돌릴 수 있습니다.
-- 롤백도 로드 및 VERSION 검증을 수행하며, 실패하면 현재 버전으로 자동 복구합니다.
-- `plugins/data/<plugin_id>` 영속 데이터와 `update_manifest.files` 밖의 런타임 파일은 롤백하지 않고 현재 값을 보존합니다.
-- 롤백 성공 후에는 방금 사용하던 버전을 새 롤백 슬롯으로 교체하므로 다시 되돌릴 수 있습니다.
+- 성공한 플러그인 업데이트의 직전 코드와 `plugins/data/<plugin_id>` 영속 데이터를 1개 롤백 슬롯에 함께 보관합니다.
+- SQLite 데이터 파일은 가능한 경우 SQLite backup API로 일관된 스냅샷을 만들고, 일반 파일과 심볼릭 링크도 함께 보존합니다.
+- 플러그인 카드의 **롤백** 버튼으로 코드와 영속 데이터를 모두 업데이트 직전 시점으로 되돌릴 수 있습니다. 업데이트 이후 생성·변경된 데이터는 롤백 시 이전 값으로 돌아갑니다.
+- 업데이트 후 로드 검증에 실패하면 사용자 롤백을 기다리지 않고 코드와 영속 데이터를 모두 자동 복구합니다.
+- `update_manifest.files` 밖의 코드 폴더 런타임 파일은 기존 정책대로 현재 값을 유지합니다.
+- `plugin_manager` 자기 롤백은 자기 데이터 폴더 안의 `rollback/` 저장소를 스냅샷에서 제외하고 복원 중에도 보존해 재귀 백업을 방지합니다.
+- 롤백은 업데이트 때 생성된 직전 상태 백업을 **1회 소비**합니다. 롤백 성공 후 백업 슬롯을 삭제하므로 방금 사용하던 업데이트 버전은 롤백 대상으로 남지 않으며, 다시 업데이트하기 전까지 추가 롤백은 제공하지 않습니다.
+- 데이터 폴더가 큰 플러그인은 업데이트 전에 전체 스냅샷을 만들기 때문에 시간이 더 걸리고 디스크 사용량이 증가할 수 있습니다. 롤백 슬롯은 플러그인별로 직전 1개만 유지합니다.

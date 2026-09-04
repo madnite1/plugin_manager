@@ -922,7 +922,7 @@
 
 
             const rollbackBtnHtml = p.has_rollback
-                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-rollback" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" data-version="${escapeHtmlAttr(p.rollback_version || '')}" title="이전 버전으로 롤백${p.rollback_version ? ` (v${escapeHtmlAttr(p.rollback_version)})` : ''}">
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-rollback" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" data-version="${escapeHtmlAttr(p.rollback_version || '')}" data-has-data="${p.rollback_has_data ? '1' : '0'}" title="이전 버전으로 롤백${p.rollback_version ? ` (v${escapeHtmlAttr(p.rollback_version)})` : ''}">
                     <i class="fa-solid fa-rotate-left"></i> 롤백
                    </button>`
                 : '';
@@ -1033,8 +1033,13 @@
                 const pluginId = this.getAttribute('data-id');
                 const pluginName = this.getAttribute('data-name') || pluginId;
                 const version = this.getAttribute('data-version');
+                const hasDataSnapshot = this.getAttribute('data-has-data') === '1';
                 if (!pluginId) return;
-                if (!confirm(`${pluginName}${version ? `을(를) v${version}` : '을(를) 이전 버전'}으로 롤백하시겠습니까?\n영속 데이터는 되돌리지 않습니다.`)) return;
+                const dataNotice = hasDataSnapshot
+                    ? '\n업데이트 이후 변경된 영속 데이터도 업데이트 직전 백업 시점으로 되돌아갑니다.'
+                    : '\n기존 형식의 롤백 백업이라 영속 데이터는 현재 값을 유지합니다.';
+                const consumeNotice = '\n롤백이 성공하면 이 백업은 삭제되며, 현재 업데이트 버전은 롤백 대상으로 남지 않습니다.';
+                if (!confirm(`${pluginName}${version ? `을(를) v${version}` : '을(를) 이전 버전'}으로 롤백하시겠습니까?${dataNotice}${consumeNotice}`)) return;
                 this.disabled = true;
                 try {
                     const res = await callPluginAction({ action: 'rollback', plugin_id: pluginId });

@@ -44,11 +44,13 @@ _CATALOG_THREAD_ALIVE = False   # 스레드 시작 시도 플래그 (사망 시 
 # 자체 save-config 라우트 1회 등록 보장 (멀티 워커/재호출 안전)
 _CATALOG_ROUTES_LOCK = threading.Lock()
 _CATALOG_ROUTES_REGISTERED = False
-# catalog.db(sqlite) 동시 접근 직렬화 (갱신 스레드 + 요청 처리)
-_CATALOG_DB_LOCK = threading.Lock()
+# plugin_manager.db(sqlite) 동시 접근 직렬화. 카탈로그와 소스 메타가 같은 DB를
+# 사용하므로 하나의 재진입 락을 공유한다. 기존 이름은 내부 호환을 위해 별칭으로 유지한다.
+_PM_DB_LOCK = threading.RLock()
+_CATALOG_DB_LOCK = _PM_DB_LOCK
+_SOURCES_DB_LOCK = _PM_DB_LOCK
+_DB_MIGRATION_LOCK = threading.Lock()
 
-# plugin_sources.db(sqlite) — .git_source/.zip_source 파일 대체 메타 저장소
-_SOURCES_DB_LOCK = threading.Lock()
 # 레거시 .git_source/.zip_source 파일 → DB 1회 마이그레이션 보장 (gunicorn 1워커 전제)
 _SOURCES_MIGRATION_LOCK = threading.Lock()
 _SOURCES_MIGRATION_DONE = False
@@ -242,13 +244,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             pass
         return data_dir
 
+    def _get_db_path(self):
+        """플러그인 매니저 통합 SQLite DB 경로를 반환한다."""
+        return os.path.join(self._get_data_dir(), "plugin_manager.db")
+
     def _get_catalog_db_path(self):
-        """카탈로그 SQLite DB 경로 (영속 저장소: ../../data/plugin_manager/catalog.db)"""
-        return os.path.join(self._get_data_dir(), "catalog.db")
+        """카탈로그 DB 경로. 기존 호출부 호환을 위해 통합 DB를 반환한다."""
+        return self._get_db_path()
 
     def _get_sources_db_path(self):
-        """소스 메타 SQLite DB 경로 (영속 저장소: ../../data/plugin_manager/plugin_sources.db)"""
-        return os.path.join(self._get_data_dir(), "plugin_sources.db")
+        """소스 메타 DB 경로. 기존 호출부 호환을 위해 통합 DB를 반환한다."""
+        return self._get_db_path()
 
     def __init__(self):
         super().__init__()
@@ -285,64 +291,246 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             logger.warning("레거시 scripts 경로 정리 실패 (%s): %s", scripts_dir, e)
 
     def _run_migration_once(self):
-        """최초 1회 마이그레이션: 구 DB 복사 + 코어 DB 설정 → catalog.db.settings"""
+        """구버전 저장소를 표준 데이터 디렉터리로 옮기고 통합 DB로 전환한다."""
         data_dir = self._get_data_dir()
         flag = os.path.join(data_dir, ".migrated")
-        if os.path.exists(flag):
-            return
-
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        unified_exists_before = os.path.exists(self._get_db_path())
 
-        # 1. 구 catalog.db / plugin_sources.db 복사 (plugin_dir → data_dir)
-        for name in ("catalog.db", "plugin_sources.db"):
-            old = os.path.join(plugin_dir, name)
-            new = os.path.join(data_dir, name)
-            if os.path.exists(old) and not os.path.exists(new):
+        # 과거 버전은 DB를 플러그인 코드 폴더에 저장했다. 아직 통합 DB가 없는 경우에만
+        # 표준 데이터 디렉터리로 복사해 새 마이그레이션 입력으로 사용한다.
+        if not os.path.exists(flag) and not unified_exists_before:
+            for name in ("catalog.db", "plugin_sources.db"):
+                old = os.path.join(plugin_dir, name)
+                new = os.path.join(data_dir, name)
+                if os.path.exists(old) and not os.path.exists(new):
+                    try:
+                        shutil.copy2(old, new)
+                    except Exception as e:
+                        logger.warning("레거시 DB 복사 실패 (%s): %s", old, e)
+
+        # catalog.db + plugin_sources.db → plugin_manager.db. 이 단계는 기존 .migrated
+        # 플래그와 별개로 실행해 이미 표준 데이터 폴더를 쓰던 사용자도 자동 전환한다.
+        self._migrate_legacy_databases()
+
+        # 아주 오래된 버전에서 코어 DB에 저장했던 PM_* 설정은 자체 DB로 1회 가져온다.
+        # 통합 DB에 이미 같은 키가 있으면 덮어쓰지 않는다.
+        if not os.path.exists(flag):
+            self._migrate_core_settings_to_catalog()
+            try:
+                with open(flag, "w", encoding="utf-8") as f:
+                    f.write("done")
+            except Exception:
+                pass
+
+    def _archive_legacy_db(self, db_path):
+        """마이그레이션이 끝난 구 DB와 WAL 보조 파일을 충돌 없는 .bak 이름으로 보존한다."""
+        if not os.path.exists(db_path):
+            return None
+        backup = db_path + ".bak"
+        suffix = 1
+        while os.path.exists(backup):
+            backup = db_path + ".bak.{0}".format(suffix)
+            suffix += 1
+        os.replace(db_path, backup)
+        for sidecar in ("-wal", "-shm"):
+            src = db_path + sidecar
+            if os.path.exists(src):
                 try:
-                    shutil.copy2(old, new)
+                    os.replace(src, backup + sidecar)
                 except Exception:
                     pass
+        return backup
 
-        # 2. 코어 DB 설정 → catalog.db.settings 마이그레이션
-        self._migrate_core_settings_to_catalog()
-
-        # 3. 플래그 생성
+    def _copy_legacy_catalog_tables(self, source_path, target_conn):
+        """구 catalog.db에서 현재 사용하는 repos/meta/settings 데이터만 통합 DB로 복사한다."""
+        source_conn = sqlite3.connect(source_path, timeout=10)
         try:
-            with open(flag, "w") as f:
-                f.write("done")
+            source_conn.row_factory = sqlite3.Row
+            table_names = {
+                row[0] for row in source_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            for name in ("repos", "meta", "settings"):
+                if name not in table_names:
+                    continue
+                source_cols = [r[1] for r in source_conn.execute(
+                    'PRAGMA table_info("{0}")'.format(name)
+                )]
+                target_cols = {r[1] for r in target_conn.execute(
+                    'PRAGMA table_info("{0}")'.format(name)
+                )}
+                cols = [c for c in source_cols if c in target_cols]
+                if not cols:
+                    continue
+                quoted_cols = ", ".join('"{0}"'.format(c) for c in cols)
+                placeholders = ", ".join("?" for _ in cols)
+                rows = source_conn.execute(
+                    'SELECT {0} FROM "{1}"'.format(quoted_cols, name)
+                ).fetchall()
+                if rows:
+                    target_conn.executemany(
+                        'INSERT OR REPLACE INTO "{0}" ({1}) VALUES ({2})'.format(
+                            name, quoted_cols, placeholders
+                        ),
+                        [tuple(row[c] for c in cols) for row in rows],
+                    )
+        finally:
+            source_conn.close()
+
+    def _copy_legacy_source_tables(self, source_path, target_conn):
+        """구 plugin_sources.db의 소스 정보와 메타를 통합 DB로 복사한다."""
+        source_conn = sqlite3.connect(source_path, timeout=10)
+        try:
+            source_conn.row_factory = sqlite3.Row
+            table_names = {
+                row[0] for row in source_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "plugin_sources" in table_names:
+                source_cols = {r[1] for r in source_conn.execute("PRAGMA table_info(plugin_sources)")}
+                cols = [
+                    c for c in ("plugin_id", "git_url", "branch", "manifest_files", "installed_at")
+                    if c in source_cols
+                ]
+                if "plugin_id" in cols and "git_url" in cols:
+                    quoted = ", ".join(cols)
+                    rows = source_conn.execute("SELECT {0} FROM plugin_sources".format(quoted)).fetchall()
+                    placeholders = ", ".join("?" for _ in cols)
+                    if rows:
+                        target_conn.executemany(
+                            "INSERT OR REPLACE INTO plugin_sources ({0}) VALUES ({1})".format(
+                                quoted, placeholders
+                            ),
+                            [tuple(row[c] for c in cols) for row in rows],
+                        )
+            if "meta" in table_names:
+                rows = source_conn.execute("SELECT key, value FROM meta").fetchall()
+                if rows:
+                    target_conn.executemany(
+                        "INSERT OR REPLACE INTO source_meta(key, value) VALUES(?, ?)",
+                        [(row["key"], row["value"]) for row in rows],
+                    )
+        finally:
+            source_conn.close()
+
+    def _ensure_unified_db_schema(self, conn):
+        """plugin_manager.db에 카탈로그·설정·소스 메타 스키마를 모두 보장한다."""
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repos (
+                full_name      TEXT PRIMARY KEY,
+                html_url       TEXT,
+                description    TEXT,
+                topics         TEXT,
+                default_branch TEXT,
+                pushed_at      TEXT,
+                plugin_id      TEXT,
+                plugin_name    TEXT,
+                latest_version TEXT,
+                is_valid       TEXT DEFAULT 'unknown',
+                last_checked   TEXT,
+                install_error  TEXT,
+                source         TEXT DEFAULT 'github',
+                base_url       TEXT
+            )
+            """
+        )
+        repo_cols = {row[1] for row in conn.execute("PRAGMA table_info(repos)")}
+        if "plugin_name" not in repo_cols:
+            conn.execute("ALTER TABLE repos ADD COLUMN plugin_name TEXT")
+        if "install_error" not in repo_cols:
+            conn.execute("ALTER TABLE repos ADD COLUMN install_error TEXT")
+        if "source" not in repo_cols:
+            conn.execute("ALTER TABLE repos ADD COLUMN source TEXT DEFAULT 'github'")
+        if "base_url" not in repo_cols:
+            conn.execute("ALTER TABLE repos ADD COLUMN base_url TEXT")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plugin_sources (
+                plugin_id      TEXT PRIMARY KEY,
+                git_url        TEXT,
+                branch         TEXT,
+                manifest_files TEXT,
+                installed_at   TEXT
+            )
+            """
+        )
+        try:
+            source_cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
+            for drop_col in ("source_type", "filename"):
+                if drop_col in source_cols:
+                    conn.execute("ALTER TABLE plugin_sources DROP COLUMN {0}".format(drop_col))
         except Exception:
             pass
+        conn.execute("CREATE TABLE IF NOT EXISTS source_meta (key TEXT PRIMARY KEY, value TEXT)")
+
+    def _migrate_legacy_databases(self):
+        """catalog.db와 plugin_sources.db를 plugin_manager.db 하나로 안전하게 통합한다."""
+        data_dir = self._get_data_dir()
+        target_path = self._get_db_path()
+        legacy_catalog = os.path.join(data_dir, "catalog.db")
+        legacy_sources = os.path.join(data_dir, "plugin_sources.db")
+
+        with _DB_MIGRATION_LOCK:
+            os.makedirs(data_dir, exist_ok=True)
+
+            # 새 통합 DB에는 현재 사용하는 스키마만 만들고, 구 DB에서는 필요한 데이터만
+            # 읽어 온다. 사용하지 않는 과거 테스트/폐기 테이블은 .bak에만 보존한다.
+            conn = sqlite3.connect(target_path, timeout=10)
+            try:
+                self._ensure_unified_db_schema(conn)
+                if os.path.exists(legacy_catalog):
+                    self._copy_legacy_catalog_tables(legacy_catalog, conn)
+                if os.path.exists(legacy_sources):
+                    self._copy_legacy_source_tables(legacy_sources, conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                    ("unified_db_migration_v1", "1"),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+            # 모든 데이터가 통합 DB에 커밋된 뒤에만 구 DB를 백업 이름으로 전환한다.
+            for old_path in (legacy_catalog, legacy_sources):
+                if os.path.exists(old_path):
+                    try:
+                        self._archive_legacy_db(old_path)
+                    except Exception as e:
+                        logger.warning("레거시 DB 백업 전환 실패 (%s): %s", old_path, e)
 
     def _migrate_core_settings_to_catalog(self):
-        """코어 DB(gateway) 설정 읽어서 catalog.db.settings에 저장 — 모든 db_type 확인"""
+        """과거 코어 DB의 PM_* 설정을 통합 DB settings에 1회 가져온다."""
         keys = [
             "PM_CATALOG_GITEA_SERVERS", "PM_CATALOG_TOPICS",
             "PM_CATALOG_REFRESH_HOURS", "PM_ALLOW_INVALID_INSTALL",
             "PM_AUTO_UPDATE", "PM_GITHUB_TOKEN"
         ]
-        catalog_db = self._get_catalog_db_path()
-        with _CATALOG_DB_LOCK:
-            conn = sqlite3.connect(catalog_db, timeout=10)
+        db_path = self._get_db_path()
+        with _PM_DB_LOCK:
+            conn = sqlite3.connect(db_path, timeout=10)
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute(
-                    """CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT
-                    )"""
-                )
-                # 모든 db_type에서 설정 조회 (세션별로 다를 수 있음)
+                self._ensure_unified_db_schema(conn)
+                # 모든 db_type에서 과거 설정을 조회하되, 자체 DB에 이미 있는 값은 보존한다.
                 for db_type in ("general", "adult", "audiobook", "video"):
                     try:
                         gateway = self.get_db_gateway(db_type)
                         for key in keys:
                             val = gateway.get_setting(key, default=None)
                             if val is not None:
-                                # dict 반환 가능성 처리
                                 if isinstance(val, dict):
                                     val = val.get("value", val)
                                 conn.execute(
-                                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                                     (key, str(val))
                                 )
                     except Exception:
@@ -394,7 +582,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             discovered_classes = self._discover_provider_map(refresh=True)
 
             gateway = self.get_db_gateway(db_type)
-            # 모든 카드에 동일한 설정값이므로 플러그인마다 catalog.db를 다시 조회하지 않는다.
+            # 모든 카드에 동일한 설정값이므로 플러그인마다 통합 DB를 다시 조회하지 않는다.
             rollback_enabled = self._catalog_get_rollback_enabled(db_type)
 
             for entry in sorted(os.listdir(base_dir)):
@@ -481,6 +669,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "git_url": git_url,
                     "has_rollback": bool(rollback_info) if rollback_enabled else False,
                     "rollback_version": (rollback_info or {}).get("from_version") if rollback_enabled else None,
+                    "rollback_has_data": bool((rollback_info or {}).get("has_data_snapshot")) if rollback_enabled else False,
                     "is_installed": True,
                 })
 
@@ -1046,6 +1235,255 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return None
         return os.path.join(self._rollback_root_dir(), plugin_id)
 
+
+    def _remove_path(self, path):
+        """파일·심볼릭 링크·디렉터리를 종류에 맞게 제거한다."""
+        if not path or not os.path.lexists(path):
+            return
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+    def _copy_sqlite_snapshot_file(self, source_path, dest_path):
+        """실행 중인 SQLite DB를 backup API로 일관된 단일 파일 스냅샷으로 복사한다.
+
+        SQLite 파일이 아니거나 백업할 수 없는 경우 False를 반환해 일반 파일 복사로 폴백한다.
+        """
+        try:
+            with open(source_path, "rb") as f:
+                if f.read(16) != b"SQLite format 3\x00":
+                    return False
+        except Exception:
+            return False
+
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        source_conn = None
+        dest_conn = None
+        try:
+            source_conn = sqlite3.connect(source_path, timeout=30)
+            dest_conn = sqlite3.connect(dest_path, timeout=30)
+            source_conn.backup(dest_conn)
+            dest_conn.commit()
+            try:
+                shutil.copystat(source_path, dest_path)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except Exception:
+                pass
+            return False
+        finally:
+            if dest_conn is not None:
+                try:
+                    dest_conn.close()
+                except Exception:
+                    pass
+            if source_conn is not None:
+                try:
+                    source_conn.close()
+                except Exception:
+                    pass
+
+    def _copy_plugin_data_snapshot_tree(self, source_dir, dest_dir, plugin_id):
+        """플러그인 데이터 디렉터리를 롤백용으로 복사한다.
+
+        SQLite 본체는 backup API를 사용해 WAL 쓰기 중에도 일관된 복사본을 만들고,
+        성공적으로 백업된 DB의 -wal/-shm 보조 파일은 복사하지 않는다. 심볼릭 링크는
+        외부 경로를 따라가지 않고 링크 자체를 보존한다.
+        """
+        source_dir = os.path.realpath(source_dir)
+        self_data_dir = os.path.realpath(self._get_data_dir())
+
+        def copy_dir(src, dst, is_root=False):
+            os.makedirs(dst, exist_ok=True)
+            try:
+                entries = list(os.scandir(src))
+            except FileNotFoundError:
+                return
+
+            sqlite_backed = set()
+            for entry in entries:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.name.endswith("-wal") or entry.name.endswith("-shm"):
+                    continue
+                target = os.path.join(dst, entry.name)
+                if self._copy_sqlite_snapshot_file(entry.path, target):
+                    sqlite_backed.add(entry.name)
+
+            for entry in entries:
+                name = entry.name
+                # plugin_manager 자기 데이터에는 롤백 저장소 자체가 포함되어 있으므로
+                # 자기 자신을 재귀적으로 백업하지 않는다.
+                if (
+                    is_root
+                    and plugin_id == self.id
+                    and os.path.realpath(src) == self_data_dir
+                    and name == "rollback"
+                ):
+                    continue
+
+                target = os.path.join(dst, name)
+                if name in sqlite_backed:
+                    continue
+                if (name.endswith("-wal") or name.endswith("-shm")):
+                    base_name = name[:-4]
+                    if base_name in sqlite_backed:
+                        continue
+
+                try:
+                    if entry.is_symlink():
+                        os.symlink(os.readlink(entry.path), target)
+                        try:
+                            shutil.copystat(entry.path, target, follow_symlinks=False)
+                        except Exception:
+                            pass
+                    elif entry.is_dir(follow_symlinks=False):
+                        copy_dir(entry.path, target, False)
+                    elif entry.is_file(follow_symlinks=False):
+                        before = os.stat(entry.path, follow_symlinks=False)
+                        shutil.copy2(entry.path, target)
+                        after = os.stat(entry.path, follow_symlinks=False)
+                        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                            raise RuntimeError(
+                                f"데이터 파일이 백업 중 변경되어 업데이트를 중단합니다: {entry.path}"
+                            )
+                    else:
+                        logger.warning("롤백 데이터 백업에서 특수 파일을 건너뜁니다: %s", entry.path)
+                except Exception:
+                    logger.exception("롤백 데이터 파일 복사 실패: %s", entry.path)
+                    raise
+
+            # 복사 중 일반 파일/디렉터리가 추가·삭제된 경우 혼합 시점 백업을 남기지 않는다.
+            # SQLite의 WAL/SHM 보조 파일 변화는 backup API가 일관성을 보장하므로 비교에서 제외한다.
+            try:
+                current_names = set(os.listdir(src))
+                initial_names = {entry.name for entry in entries}
+                if is_root and plugin_id == self.id and os.path.realpath(src) == self_data_dir:
+                    current_names.discard("rollback")
+                    initial_names.discard("rollback")
+                for db_name in sqlite_backed:
+                    for suffix in ("-wal", "-shm"):
+                        current_names.discard(db_name + suffix)
+                        initial_names.discard(db_name + suffix)
+                if current_names != initial_names:
+                    raise RuntimeError(f"데이터 디렉터리가 백업 중 변경되어 업데이트를 중단합니다: {src}")
+            except FileNotFoundError:
+                raise RuntimeError(f"데이터 디렉터리가 백업 중 삭제되었습니다: {src}")
+
+            try:
+                shutil.copystat(src, dst, follow_symlinks=False)
+            except Exception:
+                pass
+
+        self._remove_path(dest_dir)
+        copy_dir(source_dir, dest_dir, True)
+
+    def _prepare_plugin_data_snapshot(self, plugin_id):
+        """업데이트/롤백 직전 plugins/data/<plugin_id> 상태를 임시 스냅샷으로 만든다."""
+        data_dir = self._get_plugin_data_dir(plugin_id, create=False)
+        if not data_dir:
+            raise RuntimeError(f"플러그인 데이터 경로를 확인할 수 없습니다: {plugin_id}")
+
+        rollback_root = self._rollback_root_dir()
+        stage_dir = os.path.join(rollback_root, f".data_stage_{plugin_id}")
+        self._remove_path(stage_dir)
+
+        existed = os.path.isdir(data_dir)
+        if os.path.lexists(data_dir) and not existed:
+            raise RuntimeError(f"플러그인 데이터 경로가 디렉터리가 아닙니다: {data_dir}")
+        if existed:
+            self._copy_plugin_data_snapshot_tree(data_dir, stage_dir, plugin_id)
+        return {"existed": existed, "path": stage_dir if existed else None}
+
+    def _cleanup_plugin_data_snapshot(self, snapshot):
+        """아직 소비되지 않은 임시 데이터 스냅샷을 정리한다."""
+        if not isinstance(snapshot, dict):
+            return
+        path = snapshot.get("path")
+        if path and os.path.lexists(path):
+            try:
+                self._remove_path(path)
+            except Exception:
+                logger.warning("임시 롤백 데이터 스냅샷 정리 실패: %s", path, exc_info=True)
+
+    def _restore_plugin_data_snapshot(self, plugin_id, snapshot_dir, data_existed):
+        """plugins/data/<plugin_id>를 스냅샷 시점과 정확히 같은 존재 상태로 복원한다."""
+        data_dir = self._get_plugin_data_dir(plugin_id, create=False)
+        if not data_dir:
+            raise RuntimeError(f"플러그인 데이터 경로를 확인할 수 없습니다: {plugin_id}")
+        if data_existed and (not snapshot_dir or not os.path.isdir(snapshot_dir)):
+            raise RuntimeError(f"롤백 데이터 스냅샷이 없습니다: {plugin_id}")
+
+        parent = os.path.dirname(data_dir)
+        os.makedirs(parent, exist_ok=True)
+
+        if plugin_id != self.id:
+            swap_dir = os.path.join(parent, f".pm_data_restore_swap_{plugin_id}")
+            self._remove_path(swap_dir)
+            had_current = os.path.lexists(data_dir)
+            try:
+                if had_current:
+                    os.replace(data_dir, swap_dir)
+                if data_existed:
+                    shutil.copytree(snapshot_dir, data_dir, symlinks=True)
+                self._remove_path(swap_dir)
+                return True
+            except Exception:
+                try:
+                    self._remove_path(data_dir)
+                    if os.path.lexists(swap_dir):
+                        os.replace(swap_dir, data_dir)
+                except Exception:
+                    logger.exception("데이터 롤백 실패 후 현재 데이터 복구 실패 (id=%s)", plugin_id)
+                raise
+
+        # plugin_manager 자기 롤백은 rollback/이 자기 데이터 폴더 안에 있으므로
+        # rollback/을 유지한 채 나머지 항목만 트랜잭션형으로 교체한다.
+        os.makedirs(data_dir, exist_ok=True)
+        swap_root = os.path.join(parent, ".pm_data_restore_swap_plugin_manager")
+        new_root = os.path.join(parent, ".pm_data_restore_new_plugin_manager")
+        self._remove_path(swap_root)
+        self._remove_path(new_root)
+        os.makedirs(swap_root, exist_ok=True)
+        if data_existed:
+            shutil.copytree(snapshot_dir, new_root, symlinks=True)
+        try:
+            for name in os.listdir(data_dir):
+                if name == "rollback":
+                    continue
+                os.replace(os.path.join(data_dir, name), os.path.join(swap_root, name))
+
+            if data_existed:
+                for name in os.listdir(new_root):
+                    os.replace(os.path.join(new_root, name), os.path.join(data_dir, name))
+
+            self._remove_path(new_root)
+            self._remove_path(swap_root)
+            return True
+        except Exception:
+            try:
+                for name in list(os.listdir(data_dir)):
+                    if name == "rollback":
+                        continue
+                    self._remove_path(os.path.join(data_dir, name))
+                if os.path.isdir(swap_root):
+                    for name in os.listdir(swap_root):
+                        os.replace(os.path.join(swap_root, name), os.path.join(data_dir, name))
+            except Exception:
+                logger.exception("Plugin Manager 데이터 롤백 실패 후 현재 데이터 복구 실패")
+            raise
+        finally:
+            self._remove_path(new_root)
+            self._remove_path(swap_root)
+
     def _read_rollback_info(self, plugin_id):
         slot = self._rollback_slot_dir(plugin_id)
         if not slot:
@@ -1060,11 +1498,29 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not isinstance(meta, dict) or str(meta.get("plugin_id") or "") != plugin_id:
                 return None
             meta["code_dir"] = code_dir
+            # data_existed 필드가 있으면 새 형식의 코드+데이터 스냅샷이다.
+            # 구버전 슬롯에는 이 필드가 없으며, 그 경우 기존처럼 데이터는 보존한다.
+            if "data_existed" in meta:
+                data_dir = os.path.join(slot, "data_previous")
+                if bool(meta.get("data_existed")):
+                    if not os.path.isdir(data_dir):
+                        return None
+                    meta["data_dir"] = data_dir
+                else:
+                    meta["data_dir"] = None
+                meta["has_data_snapshot"] = True
+            else:
+                meta["data_dir"] = None
+                meta["has_data_snapshot"] = False
             return meta
         except Exception:
             return None
 
-    def _write_rollback_snapshot(self, plugin_id, source_dir, from_version, to_version, source_info=None):
+    def _write_rollback_snapshot(
+        self, plugin_id, source_dir, from_version, to_version, source_info=None,
+        data_stage=None, data_existed=None,
+    ):
+        """직전 코드와 선택적으로 직전 plugins/data/<plugin_id>를 하나의 롤백 슬롯에 저장한다."""
         slot = self._rollback_slot_dir(plugin_id)
         if not slot or not os.path.isdir(source_dir):
             return False
@@ -1080,6 +1536,21 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "source_info": source_info if isinstance(source_info, dict) else None,
             }
+
+            # data_existed=None은 기존 코드 전용 슬롯과의 내부 호환용이다.
+            if data_existed is not None:
+                meta["data_snapshot_version"] = 1
+                meta["data_existed"] = bool(data_existed)
+                if data_existed:
+                    if not data_stage or not os.path.isdir(data_stage):
+                        raise RuntimeError("직전 플러그인 데이터 스냅샷이 없습니다.")
+                    data_target = os.path.join(tmp, "data_previous")
+                    try:
+                        os.replace(data_stage, data_target)
+                    except OSError:
+                        shutil.copytree(data_stage, data_target, symlinks=True)
+                        shutil.rmtree(data_stage, ignore_errors=True)
+
             with open(os.path.join(tmp, "metadata.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             shutil.rmtree(slot, ignore_errors=True)
@@ -1105,6 +1576,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         current_version = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version") or "알 수 없음"
         previous_version = str(info.get("from_version") or "알 수 없음")
         current_source = self._read_git_source_info(plugin_id)
+        has_data_snapshot = bool(info.get("has_data_snapshot"))
+        current_data_snapshot = None
+        if has_data_snapshot:
+            try:
+                current_data_snapshot = self._prepare_plugin_data_snapshot(plugin_id)
+            except Exception as e:
+                return False, f"현재 플러그인 데이터 백업에 실패해 롤백을 중단했습니다: {e}"
+
         swap_dir = os.path.join(self._get_plugins_base_dir(), f".pm_rollback_swap_{plugin_id}")
         shutil.rmtree(swap_dir, ignore_errors=True)
         recovered = False
@@ -1130,6 +1609,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     os.makedirs(os.path.dirname(dst) or dest_dir, exist_ok=True)
                     shutil.copy2(src, dst)
 
+            # 새 형식의 롤백 슬롯은 영속 데이터도 업데이트 직전 상태로 복원한다.
+            # plugin_manager 자기 롤백에서는 rollback/ 자체는 보존된다.
+            if has_data_snapshot:
+                self._restore_plugin_data_snapshot(
+                    plugin_id,
+                    info.get("data_dir"),
+                    bool(info.get("data_existed")),
+                )
+
+            # plugin_manager 자기 데이터 복원으로 plugin_manager.db가 바뀔 수 있으므로
+            # 소스 메타 갱신은 데이터 복원 뒤에 수행한다.
             previous_source = info.get("source_info")
             if isinstance(previous_source, dict) and previous_source.get("git_url"):
                 self._sources_set(plugin_id, previous_source)
@@ -1144,17 +1634,32 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not loaded_ok or (previous_version != "알 수 없음" and restored_ver != previous_version):
                 raise RuntimeError(f"롤백 후 검증 실패 (기대 {previous_version}, 실제 {restored_ver or '알 수 없음'})")
 
-            self._write_rollback_snapshot(plugin_id, swap_dir, current_version, previous_version, current_source)
-            return True, (
-                f"'{plugin_id}' 플러그인을 v{current_version}에서 v{previous_version}으로 롤백했습니다. "
-                f"plugins/data/{plugin_id} 영속 데이터는 변경하지 않았습니다."
-            )
+            # 롤백은 업데이트 시 생성된 직전 상태 백업을 1회 소비한다.
+            # 방금 사용하던 업데이트 버전은 새 롤백 슬롯으로 남기지 않으며,
+            # 성공한 롤백 뒤에는 카드의 롤백 버튼도 사라진다.
+            rollback_slot = self._rollback_slot_dir(plugin_id)
+            if rollback_slot and os.path.lexists(rollback_slot):
+                self._remove_path(rollback_slot)
+
+            message = f"'{plugin_id}' 플러그인을 v{current_version}에서 v{previous_version}으로 롤백했습니다. "
+            if has_data_snapshot:
+                message += f"plugins/data/{plugin_id} 영속 데이터도 업데이트 직전 상태로 복원했습니다. "
+            else:
+                message += f"기존 형식의 롤백 백업이라 plugins/data/{plugin_id} 영속 데이터는 현재 값을 유지했습니다. "
+            message += "사용한 롤백 백업은 삭제했으며, 다시 업데이트하기 전까지 추가 롤백은 제공하지 않습니다."
+            return True, message
         except Exception as e:
             try:
                 if os.path.exists(dest_dir):
                     shutil.rmtree(dest_dir, ignore_errors=True)
                 if os.path.isdir(swap_dir):
                     shutil.copytree(swap_dir, dest_dir)
+                if has_data_snapshot and current_data_snapshot is not None:
+                    self._restore_plugin_data_snapshot(
+                        plugin_id,
+                        current_data_snapshot.get("path"),
+                        bool(current_data_snapshot.get("existed")),
+                    )
                 if current_source and current_source.get("git_url"):
                     self._sources_set(plugin_id, current_source)
                 elif current_source is None:
@@ -1163,25 +1668,34 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 MetadataFactory.hot_reload_plugin(plugin_id)
                 recovered = True
             except Exception:
-                logger.exception("롤백 실패 후 현재 버전 복구 실패 (id=%s)", plugin_id)
-            return False, f"롤백 실패: {e}. " + ("현재 버전으로 자동 복구했습니다." if recovered else "현재 버전 자동 복구에도 실패했습니다.")
+                logger.exception("롤백 실패 후 현재 코드/데이터 복구 실패 (id=%s)", plugin_id)
+            return False, f"롤백 실패: {e}. " + ("현재 버전과 데이터로 자동 복구했습니다." if recovered else "현재 버전 자동 복구에도 실패했습니다.")
         finally:
             shutil.rmtree(swap_dir, ignore_errors=True)
+            self._cleanup_plugin_data_snapshot(current_data_snapshot)
 
-    def _restore_plugin_backup(self, backup_dir, dest_dir, plugin_id):
-        """ZIP 업데이트 실패 시 기존 플러그인 폴더를 원상 복구한다."""
+    def _restore_plugin_backup(self, backup_dir, dest_dir, plugin_id, data_snapshot=None):
+        """업데이트 실패 시 기존 코드와 업데이트 직전 영속 데이터를 원상 복구한다."""
         try:
             if os.path.exists(dest_dir):
                 shutil.rmtree(dest_dir, ignore_errors=True)
             shutil.copytree(backup_dir, dest_dir)
+
+            if isinstance(data_snapshot, dict):
+                self._restore_plugin_data_snapshot(
+                    plugin_id,
+                    data_snapshot.get("path"),
+                    bool(data_snapshot.get("existed")),
+                )
+
             try:
                 from services.metadata_factory import MetadataFactory
                 MetadataFactory.hot_reload_plugin(plugin_id)
             except Exception:
-                logger.warning("ZIP 업데이트 롤백 후 플러그인 리로드 실패 (id=%s)", plugin_id, exc_info=True)
+                logger.warning("업데이트 롤백 후 플러그인 리로드 실패 (id=%s)", plugin_id, exc_info=True)
             return True
         except Exception:
-            logger.exception("ZIP 업데이트 롤백 실패 (id=%s)", plugin_id)
+            logger.exception("업데이트 코드/데이터 롤백 실패 (id=%s)", plugin_id)
             return False
 
     def _validate_self_update_package(self, target_plugin_dir, dest_dir):
@@ -1214,10 +1728,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _update_existing_from_zip(self, target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=False):
         """동일 plugin_id ZIP을 기존 플러그인의 트랜잭션형 업데이트로 적용한다.
 
-        update_manifest.files를 관리 파일 목록으로 사용해 코드/UI만 교체하고,
-        목록 밖의 레거시 런타임 파일은 보존한다. 표준 `plugins/data/<plugin_id>` 영속
-        데이터 경로는 애초에 코드 폴더 밖이므로 어떤 업데이트/롤백에서도 건드리지 않는다.
-        로드 검증 실패 시 전체 코드 폴더 백업으로 롤백한다.
+        update_manifest.files를 관리 파일 목록으로 사용해 코드/UI를 교체하고,
+        업데이트 직전 `plugins/data/<plugin_id>` 전체를 롤백 스냅샷으로 함께 보관한다.
+        업데이트 후 로드 검증에 실패하면 코드와 영속 데이터를 모두 직전 상태로 복구한다.
         """
         old_files, _old_manifest = self._extract_update_manifest_files(dest_dir)
         new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
@@ -1264,8 +1777,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             old_enabled = "1"
 
+        data_snapshot = None
         try:
+            # 코드와 영속 데이터 모두 새 코드가 실행되기 전에 확보한다.
             shutil.copytree(dest_dir, backup_dir)
+            data_snapshot = self._prepare_plugin_data_snapshot(plugin_id)
+
             for rel in sorted(old_managed - new_managed, reverse=True):
                 target = os.path.join(dest_dir, rel)
                 if os.path.isfile(target) or os.path.islink(target):
@@ -1295,10 +1812,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 logger.warning("ZIP 업데이트 후 플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
 
             if not loaded_ok:
-                restored = self._restore_plugin_backup(backup_dir, dest_dir, plugin_id)
+                restored = self._restore_plugin_backup(
+                    backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
+                )
                 return False, (
                     f"검증 실패: '{plugin_id}' ZIP 업데이트 후 플러그인이 로드되지 않았습니다. "
-                    + ("기존 버전으로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
+                    + ("기존 코드와 데이터로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
                 )
 
             if not old_git_info:
@@ -1310,35 +1829,45 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     pass
 
             rollback_saved = self._write_rollback_snapshot(
-                plugin_id, backup_dir, old_version, new_version, old_git_info
+                plugin_id,
+                backup_dir,
+                old_version,
+                new_version,
+                old_git_info,
+                data_stage=(data_snapshot or {}).get("path"),
+                data_existed=(data_snapshot or {}).get("existed"),
             )
             shutil.rmtree(backup_dir, ignore_errors=True)
             passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
             warns = [c["detail"] for c in source_checks if c.get("warn")]
             result_msg = (
                 f"동일 ID ZIP을 감지하여 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
-                f"(관리 파일 {len(new_managed)}개 갱신, plugins/data/{plugin_id} 영속 데이터 보존, 검증 통과: {', '.join(passed)})"
+                f"(관리 파일 {len(new_managed)}개 갱신, 코드와 plugins/data/{plugin_id} 롤백 백업 생성, "
+                f"검증 통과: {', '.join(passed)})"
             )
             if force:
                 result_msg += " [경고] 검증 실패 항목을 무시하고 업데이트했습니다."
             if rollback_saved:
-                result_msg += f" 이전 버전(v{old_version}) 롤백 백업을 보관했습니다."
+                result_msg += f" 이전 버전(v{old_version})의 코드와 영속 데이터 롤백 백업을 보관했습니다."
             else:
-                result_msg += " 경고: 업데이트는 성공했지만 롤백 백업 저장에 실패했습니다."
+                result_msg += " 경고: 업데이트는 성공했지만 코드/데이터 롤백 백업 저장에 실패했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
             return True, result_msg
         except Exception as e:
             restored = False
             if os.path.isdir(backup_dir):
-                restored = self._restore_plugin_backup(backup_dir, dest_dir, plugin_id)
+                restored = self._restore_plugin_backup(
+                    backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
+                )
             return False, (
                 f"ZIP 플러그인 업데이트 중 오류가 발생했습니다: {str(e)} "
-                + ("(기존 버전 자동 복원 완료)" if restored else "(기존 버전 자동 복원 실패)")
+                + ("(기존 코드와 데이터 자동 복원 완료)" if restored else "(기존 버전 자동 복원 실패)")
             )
         finally:
             if os.path.exists(backup_dir):
                 shutil.rmtree(backup_dir, ignore_errors=True)
+            self._cleanup_plugin_data_snapshot(data_snapshot)
 
     def _install_from_zip(self, zip_data_b64, filename, db_type, force=False):
         """Zip 압축 파일 업로드를 통한 플러그인 설치
@@ -2495,7 +3024,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _update_plugin_raw_legacy(self, plugin_id, db_type):
         """구형 호환용 raw 파일 개별 다운로드 업데이트 경로.
 
-        저장소 ZIP 자체를 기술적으로 가져올 수 없는 경우에만 사용한다.
+        저장소 ZIP 자체를 기술적으로 가져올 수 없는 경우에만 사용한다. 다운로드한 파일을
+        임시 플러그인 트리에 적용한 뒤 공통 트랜잭션 업데이트 경로를 사용하므로 코드와
+        `plugins/data/<plugin_id>` 롤백 정책은 ZIP 업데이트와 동일하다.
         """
         pdir, err = self._validate_plugin_path(plugin_id)
         if err or not pdir:
@@ -2520,8 +3051,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             plugin_id, spec["raw_base_url"], spec.get("files"), db_type
         )
 
-        # Gitea 소스면 원격 VERSION 확인 단계부터 같은 호스트 토큰을 사용해야 한다.
-        # (비공개 저장소는 파일 다운로드 단계만 토큰을 붙이면 버전 판별이 먼저 실패함)
         gitea_token = None
         raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
         if raw_parsed:
@@ -2543,7 +3072,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"낮거나 같습니다."
             )
 
-        # 파일 다운로드 → 교체
         downloaded = {}
         for name in spec["files"]:
             file_url = f"{base_url.rstrip('/')}/{name}"
@@ -2556,25 +3084,37 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception as e:
                 return False, f"파일 다운로드 실패 ({name}): {str(e)}"
 
-        for name, content in downloaded.items():
-            fpath = os.path.join(pdir, name)
-            fdir = os.path.dirname(fpath)
-            if fdir and not os.path.exists(fdir):
-                os.makedirs(fdir, exist_ok=True)
-            with open(fpath, "w", encoding="utf-8", newline="") as f:
-                f.write(content)
-
-        # 핫 리로드 (업데이트 자체는 성공 유지, 리로드 실패는 경고로 포함)
-        reload_warning = ""
+        temp_root = tempfile.mkdtemp(prefix="bo_plugin_raw_update_")
         try:
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
-        except Exception as e:
-            reload_warning = f" (단, 리로드 실패: {str(e)})"
+            target_dir = os.path.join(temp_root, plugin_id)
+            shutil.copytree(pdir, target_dir, symlinks=True)
+            for name, content in downloaded.items():
+                rel = os.path.normpath(str(name)).lstrip("./").lstrip("/")
+                if not rel or rel.startswith(".."):
+                    return False, f"update_manifest.files에 유효하지 않은 경로가 포함되어 있습니다: {name}"
+                fpath = os.path.join(target_dir, rel)
+                os.makedirs(os.path.dirname(fpath) or target_dir, exist_ok=True)
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(content)
 
-        source_label = "릴리즈 태그" if base_url != spec["raw_base_url"] else "브랜치(main)"
-        return True, f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{remote_ver}, {source_label} 기준).{reload_warning}"
+            source_ok, source_checks = self._validate_plugin_source(target_dir, plugin_id)
+            if not source_ok:
+                details = [c.get("detail") for c in source_checks if not c.get("ok") and c.get("detail")]
+                return False, "raw 호환 업데이트 패키지 검증 실패: " + "; ".join(details[:4])
 
+            ok, msg = self._update_existing_from_zip(
+                target_dir, pdir, plugin_id, source_checks, db_type, force=False
+            )
+            if not ok:
+                return False, msg
+
+            source_label = "릴리즈 태그" if base_url != spec["raw_base_url"] else "브랜치(main)"
+            return True, (
+                f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{remote_ver}, {source_label} 기준). "
+                + msg
+            )
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     def _update_plugin(self, plugin_id, db_type):
         """저장소 ZIP 우선으로 최신 manifest를 적용하는 안전한 온라인 업데이트."""
@@ -2791,12 +3331,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, f"플러그인 토글 중 오류 발생: {str(e)}"
 
     # ------------------------------------------------------------------
-    # Plugin Source Meta (sqlite plugin_sources.db)
-    # .git_source/.zip_source 파일 대신 소스 메타를 DB에 저장.
+    # Plugin Source Meta (sqlite plugin_manager.db)
+    # .git_source/.zip_source 파일 대신 통합 DB의 plugin_sources 테이블에 저장.
     # 설치 후 최초 1회 레거시 파일 → DB 마이그레이션 수행.
 
     def _sources_init_db(self):
-        """plugin_sources.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _SOURCES_DB_LOCK"""
+        """통합 DB의 plugin_sources/source_meta 스키마를 보장한다."""
         db_path = self._get_sources_db_path()
         try:
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -2828,7 +3368,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     pass
                 conn.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS meta (
+                    CREATE TABLE IF NOT EXISTS source_meta (
                         key   TEXT PRIMARY KEY,
                         value TEXT
                     )
@@ -2839,7 +3379,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 conn.close()
 
     def _sources_db_query(self, sql, params=()):
-        """plugin_sources.db SELECT (락 내부, dict 리스트 반환)"""
+        """통합 DB의 plugin_sources SELECT (락 내부, dict 리스트 반환)"""
         self._sources_init_db()
         with _SOURCES_DB_LOCK:
             conn = sqlite3.connect(self._get_sources_db_path(), timeout=10)
@@ -2852,7 +3392,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 conn.close()
 
     def _sources_db_execute(self, sql, params=()):
-        """plugin_sources.db write (락 내부, commit)"""
+        """통합 DB의 plugin_sources write (락 내부, commit)"""
         self._sources_init_db()
         with _SOURCES_DB_LOCK:
             conn = sqlite3.connect(self._get_sources_db_path(), timeout=10)
@@ -2927,7 +3467,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _sources_meta_get(self, key):
         try:
-            rows = self._sources_db_query("SELECT value FROM meta WHERE key = ?", (key,))
+            rows = self._sources_db_query("SELECT value FROM source_meta WHERE key = ?", (key,))
             return rows[0]["value"] if rows else None
         except Exception:
             return None
@@ -2935,7 +3475,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _sources_meta_set(self, key, value):
         try:
             self._sources_db_execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, str(value))
+                "INSERT OR REPLACE INTO source_meta(key, value) VALUES(?, ?)", (key, str(value))
             )
         except Exception:
             pass
@@ -3003,7 +3543,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     # ------------------------------------------------------------------
     # Plugin Catalog (GitHub 토픽 기반 자동 수집 — 미설치 플러그인 발견)
-    # 설정(간격/토픽)은 코어 DB(gateway → MariaDB), 조회 결과만 catalog.db(sqlite)
+    # 설정·카탈로그·소스 메타는 plugin_manager.db(sqlite)에 통합 저장
     # ------------------------------------------------------------------
     def _catalog_full_name_from_url(self, git_url):
         """git_url → full_name (owner/repo). GitHub가 아니면 None."""
@@ -3016,7 +3556,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return None
 
     def _catalog_record_install_error(self, git_url, message):
-        """Git 설치 실패 메시지를 catalog.db repos.install_error에 저장 (최대 2000자)."""
+        """Git 설치 실패 메시지를 통합 DB repos.install_error에 저장 (최대 2000자)."""
         full_name = self._catalog_full_name_from_url(git_url)
         if not full_name:
             return
@@ -3043,7 +3583,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             pass
 
     def _catalog_init_db(self):
-        """catalog.db 스키마 보장 (WAL). 호출마다 CREATE IF NOT EXISTS — 접근은 _CATALOG_DB_LOCK"""
+        """통합 DB의 카탈로그 스키마를 보장한다."""
         db_path = self._get_catalog_db_path()
         try:
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -3102,7 +3642,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 conn.close()
 
     def _catalog_db_query(self, sql, params=()):
-        """catalog.db SELECT (락 내부, dict 리스트 반환)"""
+        """통합 DB SELECT (락 내부, dict 리스트 반환)"""
         with _CATALOG_DB_LOCK:
             conn = sqlite3.connect(self._get_catalog_db_path(), timeout=10)
             try:
@@ -3114,7 +3654,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 conn.close()
 
     def _catalog_db_execute(self, sql, params=()):
-        """catalog.db write (락 내부, commit)"""
+        """통합 DB write (락 내부, commit)"""
         with _CATALOG_DB_LOCK:
             conn = sqlite3.connect(self._get_catalog_db_path(), timeout=10)
             try:
@@ -3137,10 +3677,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, str(value))
         )
 
-    # ---- 설정 헬퍼 (catalog.db.settings 직접 사용) ----
+    # ---- 설정 헬퍼 (plugin_manager.db.settings 직접 사용) ----
 
     def _catalog_get_setting(self, key, default=None):
-        """catalog.db.settings에서 설정 값 조회"""
+        """통합 DB settings에서 설정 값을 조회한다."""
         try:
             rows = self._catalog_db_query(
                 "SELECT value FROM settings WHERE key=?", (key,)
@@ -3152,12 +3692,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return default
 
     def _catalog_set_setting(self, key, value):
-        """catalog.db.settings에 설정 값 저장"""
+        """통합 DB settings에 설정 값을 저장한다."""
         self._catalog_db_execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, str(value))
         )
 
-    # ---- 설정 (catalog.db.settings — 세션 독립적) ----
+    # ---- 설정 (plugin_manager.db.settings — 세션 독립적) ----
 
     def _catalog_clamp_interval(self, raw):
         """갱신 간격 1~24 클램프 (파싱 불가/빈 값이면 기본 6)"""
@@ -3297,7 +3837,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # ---- GitHub 조회 ----
 
     def _catalog_get_github_token(self, db_type):
-        """PM_GITHUB_TOKEN 조회 (catalog.db.settings). 설정돼 있으면 Bearer 헤더로 사용.
+        """PM_GITHUB_TOKEN 조회 (plugin_manager.db.settings). 설정돼 있으면 Bearer 헤더로 사용.
         토큰 사용 시 GitHub Search API 제한이 IP 기준이 아닌 계정 기준 5,000/hr가 되어
         공용/클라우드 IP 제한(403)에서 벗어난다."""
         raw = self._catalog_get_setting("PM_GITHUB_TOKEN", default=None)
@@ -3887,7 +4427,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # ---- 응답 병합 ----
 
     def _catalog_meta_dict(self, db_type):
-        """catalog_meta 응답 — 설정은 MariaDB에서, 상태는 catalog.db meta에서"""
+        """catalog_meta 응답 — 설정과 상태는 통합 DB에서"""
         meta = self._catalog_read_meta()
         refresh_state = meta.get("refresh_state", "idle")
         if refresh_state == "running":
@@ -4115,11 +4655,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             })
         return merged, self._catalog_meta_dict(db_type)
 
-    # ---- 설정 저장 (자체 save-config API — catalog.db.settings 직접 저장) ----
+    # ---- 설정 저장 (자체 save-config API — plugin_manager.db.settings 직접 저장) ----
 
     def _catalog_save_config(self, item_data, db_type):
         """
-        save_config — 간격(1~24 클램프)/토픽(정규화) 검증 후 catalog.db.settings에 저장.
+        save_config — 간격(1~24 클램프)/토픽(정규화) 검증 후 통합 DB settings에 저장.
         db_type 파라미터는 호환용으로 유지하지만 실제로는 세션 독립적 저장소 사용.
         """
         try:
