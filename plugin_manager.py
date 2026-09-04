@@ -2,6 +2,7 @@
 import os
 import sys
 import ast
+import hashlib
 import shutil
 import json
 import re
@@ -59,9 +60,11 @@ _CATALOG_DEFAULT_TOPICS = ["bookoasis-plugin"]
 _CATALOG_DEFAULT_INTERVAL_HOURS = 6
 _CATALOG_MIN_INTERVAL_HOURS = 1
 _CATALOG_MAX_INTERVAL_HOURS = 24
-# 백그라운드 루프 sleep 틱 — 60초 단위로 last_refresh 경과를 재확인해
-# 서버 재시작(스레드 재기동)에도 타이머 리셋 없이 interval 도달을 정확히 감지
+# 백그라운드 카탈로그 due 확인 주기는 기존 60초를 유지한다.
 _CATALOG_LOOP_TICK_SECONDS = 60
+# 플러그인 코드 교체 감지 주기. 평소에는 stat()만 수행하고 변경 후보가 있을 때만
+# SHA-256을 계산해 실제 코드가 달라졌는지 확인한다.
+_CATALOG_CODE_CHECK_SECONDS = 30
 _CATALOG_MAX_TOPICS = 5  # GitHub 비인증 Search API 분당 10회 제한 (토픽 수 + VERSION 검증 합계 한도 보호)
 _CATALOG_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # VERSION 재검증 TTL: 저장소가 20개를 넘어가면 24시간 이내 검증 결과 재사용
@@ -272,9 +275,71 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         호출하는 공식 생명주기 훅에서만 레거시 파일 정리와 백그라운드 스레드를 시작한다.
         카탈로그는 전역 관리 기능이므로 세션 종류와 무관하게 general 기준으로 동작한다.
         """
+        # 재시작 직전 구버전 스레드가 catalog.db/plugin_sources.db를 다시 만들었을 수 있다.
+        # 먼저 통합 마이그레이션을 재확인한 뒤, 통합 DB가 완전한 경우에만 active 레거시 DB를 정리한다.
+        self._run_migration_once()
+        self._cleanup_legacy_active_databases()
         self._cleanup_legacy_scripts_dir()
         self._ensure_catalog_routes()
         self._ensure_catalog_thread("general")
+
+    def _cleanup_legacy_active_databases(self):
+        """통합 DB 검증 성공 시 재생성된 active 레거시 DB만 제거한다.
+
+        `.bak` 백업은 보존한다. 통합 DB가 없거나 손상됐거나 마이그레이션 완료 표식/핵심
+        테이블이 하나라도 없으면 아무것도 삭제하지 않는다.
+        """
+        data_dir = self._get_data_dir()
+        unified_path = self._get_db_path()
+        required_tables = {"repos", "settings", "plugin_sources", "meta", "source_meta"}
+
+        if not os.path.isfile(unified_path):
+            return False
+
+        conn = None
+        try:
+            with _PM_DB_LOCK:
+                conn = sqlite3.connect(unified_path, timeout=10)
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or str(integrity[0]).strip().lower() != "ok":
+                    return False
+
+                table_names = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not required_tables.issubset(table_names):
+                    return False
+
+                migrated = conn.execute(
+                    "SELECT value FROM meta WHERE key=?",
+                    ("unified_db_migration_v1",),
+                ).fetchone()
+                if not migrated or str(migrated[0]).strip() != "1":
+                    return False
+        except Exception as e:
+            logger.warning("통합 DB 검증 실패로 레거시 active DB 정리를 건너뜁니다: %s", e)
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        removed = False
+        for name in ("catalog.db", "plugin_sources.db"):
+            path = os.path.join(data_dir, name)
+            # .bak/.bak.N 파일은 건드리지 않고 active 본체와 그 sidecar만 제거한다.
+            for target in (path, path + "-wal", path + "-shm"):
+                try:
+                    if os.path.isfile(target) or os.path.islink(target):
+                        os.remove(target)
+                        removed = True
+                except Exception as e:
+                    logger.warning("레거시 active DB 정리 실패 (%s): %s", target, e)
+        return removed
 
     def _cleanup_legacy_scripts_dir(self):
         """구버전 배포에서 남을 수 있는 플러그인 코드 폴더의 scripts 경로를 제거한다."""
@@ -4307,28 +4372,121 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception as e:
             return False, "카탈로그 갱신 시작 실패: {0}".format(e)
 
-    def _catalog_background_loop(self, db_type):
-        """백그라운드 갱신 루프 (daemon). 빈 DB면 즉시 1회, 이후 last_refresh 기준
-        interval 경과 시 갱신. sleep은 60초 단위로 쪼개 매번 경과 시간을 체크하므로
-        서버 재시작(스레드 재기동)에도 타이머가 0부터 리셋되지 않는다.
+    def _catalog_code_watch_paths(self):
+        """상시 카탈로그 스레드의 코드 세대를 판별할 Python/버전 파일 경로."""
+        plugin_file = os.path.abspath(__file__)
+        plugin_dir = os.path.dirname(plugin_file)
+        return (
+            plugin_file,
+            os.path.join(plugin_dir, "__init__.py"),
+            os.path.join(plugin_dir, "VERSION"),
+        )
 
-        - 루프 시작: last_refresh 읽어 (now - last_refresh) >= interval 이면 즉시 1회 갱신
-        - 이후: 60초 sleep 후 last_refresh 기준 경과 재확인 → 경과 시 refresh
-        - 사망 복구: 루프가 어떤 예외로든 종료되면 _CATALOG_THREAD_ALIVE를 False로 리셋 —
-          다음 _ensure_catalog_thread 호출에서 is_alive()가 False임을 확인하고 재시작한다.
+    def _catalog_code_stat_signature(self):
+        """30초 감시용 저비용 파일 서명. 파일 내용은 읽지 않는다."""
+        signature = []
+        for path in self._catalog_code_watch_paths():
+            name = os.path.basename(path)
+            try:
+                st = os.stat(path)
+                signature.append((
+                    name,
+                    int(getattr(st, "st_mtime_ns", 0)),
+                    int(getattr(st, "st_ctime_ns", 0)),
+                    int(st.st_size),
+                    int(getattr(st, "st_ino", 0)),
+                ))
+            except OSError:
+                signature.append((name, None, None, None, None))
+        return tuple(signature)
+
+    def _catalog_code_fingerprint(self):
+        """감시 대상 파일의 실제 내용을 묶어 SHA-256 fingerprint를 만든다."""
+        digest = hashlib.sha256()
+        for path in self._catalog_code_watch_paths():
+            digest.update(os.path.basename(path).encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except OSError:
+                digest.update(b"<missing>")
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _catalog_code_generation_changed(self, baseline_stat, baseline_fingerprint):
+        """stat 변화가 있을 때만 실제 fingerprint를 비교한다.
+
+        단순 재복사처럼 mtime/inode만 달라지고 내용이 같으면 새 stat을 baseline으로
+        갱신하고 계속 실행한다. 실제 내용이 달라졌으면 현재 스레드를 구세대로 판단한다.
+        반환: (changed, next_stat, next_fingerprint)
+        """
+        current_stat = self._catalog_code_stat_signature()
+        if current_stat == baseline_stat:
+            return False, baseline_stat, baseline_fingerprint
+
+        current_fingerprint = self._catalog_code_fingerprint()
+        if current_fingerprint != baseline_fingerprint:
+            return True, current_stat, current_fingerprint
+        return False, current_stat, baseline_fingerprint
+
+    def _catalog_background_loop(self, db_type):
+        """백그라운드 갱신 루프 (daemon).
+
+        - 시작 시 현재 코드 fingerprint를 세대 기준으로 저장한다.
+        - 30초마다 stat()으로 코드 교체 후보를 검사하고, 실제 내용이 바뀐 경우
+          이 구세대 스레드는 정상 종료한다.
+        - 기존 카탈로그 due 확인은 60초 주기를 유지한다.
+        - 다음 _ensure_catalog_thread 호출은 새 Provider 코드로 스레드를 다시 시작할 수 있다.
         """
         global _CATALOG_THREAD_ALIVE
+        generation_stat = self._catalog_code_stat_signature()
+        generation_fingerprint = self._catalog_code_fingerprint()
+        next_catalog_check = time.monotonic() + _CATALOG_LOOP_TICK_SECONDS
+
         try:
             self._catalog_init_db()
             rows = self._catalog_db_query("SELECT COUNT(*) AS c FROM repos")
             if not rows or int(rows[0]["c"] or 0) == 0:
+                changed, generation_stat, generation_fingerprint = (
+                    self._catalog_code_generation_changed(
+                        generation_stat, generation_fingerprint
+                    )
+                )
+                if changed:
+                    logger.info(
+                        "[PluginManager] 카탈로그 스레드 코드 변경 감지: 초기 갱신 전 종료"
+                    )
+                    _CATALOG_THREAD_ALIVE = False
+                    return
                 self._catalog_refresh_once(db_type)
         except Exception:
             pass
+
         try:
             while True:
-                # 60초 단위 sleep — 매 주기 last_refresh 기준 경과 체크 (재시작 견고)
-                time.sleep(_CATALOG_LOOP_TICK_SECONDS)
+                time.sleep(_CATALOG_CODE_CHECK_SECONDS)
+
+                changed, generation_stat, generation_fingerprint = (
+                    self._catalog_code_generation_changed(
+                        generation_stat, generation_fingerprint
+                    )
+                )
+                if changed:
+                    logger.info(
+                        "[PluginManager] 카탈로그 스레드 코드 변경 감지: 구세대 스레드 종료"
+                    )
+                    return
+
+                now_mono = time.monotonic()
+                if now_mono < next_catalog_check:
+                    continue
+                next_catalog_check = now_mono + _CATALOG_LOOP_TICK_SECONDS
+
                 try:
                     interval = self._catalog_get_interval_hours(db_type)
                     due = self._catalog_due_for_refresh(interval)
@@ -4336,6 +4494,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     due = True
                 if not due:
                     continue
+
                 # 실패 쿨다운: 마지막 실패(refresh_error 기록 시각) 이후
                 # _CATALOG_RETRY_COOLDOWN_SECONDS가 지나지 않았으면 재시도 보류.
                 try:
@@ -4351,15 +4510,39 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                             if (
                                 datetime.now(timezone.utc) - last_err
                             ).total_seconds() < _CATALOG_RETRY_COOLDOWN_SECONDS:
-                                continue  # 아직 쿨다운 중 — 다음 틱에 재확인
+                                continue
                 except Exception:
-                    pass  # 쿨다운 판정 실패 시 안전하게 갱신 진행
+                    pass
+
                 try:
+                    # 원격 갱신처럼 비용이 큰 작업을 시작하기 직전 한 번 더 세대를 확인한다.
+                    changed, generation_stat, generation_fingerprint = (
+                        self._catalog_code_generation_changed(
+                            generation_stat, generation_fingerprint
+                        )
+                    )
+                    if changed:
+                        logger.info(
+                            "[PluginManager] 카탈로그 스레드 코드 변경 감지: 갱신 전 종료"
+                        )
+                        return
+
                     self._catalog_refresh_once(db_type)
-                    # 카탈로그 갱신 직후 — 자동 업데이트 ON이면 설치 플러그인 일괄 갱신
+
+                    # 갱신 도중 코드가 교체됐다면 구세대 코드로 자동 업데이트를 이어가지 않는다.
+                    changed, generation_stat, generation_fingerprint = (
+                        self._catalog_code_generation_changed(
+                            generation_stat, generation_fingerprint
+                        )
+                    )
+                    if changed:
+                        logger.info(
+                            "[PluginManager] 카탈로그 스레드 코드 변경 감지: 자동 업데이트 전 종료"
+                        )
+                        return
+
                     self._catalog_run_auto_update(db_type)
                 except Exception:
-                    # 실패 시각을 기록해 다음 재시도를 쿨다운 (rate limit 악순환 방지)
                     try:
                         self._catalog_set_meta(
                             "last_refresh_error_at",
@@ -4370,7 +4553,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     except Exception:
                         pass
         finally:
-            _CATALOG_THREAD_ALIVE = False  # 루프 종료(사망) 시 재시작 가능하도록 리셋
+            _CATALOG_THREAD_ALIVE = False
 
     def _catalog_due_for_refresh(self, interval_hours):
         """last_refresh 기준 interval 경과 여부 — 재시작 후에도 정확 (타이머 리셋 무관).
