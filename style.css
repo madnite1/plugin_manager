@@ -1015,6 +1015,19 @@ input:checked + .pm-slider:before {
     cursor: help;
 }
 
+/* DNS/인터넷/원격 서버 등 일시적인 업데이트 확인 실패 — 저장소 차단과 구분 */
+.pm-update-check-failed-badge {
+    background: rgba(251, 191, 36, 0.15);
+    color: #fde047;
+    border: 1px solid rgba(251, 191, 36, 0.4);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+    white-space: nowrap;
+    cursor: help;
+}
+
 /* 교체 모달 */
 .pm-replace-modal {
     max-width: 560px;

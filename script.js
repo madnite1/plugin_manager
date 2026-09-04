@@ -543,7 +543,18 @@
                     // 성공 시 message에 결과 객체가 담김
                     const r = res && res.success ? res.message : null;
                     if (r && typeof r === 'object') {
-                        // 소스 교체 필요 (업데이트 차단) — 배지/버튼 표시
+                        clearCardUpdateStatus(p);
+                        p.check_status = r.check_status || null;
+                        p.latest_version = r.latest_version || p.version;
+
+                        // DNS/인터넷/timeout 등 일시적인 조회 실패는 저장소 차단으로 취급하지 않는다.
+                        if (r.update_check_failed) {
+                            p.update_check_failed = true;
+                            patchCardUpdateCheckFailed(p);
+                            return;
+                        }
+
+                        // 실제 저장소/업데이트 계약 확인이 필요한 경우만 차단 + 교체 후보 표시
                         if (r.update_blocked) {
                             p.update_blocked = true;
                             p.blocked_reason = r.blocked_reason;
@@ -678,17 +689,64 @@
         if (btn) bindUpdateButton(btn);
     }
 
-    // 업데이트 차단 + 소스 교체 후보 있음 — 배지 + 교체 버튼 (부분 DOM 패치)
+    function clearCardUpdateStatus(p) {
+        const card = document.getElementById(`pm-card-${p.id}`);
+        if (card) {
+            const idEl = card.querySelector('.pm-plugin-id');
+            if (idEl) {
+                idEl.querySelectorAll('.pm-blocked-badge, .pm-update-check-failed-badge').forEach(el => el.remove());
+            }
+            const actions = card.querySelector('.pm-card-action-btns');
+            if (actions) {
+                const replaceBtn = actions.querySelector('.pm-btn-replace');
+                if (replaceBtn) replaceBtn.remove();
+            }
+        }
+        p.update_blocked = false;
+        p.blocked_reason = null;
+        p.replace_candidates = [];
+        p.update_check_failed = false;
+    }
+
+    function getBlockedStatusInfo(reason) {
+        switch (reason) {
+            case 'no_source':
+                return { label: '저장소 정보 없음', title: '업데이트에 사용할 저장소 정보가 없습니다.' };
+            case 'http_404':
+                return { label: '저장소 확인 필요', title: '원격 저장소 또는 VERSION 파일을 찾을 수 없어 업데이트가 차단되었습니다.' };
+            case 'parse_failed':
+                return { label: '업데이트 정보 오류', title: '원격 VERSION 정보를 해석할 수 없어 업데이트가 차단되었습니다.' };
+            default:
+                return { label: '업데이트 차단', title: '원격 업데이트 정보를 확인할 수 없어 업데이트가 차단되었습니다.' };
+        }
+    }
+
+    function blockedBadgeHtml(reason) {
+        const info = getBlockedStatusInfo(reason);
+        return ` <span class="pm-badge pm-blocked-badge" title="${escapeHtmlAttr(info.title)}">${escapeHtml(info.label)}</span>`;
+    }
+
+    function updateCheckFailedBadgeHtml() {
+        return ' <span class="pm-badge pm-update-check-failed-badge" title="DNS, 인터넷 연결 또는 원격 서버의 일시적인 문제로 업데이트 확인에 실패했습니다. 저장소 연결은 차단하지 않습니다.">업데이트 확인 실패</span>';
+    }
+
+    function patchCardUpdateCheckFailed(p) {
+        const card = document.getElementById(`pm-card-${p.id}`);
+        if (!card) return;
+        const idEl = card.querySelector('.pm-plugin-id');
+        if (idEl && !idEl.querySelector('.pm-update-check-failed-badge')) {
+            idEl.insertAdjacentHTML('beforeend', updateCheckFailedBadgeHtml());
+        }
+    }
+
+    // 업데이트 차단 + 소스 교체 후보 있음 — 원인별 배지 + 교체 버튼 (부분 DOM 패치)
     function patchCardReplace(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (!card) return;
-        // 배지 (ID 줄 옆)
         const idEl = card.querySelector('.pm-plugin-id');
         if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
-                        idEl.insertAdjacentHTML('beforeend',
-                            ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>');
-                    }
-        // 교체 버튼
+            idEl.insertAdjacentHTML('beforeend', blockedBadgeHtml(p.blocked_reason));
+        }
         const actions = card.querySelector('.pm-card-action-btns');
         if (!actions || actions.querySelector('.pm-btn-replace')) return;
         actions.insertAdjacentHTML('afterbegin',
@@ -699,15 +757,14 @@
         if (btn) bindReplaceButton(btn);
     }
 
-    // 업데이트 차단 + 후보 없음 — 배지만 표시 (후보 없으면 교체 버튼 없음)
+    // 업데이트 차단 + 후보 없음 — 원인별 배지만 표시
     function patchCardBlocked(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (!card) return;
         const idEl = card.querySelector('.pm-plugin-id');
         if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
-                        idEl.insertAdjacentHTML('beforeend',
-                            ' <span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>');
-                    }
+            idEl.insertAdjacentHTML('beforeend', blockedBadgeHtml(p.blocked_reason));
+        }
     }
 
     // 카운트 배지 업데이트
@@ -915,9 +972,9 @@
                    </button>`
                 : '';
 
-            const blockedBadge = p.update_blocked
-                ? '<span class="pm-badge pm-badge-danger pm-blocked-badge" title="업데이트가 차단됨 — 원격 저장소에 문제가 있습니다">저장소 연결 안됨</span>'
-                : '';
+            const updateStatusBadge = p.update_check_failed
+                ? updateCheckFailedBadgeHtml()
+                : (p.update_blocked ? blockedBadgeHtml(p.blocked_reason) : '');
 
 
 
@@ -952,7 +1009,7 @@
                                 </div>
                                 <div>
                                     <h4 class="pm-plugin-name">${p.name}</h4>
-                                    <span class="pm-plugin-id">${p.id} • v${p.version}</span>
+                                    <span class="pm-plugin-id">${p.id} • v${p.version}${updateStatusBadge}</span>
                                 </div>
                             </div>
                             ${settingsBtnHtml}
@@ -976,6 +1033,7 @@
                             <span>${p.enabled ? '사용 중' : '중지됨'}</span>
                         </div>
                         <div class="pm-card-action-btns">
+                            ${replaceBtnHtml}
                             ${updateBtnHtml}
                             ${rollbackBtnHtml}
                             ${deleteBtnHtml}

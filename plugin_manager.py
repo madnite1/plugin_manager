@@ -1166,10 +1166,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _fetch_remote_plugin_version(self, base_url, version_file="VERSION", version_key="plugin version", token=None):
+    def _fetch_remote_plugin_version(
+        self, base_url, version_file="VERSION", version_key="plugin version", token=None,
+        raise_fetch_error=False,
+    ):
         """원격 VERSION 조회. 같은 URL의 최근 성공 결과는 짧게 재사용한다.
 
         token은 Gitea 인증용이며 캐시 키에는 토큰 자체를 포함하지 않는다.
+        raise_fetch_error=True이면 DNS/timeout/HTTP 오류를 호출자에게 전달해
+        VERSION 파싱 실패와 일시적인 통신 실패를 구분할 수 있게 한다.
         """
         url = f"{base_url.rstrip('/')}/{version_file}"
         cache_key = (url, str(version_key or "plugin version"))
@@ -1182,6 +1187,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             remote_version = self._parse_remote_version(self._fetch_text(url, token=token), version_key)
         except Exception:
+            if raise_fetch_error:
+                raise
             return None
 
         if remote_version:
@@ -1235,9 +1242,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if latest_version:
             result["latest_version"] = latest_version
 
-        # B/C 판정: fetch 실패 (404/저장소 삭제/버전 파싱 실패) + A: 소스 메타 없음
+        # 조회 결과를 프론트가 원인별로 구분할 수 있도록 그대로 전달한다.
+        result["check_status"] = fetch_status
+
+        # DNS/인터넷/timeout 등 일시적인 통신 장애는 저장소 자체의 문제로 간주하지 않는다.
+        # 따라서 업데이트를 차단하거나 저장소 교체 후보를 제안하지 않고 재확인 가능한 상태로만 표시한다.
+        if fetch_status == "fetch_failed":
+            result["update_check_failed"] = True
+            return True, result
+
+        # 저장소 메타 부재, 명확한 404, VERSION 파싱 실패는 실제 업데이트 경로 확인이 필요한 상태다.
         blocked_reason = None
-        if fetch_status in ("no_source", "http_404", "fetch_failed", "parse_failed"):
+        if fetch_status in ("no_source", "http_404", "parse_failed"):
             blocked_reason = fetch_status
         if not has_manifest and blocked_reason is None:
             # update_manifest 자체가 없으면 업데이트 계약 부재 — 교체 제안 대상은 아니나 정보성 표시
@@ -1308,6 +1324,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     version_file=spec["version_file"],
                     version_key=spec["version_key"],
                     token=gitea_token,
+                    raise_fetch_error=True,
                 )
             except HTTPError as e:
                 if e.code == 404:
