@@ -23,13 +23,13 @@ logger = logging.getLogger(__name__)
 _RELEASE_TAG_CACHE = {}
 _RELEASE_TAG_CACHE_TTL = 300  # 초
 
-# Provider 클래스 discovery 결과 캐시.
+# Provider 정적 메타데이터 AST 스캔 결과 캐시.
 # 목록 로드 직후 개별 업데이트 체크가 수십 번 연속 호출되므로 매 요청마다
-# MetadataFactory._discover_provider_classes()로 전체 플러그인을 다시 스캔하지 않는다.
-_PROVIDER_CLASS_CACHE = {}
-_PROVIDER_CLASS_CACHE_AT = 0.0
-_PROVIDER_CLASS_CACHE_TTL = 60  # 초
-_PROVIDER_CLASS_CACHE_LOCK = threading.Lock()
+# 설치된 플러그인 Python 소스를 다시 파싱하지 않는다.
+_PROVIDER_META_CACHE = {}
+_PROVIDER_META_CACHE_AT = 0.0
+_PROVIDER_META_CACHE_TTL = 60  # 초
+_PROVIDER_META_CACHE_LOCK = threading.Lock()
 
 # 원격 VERSION 짧은 TTL 캐시. 화면 재진입/카탈로그 폴링 직후 동일 URL을
 # 다시 요청하는 것을 막되 업데이트 반영 지연은 짧게 유지한다.
@@ -604,36 +604,143 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             finally:
                 conn.close()
 
-    def _discover_provider_map(self, refresh=False):
-        """설치된 Provider 클래스를 ID 기준 dict로 반환한다.
+    def _extract_provider_metadata(self, plugin_dir):
+        """Provider 클래스의 공개 선언을 코드를 실행하지 않고 AST로 읽는다."""
+        if not os.path.isdir(plugin_dir):
+            return None
 
-        목록 로드에서는 refresh=True로 실제 discovery를 1회 수행하고, 곧이어 발생하는
-        개별 업데이트 체크 요청들은 캐시를 재사용한다.
-        """
-        global _PROVIDER_CLASS_CACHE, _PROVIDER_CLASS_CACHE_AT
+        fields = {
+            "id", "name", "is_searchable", "config_schema",
+            "category_tab", "dashboard_widget", "update_manifest",
+        }
+        try:
+            for fname in sorted(os.listdir(plugin_dir)):
+                if not fname.endswith(".py") or fname in ("__init__.py", "base.py"):
+                    continue
+                fpath = os.path.join(plugin_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        tree = ast.parse(f.read(), filename=fpath)
+                except (OSError, SyntaxError):
+                    continue
+
+                module_strings = self._extract_module_string_constants(tree)
+                for node in getattr(tree, "body", []):
+                    if not isinstance(node, ast.ClassDef):
+                        continue
+                    try:
+                        is_provider = any(
+                            "BaseMetadataProvider" in ast.unparse(base)
+                            for base in node.bases
+                        )
+                    except Exception:
+                        is_provider = False
+                    if not is_provider:
+                        continue
+
+                    meta = {
+                        "id": None,
+                        "name": None,
+                        "is_searchable": False,
+                        "config_schema": [],
+                        "category_tab": None,
+                        "dashboard_widget": None,
+                        "update_manifest": None,
+                        "class_name": node.name,
+                        "source_file": fname,
+                    }
+                    for stmt in node.body:
+                        value_node = None
+                        target_name = None
+                        if isinstance(stmt, ast.Assign):
+                            value_node = stmt.value
+                            for target in stmt.targets:
+                                if isinstance(target, ast.Name) and target.id in fields:
+                                    target_name = target.id
+                                    break
+                        elif (
+                            isinstance(stmt, ast.AnnAssign)
+                            and isinstance(stmt.target, ast.Name)
+                            and stmt.target.id in fields
+                        ):
+                            target_name = stmt.target.id
+                            value_node = stmt.value
+
+                        if not target_name or value_node is None:
+                            continue
+                        if target_name in ("id", "name"):
+                            value = self._resolve_static_string(value_node, module_strings)
+                        else:
+                            try:
+                                value = ast.literal_eval(value_node)
+                            except Exception:
+                                value = None
+                        if value is not None:
+                            meta[target_name] = value
+
+                    plugin_id = str(meta.get("id") or "").strip()
+                    if not plugin_id or not re.fullmatch(r"[A-Za-z0-9_-]+", plugin_id):
+                        continue
+                    meta["id"] = plugin_id
+                    if not isinstance(meta.get("name"), str) or not meta["name"].strip():
+                        meta["name"] = plugin_id
+                    return meta
+        except Exception as e:
+            logger.warning("Provider 정적 메타데이터 분석 실패 (%s): %s", plugin_dir, e)
+        return None
+
+    def _verify_installed_plugin_static(self, plugin_dir, plugin_id, expected_version=None):
+        """파일 교체 후 Provider id와 선택적 VERSION을 정적으로 재확인한다."""
+        meta = self._extract_provider_metadata(plugin_dir)
+        if not meta:
+            return False, "BaseMetadataProvider 구현 클래스를 정적으로 확인할 수 없습니다."
+        if str(meta.get("id") or "") != str(plugin_id):
+            return False, f"Provider id 불일치: {meta.get('id') or '없음'}"
+        if expected_version is not None:
+            actual_version = self._read_local_plugin_version(plugin_dir, "VERSION", "plugin version")
+            if str(actual_version or "") != str(expected_version):
+                return False, f"VERSION 불일치 (기대 {expected_version}, 실제 {actual_version or '알 수 없음'})"
+        return True, None
+
+    def _hot_reload_plugin(self, plugin_id):
+        """공식 대체 계약이 아직 없는 기존 BookOasis hot reload 호출의 단일 격리 지점."""
+        from services.metadata_factory import MetadataFactory
+        return MetadataFactory.hot_reload_plugin(plugin_id)
+
+    def _discover_provider_map(self, refresh=False):
+        """설치된 Provider 공개 선언을 ID 기준 정적 메타데이터 dict로 반환한다."""
+        global _PROVIDER_META_CACHE, _PROVIDER_META_CACHE_AT
         now = time.monotonic()
-        with _PROVIDER_CLASS_CACHE_LOCK:
+        with _PROVIDER_META_CACHE_LOCK:
             if (
                 not refresh
-                and _PROVIDER_CLASS_CACHE
-                and (now - _PROVIDER_CLASS_CACHE_AT) < _PROVIDER_CLASS_CACHE_TTL
+                and _PROVIDER_META_CACHE
+                and (now - _PROVIDER_META_CACHE_AT) < _PROVIDER_META_CACHE_TTL
             ):
-                return dict(_PROVIDER_CLASS_CACHE)
+                return dict(_PROVIDER_META_CACHE)
 
-            discovered_classes = {}
+            discovered = {}
+            base_dir = self._get_plugins_base_dir()
             try:
-                from services.metadata_factory import MetadataFactory
-                for p_name, target_cls in MetadataFactory._discover_provider_classes():
-                    p_id = getattr(target_cls, "id", p_name)
-                    discovered_classes[p_id] = target_cls
+                for entry in sorted(os.listdir(base_dir)):
+                    if entry.startswith(".") or entry == "__pycache__":
+                        continue
+                    plugin_dir = os.path.join(base_dir, entry)
+                    if not os.path.isdir(plugin_dir):
+                        continue
+                    meta = self._extract_provider_metadata(plugin_dir)
+                    if meta:
+                        discovered[str(meta["id"])] = meta
             except Exception as e:
-                print(f"[PluginManager] Discover provider classes error: {e}")
-                if _PROVIDER_CLASS_CACHE:
-                    return dict(_PROVIDER_CLASS_CACHE)
+                logger.warning("Provider 정적 discovery 실패: %s", e)
+                if _PROVIDER_META_CACHE:
+                    return dict(_PROVIDER_META_CACHE)
 
-            _PROVIDER_CLASS_CACHE = discovered_classes
-            _PROVIDER_CLASS_CACHE_AT = now
-            return dict(discovered_classes)
+            _PROVIDER_META_CACHE = discovered
+            _PROVIDER_META_CACHE_AT = now
+            return dict(discovered)
 
     def _list_plugins(self, db_type):
             """설치된 전체 메타데이터 플러그인 상세 정보 수집"""
@@ -643,8 +750,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not os.path.exists(base_dir):
                 return plugins
 
-            # 목록 로드 시 discovery를 딱 한 번 갱신한다. 이후 check_update 배치는 이 캐시를 재사용한다.
-            discovered_classes = self._discover_provider_map(refresh=True)
+            # 목록 로드 시 AST 메타데이터를 한 번 갱신한다. 이후 check_update 배치는 이 캐시를 재사용한다.
+            discovered_meta = self._discover_provider_map(refresh=True)
 
             gateway = self.get_db_gateway(db_type)
             # 모든 카드에 동일한 설정값이므로 플러그인마다 통합 DB를 다시 조회하지 않는다.
@@ -658,7 +765,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     continue
 
                 plugin_id = entry
-                cls_obj = discovered_classes.get(plugin_id)
+                provider_meta = discovered_meta.get(plugin_id) or {}
 
                 # 1. 버전 읽기
                 version = "1.0.0"
@@ -671,26 +778,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     except Exception:
                         pass
 
-                # 2. 메타 정보
-                name = getattr(cls_obj, "name", plugin_id) if cls_obj else plugin_id
-                is_searchable = getattr(cls_obj, "is_searchable", True) if cls_obj else False
-                category_tab = cls_obj.__dict__.get("category_tab", None) if cls_obj else None
-                dashboard_widget = getattr(cls_obj, "dashboard_widget", None) if cls_obj else None
-                update_manifest = getattr(cls_obj, "update_manifest", None) if cls_obj else None
+                # 2. 메타 정보 — Provider 코드를 import하지 않고 AST 공개 선언만 사용한다.
+                name = str(provider_meta.get("name") or plugin_id)
+                is_searchable = bool(provider_meta.get("is_searchable", False))
+                category_tab = provider_meta.get("category_tab")
+                dashboard_widget = provider_meta.get("dashboard_widget")
+                update_manifest = provider_meta.get("update_manifest")
 
-                # 2-1. 설정 항목 보유 여부 (config_schema 또는 커스텀 설정 UI 번들)
-                has_config = False
-                if cls_obj is not None:
-                    # 클래스 __dict__ 직접 접근: 동적 디스크립터(config_schema descriptor)의
-                    # __get__ 실행(DB 조회 등)을 유발하지 않고 선언 유무만 판별
-                    raw_schema = getattr(cls_obj, "__dict__", {}).get("config_schema", [])
-                    has_config = bool(raw_schema)
-                    if not has_config:
-                        try:
-                            from services.metadata_factory import MetadataFactory
-                            has_config = bool(MetadataFactory._load_plugin_ui_bundle(plugin_id, target="settings"))
-                        except Exception:
-                            has_config = False
+                # 2-1. config_schema 또는 공식 커스텀 설정 UI(settings.html) 보유 여부
+                raw_schema = provider_meta.get("config_schema")
+                has_config = bool(raw_schema) or os.path.isfile(os.path.join(full_path, "settings.html"))
 
                 # 3. 활성화 상태
                 enabled_raw = gateway.get_setting(f"PLUGIN_ENABLED_{plugin_id}", default="1")
@@ -1112,8 +1209,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception:
                 pass
 
-        # 목록 로드에서 만든 Provider 맵을 재사용해 전체 플러그인 재스캔을 피한다.
-        cls_obj = self._discover_provider_map(refresh=False).get(plugin_id)
+        # 목록 로드에서 만든 정적 Provider 메타데이터 맵을 재사용한다.
+        provider_meta = self._discover_provider_map(refresh=False).get(plugin_id) or {}
 
         result = {
             "plugin_id": plugin_id,
@@ -1129,10 +1226,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             git_info = self._read_git_source_info(plugin_id)
         except Exception:
             git_info = None
-        has_manifest = bool(getattr(cls_obj, "update_manifest", None) if cls_obj else None)
+        has_manifest = bool(provider_meta.get("update_manifest"))
 
         has_update, latest_version, fetch_status = self._check_plugin_update_detail(
-            plugin_id, version, cls_obj, db_type
+            plugin_id, version, provider_meta, db_type
         )
         result["has_update"] = has_update
         if latest_version:
@@ -1156,7 +1253,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         return True, result
 
-    def _check_plugin_update_detail(self, plugin_id, local_version, cls_obj, db_type=None):
+    def _check_plugin_update_detail(self, plugin_id, local_version, provider_meta, db_type=None):
         """_check_plugin_update 확장 — 업데이트 가능 여부 + fetch 상태 분류.
 
         반환: (has_update, latest_version, fetch_status)
@@ -1172,7 +1269,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         latest_version = local_version
         fetch_status = "no_manifest"
 
-        update_manifest = getattr(cls_obj, "update_manifest", None) if cls_obj else None
+        update_manifest = provider_meta.get("update_manifest") if isinstance(provider_meta, dict) else None
         if not (update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled")):
             return has_update, latest_version, fetch_status
 
@@ -1226,13 +1323,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return has_update, latest_version, "fetch_failed"
 
-    def _check_plugin_update(self, plugin_id, local_version, cls_obj, db_type=None):
+    def _check_plugin_update(self, plugin_id, local_version, provider_meta, db_type=None):
         """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)
 
         레거시 호환 래퍼 — 내부적으로 상세 판정 사용, fetch_status 무시.
         """
         has_update, latest_version, _status = self._check_plugin_update_detail(
-            plugin_id, local_version, cls_obj, db_type
+            plugin_id, local_version, provider_meta, db_type
         )
         return has_update, latest_version
 
@@ -1691,13 +1788,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             elif previous_source is None:
                 self._sources_delete(plugin_id)
 
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
-            providers = MetadataFactory.get_available_providers()
-            loaded_ok = any(str(x.get("id")) == plugin_id for x in providers)
-            restored_ver = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version")
-            if not loaded_ok or (previous_version != "알 수 없음" and restored_ver != previous_version):
-                raise RuntimeError(f"롤백 후 검증 실패 (기대 {previous_version}, 실제 {restored_ver or '알 수 없음'})")
+            self._hot_reload_plugin(plugin_id)
+            expected_restored_version = None if previous_version == "알 수 없음" else previous_version
+            verified_ok, verify_error = self._verify_installed_plugin_static(
+                dest_dir, plugin_id, expected_version=expected_restored_version
+            )
+            if not verified_ok:
+                raise RuntimeError(f"롤백 후 정적 검증 실패: {verify_error}")
 
             # 롤백은 업데이트 시 생성된 직전 상태 백업을 1회 소비한다.
             # 방금 사용하던 업데이트 버전은 새 롤백 슬롯으로 남기지 않으며,
@@ -1729,8 +1826,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     self._sources_set(plugin_id, current_source)
                 elif current_source is None:
                     self._sources_delete(plugin_id)
-                from services.metadata_factory import MetadataFactory
-                MetadataFactory.hot_reload_plugin(plugin_id)
+                self._hot_reload_plugin(plugin_id)
                 recovered = True
             except Exception:
                 logger.exception("롤백 실패 후 현재 코드/데이터 복구 실패 (id=%s)", plugin_id)
@@ -1754,8 +1850,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 )
 
             try:
-                from services.metadata_factory import MetadataFactory
-                MetadataFactory.hot_reload_plugin(plugin_id)
+                self._hot_reload_plugin(plugin_id)
             except Exception:
                 logger.warning("업데이트 롤백 후 플러그인 리로드 실패 (id=%s)", plugin_id, exc_info=True)
             return True
@@ -1859,29 +1954,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 self._copy_managed_file(target_plugin_dir, dest_dir, rel)
 
             self.get_db_gateway('general').set_setting(enabled_key, old_enabled)
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
+            self._hot_reload_plugin(plugin_id)
 
-            loaded_ok = False
-            try:
-                providers = MetadataFactory.get_available_providers()
-                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
-                if loaded_ok and plugin_id == "plugin_manager":
-                    _, reloaded_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
-                    loaded_ok = str(getattr(reloaded_cls, "id", "")) == plugin_id
-                    applied_ver = self._read_local_plugin_version(
-                        dest_dir, "VERSION", "plugin version"
-                    )
-                    loaded_ok = loaded_ok and applied_ver == self_target_version
-            except Exception as e:
-                logger.warning("ZIP 업데이트 후 플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
-
-            if not loaded_ok:
+            expected_version = self_target_version if plugin_id == "plugin_manager" else None
+            verified_ok, verify_error = self._verify_installed_plugin_static(
+                dest_dir, plugin_id, expected_version=expected_version
+            )
+            if not verified_ok:
+                logger.warning("ZIP 업데이트 후 플러그인 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
                 restored = self._restore_plugin_backup(
                     backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
                 )
                 return False, (
-                    f"검증 실패: '{plugin_id}' ZIP 업데이트 후 플러그인이 로드되지 않았습니다. "
+                    f"검증 실패: '{plugin_id}' ZIP 업데이트 후 설치 파일의 Provider 계약을 확인할 수 없습니다. "
                     + ("기존 코드와 데이터로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
                 )
 
@@ -2011,23 +2096,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
 
-            # Hot reload
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
+            # Hot reload (공식 대체 계약이 없어 현재 유일하게 남기는 코어 내부 호출)
+            self._hot_reload_plugin(plugin_id)
 
-            # 2차 검증: 실제 플러그인 로드 확인 (실패 시 설치 폴더 삭제)
-            loaded_ok = False
-            try:
-                providers = MetadataFactory.get_available_providers()
-                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
-            except Exception as e:
-                logger.warning("플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
-
-            if not loaded_ok:
+            # 2차 검증: 설치된 파일에서 Provider 계약을 다시 정적으로 확인한다.
+            verified_ok, verify_error = self._verify_installed_plugin_static(dest_dir, plugin_id)
+            if not verified_ok:
+                logger.warning("플러그인 설치 후 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
                 if os.path.exists(dest_dir):
                     shutil.rmtree(dest_dir, ignore_errors=True)
                 return False, (
-                    f"검증 실패: '{plugin_id}' 플러그인이 설치 후 로드되지 않았습니다. "
+                    f"검증 실패: '{plugin_id}' 설치 파일의 Provider 계약을 확인할 수 없습니다. "
                     f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
                 )
 
@@ -2308,19 +2387,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             # 9. 활성화 + 핫 리로드
             self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
+            self._hot_reload_plugin(plugin_id)
 
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
-
-            # 2차 검증: 실제 플러그인 로드 확인 (실패 시 설치 폴더 삭제 — zip 설치와 동일 기준)
-            loaded_ok = False
-            try:
-                providers = MetadataFactory.get_available_providers()
-                loaded_ok = any(str(p.get("id")) == plugin_id for p in providers)
-            except Exception as e:
-                logger.warning("플러그인 로드 검증 실패 (id=%s): %s", plugin_id, e)
-
-            if not loaded_ok:
+            # 2차 검증: 설치된 파일에서 Provider 계약을 다시 정적으로 확인한다.
+            verified_ok, verify_error = self._verify_installed_plugin_static(dest_dir, plugin_id)
+            if not verified_ok:
+                logger.warning("Git 설치 후 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
                 if os.path.exists(dest_dir):
                     shutil.rmtree(dest_dir, ignore_errors=True)
                 if backup_dir and os.path.isdir(backup_dir):
@@ -2330,7 +2402,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     except Exception as rb_e:
                         print(f"[PluginManager] replace rollback copy error: {rb_e}")
                 return False, (
-                    f"검증 실패: '{plugin_id}' 플러그인이 설치 후 로드되지 않았습니다. "
+                    f"검증 실패: '{plugin_id}' 설치 파일의 Provider 계약을 확인할 수 없습니다. "
                     f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
                 )
 
@@ -3100,13 +3172,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not os.path.exists(pdir):
             return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
 
-        try:
-            from services.metadata_factory import MetadataFactory
-            _, target_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
-        except Exception as e:
-            return False, f"플러그인 로드 실패: {e}"
-
-        manifest = getattr(target_cls, "update_manifest", None)
+        _manifest_files, manifest = self._extract_update_manifest_files(pdir)
         spec = self._build_update_spec(plugin_id, manifest)
         if not spec:
             return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
@@ -3189,14 +3255,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not os.path.isdir(pdir):
             return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
 
-        # 현재 설치본 manifest는 로컬 버전과 raw fallback 계약 확인에만 사용한다.
-        try:
-            from services.metadata_factory import MetadataFactory
-            _, target_cls = MetadataFactory._import_provider_module_and_class(plugin_id)
-        except Exception as e:
-            return False, f"플러그인 로드 실패: {e}"
-
-        old_manifest = getattr(target_cls, "update_manifest", None)
+        # 현재 설치본 manifest는 코드를 import하지 않고 AST로 읽는다.
+        _old_manifest_files, old_manifest = self._extract_update_manifest_files(pdir)
         old_spec = self._build_update_spec(plugin_id, old_manifest)
         if not old_spec:
             return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
@@ -3370,8 +3430,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             shutil.rmtree(pdir)
             self._sources_delete(plugin_id)  # 소스 메타(sqlite)도 함께 정리
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
+            self._hot_reload_plugin(plugin_id)
             return True, f"플러그인 '{plugin_id}' 코드가 삭제되었습니다. 영속 데이터(plugins/data/{plugin_id})는 보존됩니다."
         except Exception as e:
             return False, f"플러그인 삭제 실패: {str(e)}"
@@ -3387,8 +3446,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"PLUGIN_ENABLED_{plugin_id}", str(enabled_val)
             )
 
-            from services.metadata_factory import MetadataFactory
-            MetadataFactory.hot_reload_plugin(plugin_id)
+            self._hot_reload_plugin(plugin_id)
 
             status_text = "활성화" if str(enabled_val) == "1" else "비활성화"
             return True, f"플러그인 '{plugin_id}' 상태가 '{status_text}'로 변경되었습니다."
@@ -4941,16 +4999,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             payload = request.get_json(silent=True) or {}
             db_type = str(payload.get("type") or "general").strip() or "general"
-            # 핫 리로드 등으로 현재 인스턴스가 최신이 아닐 수 있으므로 MetadataFactory 최신 provider로 위임 시도
+            # _ensure_catalog_routes()가 hot reload 후 app.view_functions를 최신 self로 갱신한다.
             target_inst = self
-            try:
-                from services.metadata_factory import MetadataFactory
-                latest = MetadataFactory.get_provider_by_id(self.id)
-                if latest and hasattr(latest, "_catalog_save_config"):
-                    target_inst = latest
-            except Exception:
-                pass
-
             ok, msg = target_inst._catalog_save_config(payload, db_type)
             if not ok:
                 return jsonify({"success": False, "error": msg})
