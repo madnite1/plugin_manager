@@ -1094,11 +1094,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         parsed["base"], parsed["owner"], parsed["repo"], token
                     )
                 if tag:
-                    # Gitea raw URL은 /raw/branch/<branch> 형식, GitHub는 /raw.githubusercontent.com/.../<branch>
+                    # Gitea는 브랜치와 태그 raw 경로가 다르다:
+                    # /raw/branch/<branch> → /raw/tag/<tag>.
+                    # GitHub는 raw URL의 ref 세그먼트만 태그로 교체하면 된다.
                     if parsed["type"] == "gitea" and "/raw/branch/" in raw_base_url:
                         return raw_base_url.replace(
                             raw_prefix + "/branch/" + branch,
-                            raw_prefix + "/branch/" + tag,
+                            raw_prefix + "/tag/" + tag,
                             1,
                         )
                     return raw_base_url.replace(
