@@ -531,6 +531,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 git_url        TEXT,
                 branch         TEXT,
                 update_channel TEXT DEFAULT 'branch',
+                update_channel_explicit INTEGER DEFAULT 0,
                 manifest_files TEXT,
                 installed_at   TEXT
             )
@@ -540,6 +541,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             source_cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
             if "update_channel" not in source_cols:
                 conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel TEXT DEFAULT 'branch'")
+            if "update_channel_explicit" not in source_cols:
+                conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel_explicit INTEGER DEFAULT 0")
+                conn.execute(
+                    "UPDATE plugin_sources SET update_channel_explicit = "
+                    "CASE WHEN lower(COALESCE(update_channel, '')) IN ('release', 'tag') THEN 1 ELSE 0 END"
+                )
             for drop_col in ("source_type", "filename"):
                 if drop_col in source_cols:
                     conn.execute("ALTER TABLE plugin_sources DROP COLUMN {0}".format(drop_col))
@@ -819,7 +826,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 if git_info:
                     git_url = str(git_info.get("git_url") or "").strip() or None
                 update_channel = self._normalize_update_channel((git_info or {}).get("update_channel"))
-                effective_update_channel = update_channel if update_path_selection else "branch"
+                default_update_channel = self._default_update_channel(git_url)
+                effective_update_channel = self._effective_update_channel(git_info, update_path_selection)
 
                 # 4-2. monorepo 서브디렉토리 플러그인은 update_manifest 있어도 업데이트 불가 처리
                 _is_monorepo_subdir = False
@@ -846,6 +854,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
                     "update_channel": update_channel,
+                    "update_channel_explicit": bool((git_info or {}).get("update_channel_explicit")),
+                    "default_update_channel": default_update_channel,
                     "effective_update_channel": effective_update_channel,
                     "has_rollback": bool(rollback_info) if rollback_enabled else False,
                     "rollback_version": (rollback_info or {}).get("from_version") if rollback_enabled else None,
@@ -983,8 +993,24 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         channel = str(value or "branch").strip().lower()
         return channel if channel in _UPDATE_CHANNELS else "branch"
 
+    def _default_update_channel(self, git_url):
+        """저장소 owner 기준 기본 업데이트 경로를 반환한다."""
+        parsed = self._parse_git_repo(git_url)
+        if parsed and str(parsed.get("owner") or "").strip().lower() == "madnite1":
+            return "release"
+        return "branch"
+
+    def _effective_update_channel(self, git_info, selection_enabled):
+        """명시 선택값이 있으면 우선하고, 아니면 저장소 owner 기본값을 사용한다."""
+        info = git_info or {}
+        git_url = str(info.get("git_url") or "").strip()
+        default_channel = self._default_update_channel(git_url)
+        if selection_enabled and bool(info.get("update_channel_explicit")):
+            return self._normalize_update_channel(info.get("update_channel"))
+        return default_channel
+
     def _catalog_get_update_path_selection_enabled(self, db_type):
-        """플러그인별 업데이트 경로 선택 기능. 기본 OFF이며 OFF일 때는 모두 branch를 사용한다."""
+        """플러그인별 업데이트 경로 선택 기능. 기본 OFF이며 OFF일 때는 owner 기본값을 사용한다."""
         raw = self._catalog_get_setting("PM_UPDATE_PATH_SELECTION", default=None)
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
@@ -996,6 +1022,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, f"플러그인 '{plugin_id}'의 저장소 정보를 찾을 수 없습니다."
         info = dict(info)
         info["update_channel"] = channel
+        info["update_channel_explicit"] = True
         self._sources_set(plugin_id, info)
         return True, f"'{plugin_id}' 업데이트 경로를 {channel}로 설정했습니다."
 
@@ -1163,7 +1190,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 return {"mode": "branch", "ref_name": None, "raw_base_url": raw_base_url, "git_info": git_info, "parsed": None}
             branch = str(git_info.get("branch") or "").strip() or self._host_branch(parsed)
             enabled = self._catalog_get_update_path_selection_enabled(db_type)
-            mode = self._normalize_update_channel(git_info.get("update_channel")) if enabled else "branch"
+            mode = self._effective_update_channel(git_info, enabled)
             ref_name = branch
             if mode == "release":
                 if parsed["type"] == "github":
@@ -2250,8 +2277,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if plugin_id and parsed:
             info = self._read_git_source_info(plugin_id) or {}
             ref_name = str(info.get("branch") or branch).strip() or branch
-            if self._catalog_get_update_path_selection_enabled(db_type):
-                mode = self._normalize_update_channel(info.get("update_channel"))
+            mode = self._effective_update_channel(
+                info, self._catalog_get_update_path_selection_enabled(db_type)
+            )
             if mode == "release":
                 if parsed.get("type") == "github":
                     ref_name = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
@@ -3591,7 +3619,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         plugin_id      TEXT PRIMARY KEY,
                         git_url        TEXT,
                         branch         TEXT,
-                update_channel TEXT DEFAULT 'branch',
+                        update_channel TEXT DEFAULT 'branch',
+                        update_channel_explicit INTEGER DEFAULT 0,
                         manifest_files TEXT,
                         installed_at   TEXT
                     )
@@ -3603,6 +3632,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
                     if "update_channel" not in cols:
                         conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel TEXT DEFAULT 'branch'")
+                    if "update_channel_explicit" not in cols:
+                        conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel_explicit INTEGER DEFAULT 0")
+                        conn.execute(
+                            "UPDATE plugin_sources SET update_channel_explicit = "
+                            "CASE WHEN lower(COALESCE(update_channel, '')) IN ('release', 'tag') THEN 1 ELSE 0 END"
+                        )
                     for drop_col in ("source_type", "filename"):
                         if drop_col in cols:
                             conn.execute(f"ALTER TABLE plugin_sources DROP COLUMN {drop_col}")
@@ -3648,7 +3683,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """plugin_sources 레코드 → dict (git_url 없으면 None — 로컬 플러그인과 동치)"""
         try:
             rows = self._sources_db_query(
-                "SELECT git_url, branch, update_channel, manifest_files, installed_at "
+                "SELECT git_url, branch, update_channel, update_channel_explicit, manifest_files, installed_at "
                 "FROM plugin_sources WHERE plugin_id = ?",
                 (str(plugin_id),),
             )
@@ -3661,6 +3696,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if r.get("branch"):
                 info["branch"] = r["branch"]
             info["update_channel"] = self._normalize_update_channel(r.get("update_channel"))
+            info["update_channel_explicit"] = bool(r.get("update_channel_explicit"))
             if r.get("manifest_files"):
                 try:
                     info["manifest_files"] = json.loads(r["manifest_files"])
@@ -3685,15 +3721,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             mf = info.get("manifest_files")
             mf_json = json.dumps(mf, ensure_ascii=False) if mf else None
             update_channel = self._normalize_update_channel(info.get("update_channel"))
+            update_channel_explicit = 1 if bool(info.get("update_channel_explicit")) else 0
             self._sources_db_execute(
                 "INSERT OR REPLACE INTO plugin_sources "
-                "(plugin_id, git_url, branch, update_channel, manifest_files, installed_at) "
-                "VALUES(?, ?, ?, ?, ?, ?)",
+                "(plugin_id, git_url, branch, update_channel, update_channel_explicit, manifest_files, installed_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(plugin_id),
                     git_url,
                     str(info.get("branch") or "") or None,
                     update_channel,
+                    update_channel_explicit,
                     mf_json,
                     str(info.get("installed_at") or "") or None,
                 ),

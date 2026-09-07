@@ -3,7 +3,7 @@
 > 저장소: [github.com/madnite1/plugin_manager](https://github.com/madnite1/plugin_manager)
 
 BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이트·삭제·활성화 관리하는 시스템 플러그인입니다.
-**ZIP 파일 업로드 설치**, **Git 저장소 URL 설치**, **단일 업데이트 경로(branch / release / tag)** 선택을 지원합니다. 기본 업데이트 경로는 `branch`이며, 선택한 경로에서 다른 경로로 자동 폴백하지 않습니다.
+**ZIP 파일 업로드 설치**, **Git 저장소 URL 설치**, **단일 업데이트 경로(branch / release / tag)** 선택을 지원합니다. 기본 업데이트 경로는 저장소 owner 기준으로 결정되며 `madnite1`은 `release`, 그 외는 `branch`입니다. 선택한 경로에서 다른 경로로 자동 폴백하지 않습니다.
 **Gitea 카탈로그 서버별 활성화/비활성화 토글**로 개별 서버의 카탈로그 조회/업데이트/저장소 변경 포함 여부를 제어하며,
 설정 저장 후 다시 열어도 비활성 서버 항목과 토큰 마스킹 상태를 그대로 복원합니다.
 
@@ -60,7 +60,7 @@ BookOasis/
 | `PM_CATALOG_REFRESH_HOURS` | 카탈로그 갱신 간격 (1~24시간) |
 | `PM_ALLOW_INVALID_INSTALL` | 검증 실패 플러그인 설치 허용 여부 |
 | `PM_AUTO_UPDATE` | 플러그인 자동 업데이트 ON/OFF |
-| `PM_UPDATE_PATH_SELECTION` | 플러그인별 업데이트 경로 선택 UI ON/OFF (기본 OFF, OFF 시 모든 플러그인 branch) |
+| `PM_UPDATE_PATH_SELECTION` | 플러그인별 업데이트 경로 선택 UI ON/OFF (기본 OFF, OFF 시 owner 기준 기본값 사용) |
 | `PM_GITHUB_TOKEN` | GitHub API 토큰 (Bearer 인증용) |
 
 ### 특징
@@ -170,7 +170,7 @@ update_manifest = {
 
 ### 업데이트 경로 (자체 업데이트 엔진, 코어 PluginService 미사용)
 
-기본값은 **`branch`** 입니다. 설정의 **플러그인별 업데이트 경로 선택**을 켜면 설치된 업데이트 가능 플러그인 카드에 `branch / release / tag` 드롭다운이 표시되며, 선택값은 `plugin_manager.db`의 `plugin_sources.update_channel`에 저장됩니다. 설정을 끄면 저장된 개별 값은 유지되지만 실제 업데이트는 모두 `branch`로 동작합니다.
+기본값은 저장소 owner 기준으로 결정됩니다. owner가 **`madnite1`**이면 `release`, 그 외 저장소는 `branch`입니다. 설정의 **플러그인별 업데이트 경로 선택**을 켜면 설치된 업데이트 가능 플러그인 카드에 `branch / release / tag` 드롭다운이 표시되며, 사용자가 직접 선택한 값은 `plugin_manager.db`에 명시 선택으로 저장되어 기본값보다 우선합니다. 설정을 끄면 저장된 개별 선택값은 유지되지만 실제 업데이트는 owner 기준 기본값을 사용합니다.
 
 - **branch** — 저장된 브랜치만 사용합니다.
 - **release** — 최신 Release의 tag만 사용합니다. Release가 없거나 ref를 얻지 못하면 업데이트를 차단합니다.

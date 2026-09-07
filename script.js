@@ -982,9 +982,9 @@
 
             const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url && p.has_update_manifest)
                 ? `<select class="pm-update-channel-select" data-id="${p.id}" title="업데이트 경로 선택 — 선택한 경로만 사용하며 폴백하지 않습니다" style="padding:0.35rem 0.5rem;border-radius:6px;background:var(--app-input-bg,rgba(15,23,42,.6));border:1px solid var(--app-border,rgba(255,255,255,.15));color:var(--app-text-primary,#fff);font-size:.78rem;">
-                    <option value="branch" ${(p.update_channel || 'branch') === 'branch' ? 'selected' : ''}>branch</option>
-                    <option value="release" ${p.update_channel === 'release' ? 'selected' : ''}>release</option>
-                    <option value="tag" ${p.update_channel === 'tag' ? 'selected' : ''}>tag</option>
+                    <option value="branch" ${(p.effective_update_channel || 'branch') === 'branch' ? 'selected' : ''}>branch</option>
+                    <option value="release" ${p.effective_update_channel === 'release' ? 'selected' : ''}>release</option>
+                    <option value="tag" ${p.effective_update_channel === 'tag' ? 'selected' : ''}>tag</option>
                    </select>`
                 : '';
 
