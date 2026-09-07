@@ -3,7 +3,7 @@
 > 저장소: [github.com/madnite1/plugin_manager](https://github.com/madnite1/plugin_manager)
 
 BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이트·삭제·활성화 관리하는 시스템 플러그인입니다.
-**ZIP 파일 업로드 설치**, **Git 저장소 URL 설치**, **릴리즈 태그 우선 자동 업데이트**(GitHub 릴리즈 → 브랜치 폴백)를 지원합니다.
+**ZIP 파일 업로드 설치**, **Git 저장소 URL 설치**, **단일 업데이트 경로(branch / release / tag)** 선택을 지원합니다. 기본 업데이트 경로는 `branch`이며, 선택한 경로에서 다른 경로로 자동 폴백하지 않습니다.
 **Gitea 카탈로그 서버별 활성화/비활성화 토글**로 개별 서버의 카탈로그 조회/업데이트/저장소 변경 포함 여부를 제어하며,
 설정 저장 후 다시 열어도 비활성 서버 항목과 토큰 마스킹 상태를 그대로 복원합니다.
 
@@ -60,6 +60,7 @@ BookOasis/
 | `PM_CATALOG_REFRESH_HOURS` | 카탈로그 갱신 간격 (1~24시간) |
 | `PM_ALLOW_INVALID_INSTALL` | 검증 실패 플러그인 설치 허용 여부 |
 | `PM_AUTO_UPDATE` | 플러그인 자동 업데이트 ON/OFF |
+| `PM_UPDATE_PATH_SELECTION` | 플러그인별 업데이트 경로 선택 UI ON/OFF (기본 OFF, OFF 시 모든 플러그인 branch) |
 | `PM_GITHUB_TOKEN` | GitHub API 토큰 (Bearer 인증용) |
 
 ### 특징
@@ -76,43 +77,35 @@ BookOasis/
 지원 URL 형식 (단독 플러그인 저장소 = 저장소 루트가 플러그인 자체):
 
 ```text
-https://github.com/<owner>/<repo>[/tree/<branch>]     # GitHub (기본 브랜치 main, 실패 시 master 폴백)
+https://github.com/<owner>/<repo>[/tree/<branch>]     # GitHub (기본 브랜치 main)
 https://github.com/<owner>/<repo>.git                  # .git 형식
 https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{branch}.zip 방식)
 ```
 
-### 소스 다운로드 후보 순서
+### 저장소 설치와 업데이트 ref
 
-```
-GitHub 소스 + 브랜치 미지정 (예: https://github.com/owner/repo)
-  1) 최신 릴리즈 태그 ZIP   ← /releases/latest 리다이렉트로 태그 조회 (API 키 불필요)
-  2) main 브랜치 ZIP        ← 태그 없음(릴리즈 미생성) 또는 태그 ZIP 실패 시
-  3) master 브랜치 ZIP      ← main 실패 시 폴백
-```
+신규 Git 저장소 URL 설치는 URL에 지정된 브랜치(미지정 시 `main`) ZIP을 사용합니다. 설치 뒤 온라인 업데이트는 `branch` / `release` / `tag` 중 선택한 **하나의 ref**만 사용합니다.
 
-예외 조건:
-
-- `/tree/<branch>` 로 브랜치를 **명시한 URL** → 태그 조회 생략, 해당 브랜치 ZIP만 사용
-- **Gitea 저장소** → 일반 저장소 URL은 최신 릴리즈 태그를 우선 조회하고, 실패/미존재 시 `archive/{branch}.zip` 브랜치 ZIP으로 폴백
-- 태그 ZIP 다운로드가 404/오류여도 **자동으로 main → master 로 폴백** (후보 순차 시도 구조)
-
-설치 완료 시 사용된 소스가 표시됩니다 (`릴리즈 태그 1.0.0` 또는 `브랜치 main`).
+- 저장소 URL에 브랜치가 명시되어 있으면 그 값을 `branch` 기준으로 저장합니다.
+- **Gitea 저장소**도 GitHub와 동일하게 선택한 하나의 업데이트 경로만 사용합니다.
+- 선택한 ref의 ZIP 다운로드가 실패해도 다른 업데이트 경로로 바꾸지 않습니다. 일반 플러그인의 레거시 raw 호환 전송 경로를 사용하더라도 같은 선택 ref를 유지합니다.
+- 업데이트 완료 시 실제 사용한 소스가 표시됩니다 (`브랜치 main`, `릴리즈 v1.0.0`, `태그 v1.0.1`).
 
 설치 절차:
 
-1. 위 후보 순서대로 소스 ZIP 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
+1. 지정된 설치 브랜치의 소스 ZIP 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
 2. 저장소 루트에서 `update_manifest` 를 AST 로 추출 (없으면 설치 거부)
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
 4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
 
 설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 설치는 zip/git
 어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다 — 유효한 GitHub 루트
-주소면 `git_url` / `branch`(릴리즈 태그 설치 시 태그명) / `manifest_files` 이력이 남아 자동
+주소면 `git_url` / `branch` / `update_channel` / `manifest_files` 이력이 남아 자동
 업데이트·GitHub 배지가 활성화되고, manifest가 없거나 monorepo 서브디렉토리면 레코드가 없어
 로컬 플러그인으로 유지됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
 자동으로 DB에 마이그레이션됩니다 — `.zip_source`처럼 git_url이 없는 파일은 삭제 후
 `update_manifest` 기준으로 재판단).
-설치와 업데이트가 같은 소스(릴리즈 태그 우선, 브랜치 폴백)를 바라보므로 버전 불일치가 없습니다.
+업데이트 확인과 실제 업데이트는 동일하게 해석한 `branch` / `release` / `tag` ref를 사용하므로 VERSION 확인 대상과 ZIP 설치 대상이 달라지지 않습니다.
 
 ---
 
@@ -175,14 +168,15 @@ update_manifest = {
 }
 ```
 
-### 우선순위 (자체 업데이트 엔진, 코어 PluginService 미사용)
+### 업데이트 경로 (자체 업데이트 엔진, 코어 PluginService 미사용)
 
-1. **릴리즈 태그 (우선)** — 설치 시 저장된 소스 메타(`plugin_manager.db`의 `plugin_sources` 테이블)의 `git_url`이 GitHub 소스이면
-   `/releases/latest` 리다이렉트로 최신 릴리즈 태그를 추출(API 키 불필요, 5분 TTL 캐시)하고
-   해당 태그의 raw URL에서 `VERSION` 비교 → 파일 다운로드/교체 → hot reload.
-   릴리즈를 안 만든 커밋의 VERSION bump는 무시되므로 개발 중 실수 감지를 방지.
-2. **브랜치 (폴백)** — `git_url`이 없거나 태그 조회 실패/릴리즈가 없으면 기존 방식대로
-   `raw_base_url`(main 브랜치 raw)의 `VERSION` 파일을 비교해 업데이트.
+기본값은 **`branch`** 입니다. 설정의 **플러그인별 업데이트 경로 선택**을 켜면 설치된 업데이트 가능 플러그인 카드에 `branch / release / tag` 드롭다운이 표시되며, 선택값은 `plugin_manager.db`의 `plugin_sources.update_channel`에 저장됩니다. 설정을 끄면 저장된 개별 값은 유지되지만 실제 업데이트는 모두 `branch`로 동작합니다.
+
+- **branch** — 저장된 브랜치만 사용합니다.
+- **release** — 최신 Release의 tag만 사용합니다. Release가 없거나 ref를 얻지 못하면 업데이트를 차단합니다.
+- **tag** — 태그 목록에서 가장 높은 SemVer 태그만 사용합니다. 태그가 없으면 업데이트를 차단합니다.
+
+세 경로 사이의 자동 폴백은 없습니다. 업데이트 확인용 `VERSION`, 원격 `update_manifest`, 실제 다운로드 ZIP은 모두 같은 선택 ref를 기준으로 처리합니다.
 
 `enabled: True`는 필수 게이트 — 없으면 업데이트 대상 목록에 포함되지 않습니다.
 버전 비교 규칙: SemVer core(`MAJOR.MINOR.PATCH`)만 비교, `v` 접두사·pre-release 접미사 무시,
@@ -205,7 +199,7 @@ update_manifest = {
 > (릴리즈/태그 생성 권한 필요)
 
 릴리즈 태그 = main 커밋 스냅샷이므로, 자동 릴리즈된 버전은 plugin_manager의
-"릴리즈 태그 우선" 업데이트 경로로 즉시 감지됩니다.
+`release` 업데이트 경로를 선택한 플러그인에서 감지됩니다.
 
 ---
 

@@ -73,6 +73,7 @@ _CATALOG_VERIFY_TTL_SECONDS = 24 * 3600
 # 갱신 실패 후 재시도 쿨다운 — rate limit(403) 등으로 실패 시 60초마다 재시도하면
 # 오히려 제한이 풀리지 않아 악순환됨. 실패하면 최소 이 시간(초) 뒤에야 재시도.
 _CATALOG_RETRY_COOLDOWN_SECONDS = 10 * 60
+_UPDATE_CHANNELS = ("branch", "release", "tag")
 
 
 class PluginManagerMetadataProvider(BaseMetadataProvider):
@@ -183,6 +184,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not plugin_id:
                 return False, "업데이트 확인할 플러그인 ID가 누락되었습니다."
             return self._check_update_action(plugin_id, db_type)
+
+        elif action == "set_update_channel":
+            plugin_id = str(item_data.get("plugin_id", "")).strip()
+            channel = str(item_data.get("channel", "branch")).strip().lower()
+            if not plugin_id:
+                return False, "업데이트 경로를 설정할 플러그인 ID가 누락되었습니다."
+            return self._set_plugin_update_channel(plugin_id, channel)
 
         elif action == "catalog_refresh":
             return self._catalog_manual_refresh(db_type)
@@ -522,6 +530,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 plugin_id      TEXT PRIMARY KEY,
                 git_url        TEXT,
                 branch         TEXT,
+                update_channel TEXT DEFAULT 'branch',
                 manifest_files TEXT,
                 installed_at   TEXT
             )
@@ -529,6 +538,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         )
         try:
             source_cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
+            if "update_channel" not in source_cols:
+                conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel TEXT DEFAULT 'branch'")
             for drop_col in ("source_type", "filename"):
                 if drop_col in source_cols:
                     conn.execute("ALTER TABLE plugin_sources DROP COLUMN {0}".format(drop_col))
@@ -579,7 +590,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         keys = [
             "PM_CATALOG_GITEA_SERVERS", "PM_CATALOG_TOPICS",
             "PM_CATALOG_REFRESH_HOURS", "PM_ALLOW_INVALID_INSTALL",
-            "PM_AUTO_UPDATE", "PM_GITHUB_TOKEN"
+            "PM_AUTO_UPDATE", "PM_GITHUB_TOKEN", "PM_UPDATE_PATH_SELECTION"
         ]
         db_path = self._get_db_path()
         with _PM_DB_LOCK:
@@ -757,6 +768,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             gateway = self.get_db_gateway(db_type)
             # 모든 카드에 동일한 설정값이므로 플러그인마다 통합 DB를 다시 조회하지 않는다.
             rollback_enabled = self._catalog_get_rollback_enabled(db_type)
+            update_path_selection = self._catalog_get_update_path_selection_enabled(db_type)
 
             for entry in sorted(os.listdir(base_dir)):
                 full_path = os.path.join(base_dir, entry)
@@ -806,6 +818,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 git_info = self._read_git_source_info(plugin_id)
                 if git_info:
                     git_url = str(git_info.get("git_url") or "").strip() or None
+                update_channel = self._normalize_update_channel((git_info or {}).get("update_channel"))
+                effective_update_channel = update_channel if update_path_selection else "branch"
 
                 # 4-2. monorepo 서브디렉토리 플러그인은 update_manifest 있어도 업데이트 불가 처리
                 _is_monorepo_subdir = False
@@ -831,6 +845,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
+                    "update_channel": update_channel,
+                    "effective_update_channel": effective_update_channel,
                     "has_rollback": bool(rollback_info) if rollback_enabled else False,
                     "rollback_version": (rollback_info or {}).get("from_version") if rollback_enabled else None,
                     "rollback_has_data": bool((rollback_info or {}).get("has_data_snapshot")) if rollback_enabled else False,
@@ -963,6 +979,26 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """브랜치 결정: 명시 → default_branch 설정 → main"""
         return parsed.get("branch") or parsed.get("default_branch") or "main"
 
+    def _normalize_update_channel(self, value):
+        channel = str(value or "branch").strip().lower()
+        return channel if channel in _UPDATE_CHANNELS else "branch"
+
+    def _catalog_get_update_path_selection_enabled(self, db_type):
+        """플러그인별 업데이트 경로 선택 기능. 기본 OFF이며 OFF일 때는 모두 branch를 사용한다."""
+        raw = self._catalog_get_setting("PM_UPDATE_PATH_SELECTION", default=None)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    def _set_plugin_update_channel(self, plugin_id, channel):
+        if channel not in _UPDATE_CHANNELS:
+            return False, "업데이트 경로는 branch, release, tag 중 하나여야 합니다."
+        info = self._read_git_source_info(plugin_id)
+        if not info:
+            return False, f"플러그인 '{plugin_id}'의 저장소 정보를 찾을 수 없습니다."
+        info = dict(info)
+        info["update_channel"] = channel
+        self._sources_set(plugin_id, info)
+        return True, f"'{plugin_id}' 업데이트 경로를 {channel}로 설정했습니다."
+
     def _fetch_latest_release_tag(self, owner, repo):
         """
         GitHub 최신 릴리즈 태그 조회.
@@ -1007,6 +1043,47 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             tag = str(data.get("tag_name") or "").strip()
             return tag or None
+        except Exception:
+            return None
+
+    def _select_latest_tag_name(self, names):
+        clean = [str(name or "").strip() for name in names if str(name or "").strip()]
+        if not clean:
+            return None
+        semver = [(self._parse_version_tuple(name), name) for name in clean]
+        semver = [item for item in semver if item[0] is not None]
+        if semver:
+            semver.sort(key=lambda item: item[0], reverse=True)
+            return semver[0][1]
+        return clean[0]
+
+    def _fetch_latest_tag(self, parsed, db_type=None):
+        """GitHub/Gitea의 태그 목록에서 최신 semver 태그를 선택한다."""
+        if not parsed:
+            return None
+        try:
+            headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
+            if parsed["type"] == "github":
+                token = self._catalog_get_github_token(db_type)
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+                api_path = "/".join(("", "repos", parsed["owner"], parsed["repo"], "tags"))
+                url = "https://api.github.com{0}?per_page=100".format(api_path)
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                names = [item.get("name") for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+                return self._select_latest_tag_name(names)
+            token = self._gitea_token_for_host(db_type, parsed["host"])
+            if token:
+                headers["Authorization"] = "token {0}".format(token)
+            api_path = "/".join(("", "api", "v1", "repos", parsed["owner"], parsed["repo"], "tags"))
+            url = "{0}{1}?limit=100".format(parsed["base"], api_path)
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            names = [item.get("name") for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+            return self._select_latest_tag_name(names)
         except Exception:
             return None
 
@@ -1070,50 +1147,54 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return None
 
-    def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None, db_type=None):
-        """업데이트 소스 URL 결정: 릴리즈 태그 우선, 없으면 브랜치(raw_base_url) 폴백.
-        GitHub는 /releases/latest 리다이렉트, Gitea는 API로 태그 조회 (토큰 필요 시 사용).
-        소스 메타가 없으면 raw_base_url에서 추론하여 저장한 뒤 동일하게 처리."""
+    def _resolve_update_ref(self, plugin_id, raw_base_url, manifest_files=None, db_type=None):
+        """선택된 단일 업데이트 경로(branch/release/tag)의 ref와 raw URL을 결정한다.
+
+        경로 선택 기능이 꺼져 있거나 플러그인별 값이 없으면 branch만 사용한다.
+        선택한 경로에서 ref를 찾지 못해도 다른 경로로 폴백하지 않는다.
+        """
         try:
             git_info = self._read_git_source_info(plugin_id)
             if not git_info:
-                git_info = self._ensure_git_source_from_raw_base_url(
-                    plugin_id, raw_base_url, manifest_files
-                )
+                git_info = self._ensure_git_source_from_raw_base_url(plugin_id, raw_base_url, manifest_files)
             git_url = (git_info.get("git_url") or "") if git_info else ""
             parsed = self._parse_git_repo(git_url)
             if not parsed:
-                return raw_base_url
+                return {"mode": "branch", "ref_name": None, "raw_base_url": raw_base_url, "git_info": git_info, "parsed": None}
             branch = str(git_info.get("branch") or "").strip() or self._host_branch(parsed)
-            raw_prefix = self._host_zip_base(parsed)[2]
-            # 현재 raw_base_url이 이 저장소의 raw 브랜치 경로인지 확인 후 태그로 교체
-            if raw_base_url.startswith(raw_prefix):
-                # GitHub/Gitea 공통: 태그 조회
+            enabled = self._catalog_get_update_path_selection_enabled(db_type)
+            mode = self._normalize_update_channel(git_info.get("update_channel")) if enabled else "branch"
+            ref_name = branch
+            if mode == "release":
                 if parsed["type"] == "github":
-                    tag = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
+                    ref_name = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
                 else:
                     token = self._gitea_token_for_host(db_type, parsed["host"])
-                    tag = self._fetch_gitea_latest_release_tag(
-                        parsed["base"], parsed["owner"], parsed["repo"], token
-                    )
-                if tag:
-                    # Gitea는 브랜치와 태그 raw 경로가 다르다:
-                    # /raw/branch/<branch> → /raw/tag/<tag>.
-                    # GitHub는 raw URL의 ref 세그먼트만 태그로 교체하면 된다.
-                    if parsed["type"] == "gitea" and "/raw/branch/" in raw_base_url:
-                        return raw_base_url.replace(
-                            raw_prefix + "/branch/" + branch,
-                            raw_prefix + "/tag/" + tag,
-                            1,
-                        )
-                    return raw_base_url.replace(
-                        raw_prefix + "/" + branch,
-                        raw_prefix + "/" + tag,
-                        1,
-                    )
+                    ref_name = self._fetch_gitea_latest_release_tag(parsed["base"], parsed["owner"], parsed["repo"], token)
+            elif mode == "tag":
+                ref_name = self._fetch_latest_tag(parsed, db_type)
+            if not ref_name:
+                return None
+            raw_prefix = self._host_zip_base(parsed)[2]
+            resolved_raw = raw_base_url
+            if raw_base_url.startswith(raw_prefix):
+                if parsed["type"] == "gitea" and "/raw/branch/" in raw_base_url:
+                    target_prefix = "/branch/" if mode == "branch" else "/tag/"
+                    resolved_raw = raw_base_url.replace(raw_prefix + "/branch/" + branch, raw_prefix + target_prefix + ref_name, 1)
+                else:
+                    refs_heads = raw_prefix + "/refs/heads/" + branch
+                    if refs_heads in raw_base_url:
+                        target = refs_heads if mode == "branch" else raw_prefix + "/" + ref_name
+                        resolved_raw = raw_base_url.replace(refs_heads, target, 1)
+                    else:
+                        resolved_raw = raw_base_url.replace(raw_prefix + "/" + branch, raw_prefix + "/" + ref_name, 1)
+            return {"mode": mode, "ref_name": ref_name, "raw_base_url": resolved_raw, "git_info": git_info, "parsed": parsed}
         except Exception:
-            pass
-        return raw_base_url
+            return None
+
+    def _resolve_update_base_url(self, plugin_id, raw_base_url, manifest_files=None, db_type=None):
+        resolved = self._resolve_update_ref(plugin_id, raw_base_url, manifest_files, db_type)
+        return resolved.get("raw_base_url") if resolved else None
 
     def _fetch_text(self, url, timeout=15, token=None):
         """URL GET → 텍스트 (UTF-8, 오류 시 예외 전파). token은 Gitea 인증 헤더용."""
@@ -1258,7 +1339,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         # 저장소 메타 부재, 명확한 404, VERSION 파싱 실패는 실제 업데이트 경로 확인이 필요한 상태다.
         blocked_reason = None
-        if fetch_status in ("no_source", "http_404", "parse_failed"):
+        if fetch_status in ("no_source", "http_404", "parse_failed", "ref_unavailable"):
             blocked_reason = fetch_status
         if not has_manifest and blocked_reason is None:
             # update_manifest 자체가 없으면 업데이트 계약 부재 — 교체 제안 대상은 아니나 정보성 표시
@@ -1285,6 +1366,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
           - 'http_404'   : 원격 fetch 404 (저장소/파일 삭제)
           - 'fetch_failed': 그 외 네트워크/HTTP 오류
           - 'parse_failed': fetch는 됐지만 버전 파싱 실패
+          - 'ref_unavailable': 선택한 release/tag ref가 없음
         """
         has_update = False
         latest_version = local_version
@@ -1314,9 +1396,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if raw_parsed and raw_parsed[3]:
                 return has_update, latest_version, "no_manifest"
 
-            base_url = self._resolve_update_base_url(
+            resolved_ref = self._resolve_update_ref(
                 plugin_id, spec["raw_base_url"], spec.get("files"), db_type
             )
+            if not resolved_ref:
+                return has_update, latest_version, "ref_unavailable"
+            base_url = resolved_ref["raw_base_url"]
             # Gitea 소스면 해당 호스트 토큰 사용 (비공개 저장소 인증)
             gitea_token = None
             raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
@@ -1346,7 +1431,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return has_update, latest_version, "fetch_failed"
 
     def _check_plugin_update(self, plugin_id, local_version, provider_meta, db_type=None):
-        """릴리즈 태그 우선, 브랜치 폴백 업데이트 체크 (자동 업데이트는 진행하지 않음)
+        """선택된 단일 업데이트 경로 기준으로 버전을 확인한다 (자동 업데이트는 진행하지 않음).
 
         레거시 호환 래퍼 — 내부적으로 상세 판정 사용, fetch_status 무시.
         """
@@ -2152,49 +2237,41 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _download_repository_zip(self, git_url, db_type):
-        """저장소 소스 ZIP을 공통 정책으로 다운로드한다.
-
-        명시적 브랜치 URL은 해당 브랜치만 추적하고, 일반 저장소 URL은
-        최신 릴리즈를 우선한 뒤 main/master 브랜치로 폴백한다.
-        반환: (정보 dict, None) 또는 (None, 오류 문자열)
-        """
+    def _download_repository_zip(self, git_url, db_type, plugin_id=None):
+        """선택된 단일 업데이트 경로의 저장소 ZIP을 다운로드한다. 다른 경로로 폴백하지 않는다."""
         git_url = str(git_url or "").strip()
         zip_url, branch = self._build_repo_zip_url(git_url)
         if not zip_url:
             return None, "Git 저장소 URL 형식을 인식할 수 없습니다."
-
         parsed = self._parse_git_repo(git_url)
         explicit_branch = ("/tree/" in git_url or "/src/branch/" in git_url)
-        candidates = list(self._zip_url_candidates(zip_url))
-        release_url = None
-        release_tag = None
-
-        if not explicit_branch and parsed:
-            if parsed.get("type") == "github":
-                release_tag = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
-                if release_tag:
-                    release_url = (
-                        f"https://codeload.github.com/{parsed['owner']}/{parsed['repo']}"
-                        f"/zip/refs/tags/{release_tag}"
-                    )
-            elif parsed.get("type") == "gitea":
-                token = self._gitea_token_for_host(db_type, parsed["host"])
-                release_tag = self._fetch_gitea_latest_release_tag(
-                    parsed["base"], parsed["owner"], parsed["repo"], token
-                )
-                if release_tag:
-                    release_url = (
-                        f"{parsed['base']}/{parsed['owner']}/{parsed['repo']}"
-                        f"/archive/{release_tag}.zip"
-                    )
-            if release_url and release_url not in candidates:
-                candidates.insert(0, release_url)
-
-        token = None
-        if parsed and parsed.get("type") == "gitea":
-            token = self._gitea_token_for_host(db_type, parsed["host"])
-
+        mode = "branch"
+        ref_name = branch
+        if plugin_id and parsed:
+            info = self._read_git_source_info(plugin_id) or {}
+            ref_name = str(info.get("branch") or branch).strip() or branch
+            if self._catalog_get_update_path_selection_enabled(db_type):
+                mode = self._normalize_update_channel(info.get("update_channel"))
+            if mode == "release":
+                if parsed.get("type") == "github":
+                    ref_name = self._fetch_latest_release_tag(parsed["owner"], parsed["repo"])
+                else:
+                    token = self._gitea_token_for_host(db_type, parsed["host"])
+                    ref_name = self._fetch_gitea_latest_release_tag(parsed["base"], parsed["owner"], parsed["repo"], token)
+            elif mode == "tag":
+                ref_name = self._fetch_latest_tag(parsed, db_type)
+        if not ref_name:
+            return None, f"선택한 업데이트 경로({mode})에서 사용할 ref를 찾을 수 없습니다."
+        if parsed and parsed.get("type") == "github":
+            if mode in ("release", "tag"):
+                candidates = [f"https://codeload.github.com/{parsed['owner']}/{parsed['repo']}/zip/refs/tags/{ref_name}"]
+            else:
+                candidates = [f"https://codeload.github.com/{parsed['owner']}/{parsed['repo']}/zip/refs/heads/{ref_name}"]
+        elif parsed:
+            candidates = [f"{parsed['base']}/{parsed['owner']}/{parsed['repo']}/archive/{ref_name}.zip"]
+        else:
+            candidates = [zip_url]
+        token = self._gitea_token_for_host(db_type, parsed["host"]) if parsed and parsed.get("type") == "gitea" else None
         last_err = None
         for cand_url in candidates:
             try:
@@ -2204,21 +2281,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 req = Request(cand_url, headers=headers)
                 with urlopen(req, timeout=60) as resp:
                     zip_bytes = resp.read()
-                is_release = bool(release_url and cand_url == release_url)
-                return {
-                    "zip_bytes": zip_bytes,
-                    "used_url": cand_url,
-                    "ref_type": "release" if is_release else "branch",
-                    "ref_name": release_tag if is_release else branch,
-                    "branch": release_tag if is_release else branch,
-                    "explicit_branch": explicit_branch,
-                }, None
+                return {"zip_bytes": zip_bytes, "used_url": cand_url, "ref_type": mode, "ref_name": ref_name, "branch": ref_name, "explicit_branch": explicit_branch}, None
             except HTTPError as e:
                 last_err = f"{e.code} {e.reason}"
             except Exception as e:
                 last_err = str(e)
-
-        return None, f"저장소 ZIP 다운로드 실패: {last_err or '알 수 없는 오류'}"
+        return None, f"저장소 ZIP 다운로드 실패 ({mode} {ref_name}): {last_err or '알 수 없는 오류'}"
 
     def _extract_repository_zip(self, zip_bytes, temp_dir):
         """저장소 ZIP을 Zip Slip 검사 후 해제하고 플러그인 루트를 반환한다."""
@@ -3200,9 +3268,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
 
         local_ver = self._read_local_plugin_version(pdir, spec["version_file"], spec["version_key"])
-        base_url = self._resolve_update_base_url(
+        resolved_ref = self._resolve_update_ref(
             plugin_id, spec["raw_base_url"], spec.get("files"), db_type
         )
+        if not resolved_ref:
+            return False, "선택한 업데이트 경로에서 사용할 ref를 찾을 수 없습니다."
+        base_url = resolved_ref["raw_base_url"]
 
         gitea_token = None
         raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
@@ -3261,7 +3332,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not ok:
                 return False, msg
 
-            source_label = "릴리즈 태그" if base_url != spec["raw_base_url"] else "브랜치(main)"
+            source_label = "{0} {1}".format(resolved_ref["mode"], resolved_ref.get("ref_name") or "")
             return True, (
                 f"'{plugin_id}' 플러그인이 업데이트되었습니다 (v{remote_ver}, {source_label} 기준). "
                 + msg
@@ -3308,7 +3379,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 msg += " (저장소 ZIP 소스를 결정할 수 없어 raw 호환 경로 사용)"
             return ok, msg
 
-        zip_info, zip_err = self._download_repository_zip(git_url, db_type)
+        zip_info, zip_err = self._download_repository_zip(git_url, db_type, plugin_id=plugin_id)
         if not zip_info:
             if plugin_id == "plugin_manager":
                 return False, (
@@ -3391,11 +3462,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 refreshed["manifest_files"] = list(new_spec["files"])
                 self._sources_set(plugin_id, refreshed)
 
-            source_label = (
-                f"릴리즈 {zip_info['ref_name']}"
-                if zip_info.get("ref_type") == "release"
-                else f"브랜치 {zip_info.get('ref_name') or '알 수 없음'}"
-            )
+            if zip_info.get("ref_type") == "release":
+                source_label = f"릴리즈 {zip_info['ref_name']}"
+            elif zip_info.get("ref_type") == "tag":
+                source_label = f"태그 {zip_info.get('ref_name') or '알 수 없음'}"
+            else:
+                source_label = f"브랜치 {zip_info.get('ref_name') or '알 수 없음'}"
             return True, (
                 f"'{plugin_id}' 플러그인이 저장소 ZIP의 최신 update_manifest 기준으로 "
                 f"v{remote_ver} 업데이트되었습니다 ({source_label})."
@@ -3519,6 +3591,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         plugin_id      TEXT PRIMARY KEY,
                         git_url        TEXT,
                         branch         TEXT,
+                update_channel TEXT DEFAULT 'branch',
                         manifest_files TEXT,
                         installed_at   TEXT
                     )
@@ -3528,6 +3601,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 # 소스 메타 판단 기준이므로 불필요한 컬럼 제거 (sqlite 3.35+ DROP COLUMN)
                 try:
                     cols = {r[1] for r in conn.execute("PRAGMA table_info(plugin_sources)")}
+                    if "update_channel" not in cols:
+                        conn.execute("ALTER TABLE plugin_sources ADD COLUMN update_channel TEXT DEFAULT 'branch'")
                     for drop_col in ("source_type", "filename"):
                         if drop_col in cols:
                             conn.execute(f"ALTER TABLE plugin_sources DROP COLUMN {drop_col}")
@@ -3573,7 +3648,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """plugin_sources 레코드 → dict (git_url 없으면 None — 로컬 플러그인과 동치)"""
         try:
             rows = self._sources_db_query(
-                "SELECT git_url, branch, manifest_files, installed_at "
+                "SELECT git_url, branch, update_channel, manifest_files, installed_at "
                 "FROM plugin_sources WHERE plugin_id = ?",
                 (str(plugin_id),),
             )
@@ -3585,6 +3660,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             info = {"git_url": r["git_url"]}
             if r.get("branch"):
                 info["branch"] = r["branch"]
+            info["update_channel"] = self._normalize_update_channel(r.get("update_channel"))
             if r.get("manifest_files"):
                 try:
                     info["manifest_files"] = json.loads(r["manifest_files"])
@@ -3608,14 +3684,16 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         try:
             mf = info.get("manifest_files")
             mf_json = json.dumps(mf, ensure_ascii=False) if mf else None
+            update_channel = self._normalize_update_channel(info.get("update_channel"))
             self._sources_db_execute(
                 "INSERT OR REPLACE INTO plugin_sources "
-                "(plugin_id, git_url, branch, manifest_files, installed_at) "
-                "VALUES(?, ?, ?, ?, ?)",
+                "(plugin_id, git_url, branch, update_channel, manifest_files, installed_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
                 (
                     str(plugin_id),
                     git_url,
                     str(info.get("branch") or "") or None,
+                    update_channel,
                     mf_json,
                     str(info.get("installed_at") or "") or None,
                 ),
@@ -4758,6 +4836,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
             "auto_update": self._catalog_get_auto_update(db_type),
             "rollback_enabled": self._catalog_get_rollback_enabled(db_type),
+            "update_path_selection_enabled": self._catalog_get_update_path_selection_enabled(db_type),
             "github_token_set": bool(self._catalog_get_github_token(db_type)),
             "gitea_servers": gitea_servers,
         }
@@ -4981,6 +5060,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 rollback_val = str(rollback_raw).strip().lower() in ("1", "true", "yes", "on")
             self._catalog_set_setting("PM_ROLLBACK_ENABLED", "1" if rollback_val else "0")
 
+            update_path_raw = item_data.get("update_path_selection_enabled")
+            if update_path_raw is None or str(update_path_raw).strip() == "":
+                update_path_val = self._catalog_get_update_path_selection_enabled(db_type)
+            else:
+                update_path_val = str(update_path_raw).strip().lower() in ("1", "true", "yes", "on")
+            self._catalog_set_setting("PM_UPDATE_PATH_SELECTION", "1" if update_path_val else "0")
+
             # Gitea 서버 목록 — 프론트가 보낸 마스킹 토큰(****)은 기존 값 유지
             gitea_raw = item_data.get("gitea_servers")
             if gitea_raw is not None:
@@ -5027,10 +5113,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     self._catalog_set_setting("PM_GITHUB_TOKEN", str(raw_token).strip())
 
             return True, (
-                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, 자동 업데이트 {3}, GitHub 토큰 {4} — 다음 갱신 주기부터 적용)"
+                "설정이 저장되었습니다. (갱신 간격 {0}시간, 토픽 {1}개, 검증 실패 설치 {2}, 자동 업데이트 {3}, 업데이트 경로 선택 {4}, GitHub 토큰 {5} — 다음 갱신 주기부터 적용)"
             ).format(
                 interval, len(topics), "허용" if allow_val else "차단",
                 "ON" if auto_val else "OFF",
+                "ON" if update_path_val else "OFF",
                 "삭제됨" if item_data.get("clear_github_token")
                 else ("등록됨" if (item_data.get("github_token") and str(item_data.get("github_token")).strip()) else "유지"),
             )

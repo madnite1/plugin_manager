@@ -716,6 +716,8 @@
                 return { label: '저장소 확인 필요', title: '원격 저장소 또는 VERSION 파일을 찾을 수 없어 업데이트가 차단되었습니다.' };
             case 'parse_failed':
                 return { label: '업데이트 정보 오류', title: '원격 VERSION 정보를 해석할 수 없어 업데이트가 차단되었습니다.' };
+            case 'ref_unavailable':
+                return { label: '선택 경로 없음', title: '선택한 release 또는 tag 경로에서 사용할 ref를 찾을 수 없습니다.' };
             default:
                 return { label: '업데이트 차단', title: '원격 업데이트 정보를 확인할 수 없어 업데이트가 차단되었습니다.' };
         }
@@ -978,6 +980,14 @@
 
 
 
+            const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url && p.has_update_manifest)
+                ? `<select class="pm-update-channel-select" data-id="${p.id}" title="업데이트 경로 선택 — 선택한 경로만 사용하며 폴백하지 않습니다" style="padding:0.35rem 0.5rem;border-radius:6px;background:var(--app-input-bg,rgba(15,23,42,.6));border:1px solid var(--app-border,rgba(255,255,255,.15));color:var(--app-text-primary,#fff);font-size:.78rem;">
+                    <option value="branch" ${(p.update_channel || 'branch') === 'branch' ? 'selected' : ''}>branch</option>
+                    <option value="release" ${p.update_channel === 'release' ? 'selected' : ''}>release</option>
+                    <option value="tag" ${p.update_channel === 'tag' ? 'selected' : ''}>tag</option>
+                   </select>`
+                : '';
+
             const rollbackBtnHtml = p.has_rollback
                 ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-rollback" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" data-version="${escapeHtmlAttr(p.rollback_version || '')}" data-has-data="${p.rollback_has_data ? '1' : '0'}" title="이전 버전으로 롤백${p.rollback_version ? ` (v${escapeHtmlAttr(p.rollback_version)})` : ''}">
                     <i class="fa-solid fa-rotate-left"></i> 롤백
@@ -1033,6 +1043,7 @@
                             <span>${p.enabled ? '사용 중' : '중지됨'}</span>
                         </div>
                         <div class="pm-card-action-btns">
+                            ${updateChannelSelectHtml}
                             ${replaceBtnHtml}
                             ${updateBtnHtml}
                             ${rollbackBtnHtml}
@@ -1076,6 +1087,36 @@
                         showAlert('통신 오류: ' + err.message, true);
                         this.checked = !this.checked;
                     });
+            });
+        });
+
+        // 업데이트 경로 선택
+        document.querySelectorAll('.pm-update-channel-select').forEach(select => {
+            select.addEventListener('click', e => e.stopPropagation());
+            select.addEventListener('change', async function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const pluginId = this.getAttribute('data-id');
+                const channel = this.value || 'branch';
+                const previous = (allPlugins.find(p => p.id === pluginId) || {}).update_channel || 'branch';
+                this.disabled = true;
+                try {
+                    const res = await callPluginAction({ action: 'set_update_channel', plugin_id: pluginId, channel: channel });
+                    if (!res.success) {
+                        this.value = previous;
+                        showAlert(res.error || '업데이트 경로 저장 실패', true);
+                        return;
+                    }
+                    const p = allPlugins.find(item => item.id === pluginId);
+                    if (p) p.update_channel = channel;
+                    showAlert(res.message || `업데이트 경로를 ${channel}로 변경했습니다.`);
+                    loadPlugins();
+                } catch(err) {
+                    this.value = previous;
+                    showAlert('업데이트 경로 저장 중 통신 오류: ' + err.message, true);
+                } finally {
+                    this.disabled = false;
+                }
             });
         });
 
@@ -1335,6 +1376,7 @@
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
         const autoUpdateInput = document.getElementById('pm-auto-update');
         const rollbackEnabledInput = document.getElementById('pm-rollback-enabled');
+        const updatePathSelectionInput = document.getElementById('pm-update-path-selection');
         const tokenInput = document.getElementById('pm-github-token');
 
         // 토픽 개수 검증 — GitHub 비인증 Search API 분당 10회 제한 보호 (백엔드 _CATALOG_MAX_TOPICS와 동일 규칙)
@@ -1366,6 +1408,7 @@
                 allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                 auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                 rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
+                update_path_selection_enabled: updatePathSelectionInput ? updatePathSelectionInput.checked : false,
                 github_token: tokenInput ? tokenInput.value.trim() : '',
                 gitea_servers: giteaServers
             };
@@ -1414,6 +1457,7 @@
                             allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                             auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                             rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
+                            update_path_selection_enabled: updatePathSelectionInput ? updatePathSelectionInput.checked : false,
                             github_token: tokenInput ? tokenInput.value.trim() : '',
                             gitea_servers: giteaServers
                         })
