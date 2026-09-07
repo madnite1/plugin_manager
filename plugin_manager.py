@@ -166,9 +166,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         elif action == "delete":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
+            delete_data = item_data.get("delete_data") in (True, 1, "1", "true", "True")
             if not plugin_id:
                 return False, "삭제할 플러그인 ID가 누락되었습니다."
-            return self._delete_plugin(plugin_id, db_type)
+            return self._delete_plugin(plugin_id, db_type, delete_data=delete_data)
 
         elif action == "toggle":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
@@ -814,6 +815,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     _is_monorepo_subdir = bool(_rp and _rp[3])
 
                 rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
+                plugin_data_dir = self._get_plugin_data_dir(plugin_id)
 
                 plugins.append({
                     "id": plugin_id,
@@ -832,6 +834,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "has_rollback": bool(rollback_info) if rollback_enabled else False,
                     "rollback_version": (rollback_info or {}).get("from_version") if rollback_enabled else None,
                     "rollback_has_data": bool((rollback_info or {}).get("has_data_snapshot")) if rollback_enabled else False,
+                    "has_data": bool(plugin_data_dir and os.path.isdir(plugin_data_dir)),
                     "is_installed": True,
                 })
 
@@ -3434,8 +3437,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         return target_path, None
 
-    def _delete_plugin(self, plugin_id, db_type):
-        """플러그인 코드 삭제. `plugins/data/<plugin_id>` 영속 데이터는 의도적으로 보존한다."""
+    def _delete_plugin(self, plugin_id, db_type, delete_data=False):
+        """플러그인 코드와 롤백 백업을 삭제하고, 요청 시 영속 데이터도 함께 삭제한다."""
         if plugin_id in ("plugin_manager", "base.py"):
             return False, "시스템 핵심 플러그인 매니저는 삭제할 수 없습니다."
 
@@ -3446,11 +3449,33 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not os.path.exists(pdir):
             return False, f"존재하지 않는 플러그인입니다: {plugin_id}"
 
+        data_dir = self._get_plugin_data_dir(plugin_id)
+        rollback_slot = self._rollback_slot_dir(plugin_id)
+
         try:
             shutil.rmtree(pdir)
             self._sources_delete(plugin_id)  # 소스 메타(sqlite)도 함께 정리
+
+            # 플러그인이 사라진 뒤에는 해당 코드/데이터 롤백 슬롯을 사용할 수 없으므로
+            # 롤백 설정 활성화 여부와 관계없이 저장된 이전 버전 백업을 함께 정리한다.
+            if rollback_slot and os.path.lexists(rollback_slot):
+                self._remove_path(rollback_slot)
+
+            data_deleted = False
+            if delete_data and data_dir and os.path.lexists(data_dir):
+                self._remove_path(data_dir)
+                data_deleted = True
+
             self._hot_reload_plugin(plugin_id)
-            return True, f"플러그인 '{plugin_id}' 코드가 삭제되었습니다. 영속 데이터(plugins/data/{plugin_id})는 보존됩니다."
+
+            if data_deleted:
+                data_message = f" 영속 데이터(plugins/data/{plugin_id})도 함께 삭제되었습니다."
+            else:
+                data_message = f" 영속 데이터(plugins/data/{plugin_id})는 보존됩니다."
+            return True, (
+                f"플러그인 '{plugin_id}' 코드와 저장된 롤백 백업이 삭제되었습니다."
+                + data_message
+            )
         except Exception as e:
             return False, f"플러그인 삭제 실패: {str(e)}"
 

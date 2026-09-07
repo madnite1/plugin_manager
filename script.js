@@ -986,7 +986,7 @@
 
             const deleteBtnHtml = p.is_system
                 ? ''
-                : `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-delete" data-id="${p.id}" data-name="${p.name}" title="삭제">
+                : `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-delete" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" data-has-data="${p.has_data ? '1' : '0'}" title="삭제">
                     <i class="fa-solid fa-trash-can pm-text-danger"></i>
                    </button>`;
 
@@ -1136,7 +1136,8 @@
                 e.stopPropagation();
                 const pluginId = this.getAttribute('data-id');
                 const pluginName = this.getAttribute('data-name');
-                openDeleteModal(pluginId, pluginName);
+                const hasData = this.getAttribute('data-has-data') === '1';
+                openDeleteModal(pluginId, pluginName, hasData);
             });
         });
     }
@@ -1504,17 +1505,27 @@
     }
 
     // Modal Control
-    function openDeleteModal(pluginId, pluginName) {
+    function openDeleteModal(pluginId, pluginName, hasData = false) {
         pendingDeletePluginId = pluginId;
         const nameEl = document.getElementById('pm-delete-plugin-name');
         const modal = document.getElementById('pm-delete-modal');
+        const dataOption = document.getElementById('pm-delete-data-option');
+        const dataCheckbox = document.getElementById('pm-delete-data-checkbox');
+        const dataPath = document.getElementById('pm-delete-data-path');
         if (nameEl) nameEl.textContent = `${pluginName} (${pluginId})`;
+        if (dataPath) dataPath.textContent = `plugins/data/${pluginId}`;
+        if (dataCheckbox) dataCheckbox.checked = false;
+        if (dataOption) dataOption.style.display = hasData ? 'block' : 'none';
         if (modal) modal.style.display = 'flex';
     }
 
     function closeDeleteModal() {
         pendingDeletePluginId = null;
         const modal = document.getElementById('pm-delete-modal');
+        const dataOption = document.getElementById('pm-delete-data-option');
+        const dataCheckbox = document.getElementById('pm-delete-data-checkbox');
+        if (dataCheckbox) dataCheckbox.checked = false;
+        if (dataOption) dataOption.style.display = 'none';
         if (modal) modal.style.display = 'none';
     }
 
@@ -1692,7 +1703,14 @@
                 confirmBtn.disabled = true;
                 confirmBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 삭제 중...';
 
-                callPluginAction({ action: 'delete', plugin_id: pendingDeletePluginId })
+                const dataCheckbox = document.getElementById('pm-delete-data-checkbox');
+                const deleteData = !!(dataCheckbox && dataCheckbox.checked);
+
+                callPluginAction({
+                    action: 'delete',
+                    plugin_id: pendingDeletePluginId,
+                    delete_data: deleteData
+                })
                     .then(res => {
                         confirmBtn.disabled = false;
                         confirmBtn.innerHTML = originalHtml;
