@@ -673,9 +673,16 @@
         if (!p) return;
         p.has_update = hasUpdate;
         p.latest_version = latestVersion;
-        if (!hasUpdate) return;
 
         const card = document.getElementById(`pm-card-${pluginId}`);
+        if (!hasUpdate) {
+            // 정상 재확인 결과 업데이트가 없으면 이전 비동기 결과에서 남은 버튼도 제거한다.
+            if (card) {
+                card.querySelectorAll('.pm-btn-update').forEach(el => el.remove());
+            }
+            return;
+        }
+
         if (!card) return; // 필터로 숨겨진 상태 — 데이터만 갱신
         const actions = card.querySelector('.pm-card-action-btns');
         if (!actions || actions.querySelector('.pm-btn-update')) return;
@@ -692,15 +699,9 @@
     function clearCardUpdateStatus(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (card) {
-            const idEl = card.querySelector('.pm-plugin-id');
-            if (idEl) {
-                idEl.querySelectorAll('.pm-blocked-badge, .pm-update-check-failed-badge').forEach(el => el.remove());
-            }
-            const actions = card.querySelector('.pm-card-action-btns');
-            if (actions) {
-                const replaceBtn = actions.querySelector('.pm-btn-replace');
-                if (replaceBtn) replaceBtn.remove();
-            }
+            // 이전 비동기 업데이트 확인에서 남은 상태 UI를 카드 전체에서 정리한다.
+            card.querySelectorAll('.pm-blocked-badge, .pm-update-check-failed-badge').forEach(el => el.remove());
+            card.querySelectorAll('.pm-btn-replace').forEach(el => el.remove());
         }
         p.update_blocked = false;
         p.blocked_reason = null;
