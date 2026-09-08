@@ -256,6 +256,34 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             pass
         return data_dir
 
+    def _get_work_dir(self):
+        """플러그인 교체/업데이트/롤백 중 사용하는 임시 작업 디렉터리.
+
+        plugins/metadata 아래에 .pm_* 임시 폴더를 만들면 코어 discovery가 이를
+        플러그인으로 오인할 수 있으므로 Plugin Manager 데이터 영역으로 격리한다.
+        """
+        work_dir = os.path.join(self._get_data_dir(), "work")
+        os.makedirs(work_dir, exist_ok=True)
+        return work_dir
+
+    def _cleanup_legacy_metadata_workdirs(self):
+        """구버전이 plugins/metadata 루트에 남긴 .pm_* 작업 잔재를 정리한다."""
+        base_dir = self._get_plugins_base_dir()
+        removed = []
+        try:
+            for name in os.listdir(base_dir):
+                if not name.startswith(".pm_"):
+                    continue
+                target = os.path.join(base_dir, name)
+                try:
+                    self._remove_path(target)
+                    removed.append(name)
+                except Exception:
+                    logger.warning("레거시 .pm_* 작업 경로 정리 실패: %s", target, exc_info=True)
+        except Exception:
+            logger.warning("레거시 .pm_* 작업 경로 검색 실패: %s", base_dir, exc_info=True)
+        return removed
+
     def _get_db_path(self):
         """플러그인 매니저 통합 SQLite DB 경로를 반환한다."""
         return os.path.join(self._get_data_dir(), "plugin_manager.db")
@@ -1616,13 +1644,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             for entry in entries:
                 name = entry.name
-                # plugin_manager 자기 데이터에는 롤백 저장소 자체가 포함되어 있으므로
+                # plugin_manager 자기 데이터에는 롤백 저장소와 작업 디렉터리가 포함되므로
                 # 자기 자신을 재귀적으로 백업하지 않는다.
                 if (
                     is_root
                     and plugin_id == self.id
                     and os.path.realpath(src) == self_data_dir
-                    and name == "rollback"
+                    and name in ("rollback", "work")
                 ):
                     continue
 
@@ -1665,6 +1693,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 if is_root and plugin_id == self.id and os.path.realpath(src) == self_data_dir:
                     current_names.discard("rollback")
                     initial_names.discard("rollback")
+                    current_names.discard("work")
+                    initial_names.discard("work")
                 for db_name in sqlite_backed:
                     for suffix in ("-wal", "-shm"):
                         current_names.discard(db_name + suffix)
@@ -1741,8 +1771,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     logger.exception("데이터 롤백 실패 후 현재 데이터 복구 실패 (id=%s)", plugin_id)
                 raise
 
-        # plugin_manager 자기 롤백은 rollback/이 자기 데이터 폴더 안에 있으므로
-        # rollback/을 유지한 채 나머지 항목만 트랜잭션형으로 교체한다.
+        # plugin_manager 자기 롤백은 rollback/과 work/가 자기 데이터 폴더 안에 있으므로
+        # 두 작업 영역을 유지한 채 나머지 항목만 트랜잭션형으로 교체한다.
         os.makedirs(data_dir, exist_ok=True)
         swap_root = os.path.join(parent, ".pm_data_restore_swap_plugin_manager")
         new_root = os.path.join(parent, ".pm_data_restore_new_plugin_manager")
@@ -1753,7 +1783,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             shutil.copytree(snapshot_dir, new_root, symlinks=True)
         try:
             for name in os.listdir(data_dir):
-                if name == "rollback":
+                if name in ("rollback", "work"):
                     continue
                 os.replace(os.path.join(data_dir, name), os.path.join(swap_root, name))
 
@@ -1767,7 +1797,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             try:
                 for name in list(os.listdir(data_dir)):
-                    if name == "rollback":
+                    if name in ("rollback", "work"):
                         continue
                     self._remove_path(os.path.join(data_dir, name))
                 if os.path.isdir(swap_root):
@@ -1880,7 +1910,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             except Exception as e:
                 return False, f"현재 플러그인 데이터 백업에 실패해 롤백을 중단했습니다: {e}"
 
-        swap_dir = os.path.join(self._get_plugins_base_dir(), f".pm_rollback_swap_{plugin_id}")
+        swap_dir = os.path.join(self._get_work_dir(), f"rollback_swap_{plugin_id}")
         shutil.rmtree(swap_dir, ignore_errors=True)
         recovered = False
         try:
@@ -2048,7 +2078,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "update_manifest.files에 유효하지 않은 경로가 포함되어 있습니다."
 
         base_dir = self._get_plugins_base_dir()
-        backup_dir = os.path.join(base_dir, f".pm_zip_backup_{plugin_id}")
+        backup_dir = os.path.join(self._get_work_dir(), f"zip_backup_{plugin_id}")
         if os.path.exists(backup_dir):
             shutil.rmtree(backup_dir, ignore_errors=True)
 
@@ -2122,6 +2152,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 data_existed=(data_snapshot or {}).get("existed"),
             )
             shutil.rmtree(backup_dir, ignore_errors=True)
+            legacy_pm_removed = []
+            if plugin_id == "plugin_manager":
+                legacy_pm_removed = self._cleanup_legacy_metadata_workdirs()
             passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
             warns = [c["detail"] for c in source_checks if c.get("warn")]
             result_msg = (
@@ -2135,6 +2168,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 result_msg += f" 이전 버전(v{old_version})의 코드와 영속 데이터 롤백 백업을 보관했습니다."
             else:
                 result_msg += " 경고: 업데이트는 성공했지만 코드/데이터 롤백 백업 저장에 실패했습니다."
+            if legacy_pm_removed:
+                result_msg += f" 레거시 .pm_* 작업 잔재 {len(legacy_pm_removed)}개를 정리했습니다."
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
             return True, result_msg
@@ -2569,7 +2604,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         설계: 소스마다 파일 구조/update_manifest/subpath가 다를 수 있어
         git_url 메타만 바꾸는 대신 폴더 재설치 방식으로 안전하게 교체.
-        - 백업: plugins_base/.pm_replace_backup_<id> (플러그인 폴더 전체 + 소스 메타)
+        - 백업: plugins/data/plugin_manager/work/replace_backup_<id> (플러그인 폴더 전체 + 소스 메타)
         - 재설치: _install_from_git(new_git_url, backup_dir=백업경로)
         - 성공: 백업 삭제, 실패: 백업 복원 (소스 메타도 원복)
         """
@@ -2595,7 +2630,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             )
 
         # 2. 백업 (플러그인 폴더 + 소스 메타)
-        backup_dir = os.path.join(base_dir, f".pm_replace_backup_{plugin_id}")
+        backup_dir = os.path.join(self._get_work_dir(), f"replace_backup_{plugin_id}")
         old_git_info = None
         try:
             old_git_info = self._read_git_source_info(plugin_id)
