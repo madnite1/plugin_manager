@@ -317,6 +317,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         self._run_migration_once()
         self._cleanup_legacy_active_databases()
         self._cleanup_legacy_scripts_dir()
+        self._cleanup_legacy_metadata_workdirs()
         self._ensure_catalog_routes()
         self._ensure_catalog_thread("general")
 
