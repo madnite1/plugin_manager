@@ -31,7 +31,7 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 
 ## 데이터 영속성 아키텍처
 
-플러그인 매니저는 **플러그인 폴더 밖의 별도 데이터 디렉토리**를 사용해 설정과 카탈로그를 저장합니다. 업데이트·재설치 시에는 데이터가 보존되며, 플러그인 삭제 시에는 `plugins/data/<plugin_id>`가 존재하는 경우 삭제 모달에서 데이터 폴더까지 함께 지울지 선택할 수 있습니다. 선택하지 않으면 영속 데이터는 보존됩니다.
+BookOasis 플러그인은 코드/메타데이터, 영속 데이터, 재생성 가능한 캐시를 각각 분리합니다. 공통 경로는 `plugins/metadata/<plugin_id>`, `plugins/data/<plugin_id>`, `plugins/cache/<plugin_id>`입니다. 업데이트·재설치 시 영속 데이터와 캐시는 코드 폴더와 분리되며, 플러그인 삭제 시 `plugins/cache/<plugin_id>`는 항상 함께 삭제됩니다. `plugins/data/<plugin_id>`가 존재하는 경우에만 삭제 모달에서 영속 데이터까지 함께 지울지 선택할 수 있으며, 선택하지 않으면 보존됩니다.
 
 ### 디렉토리 구조
 
@@ -43,12 +43,14 @@ BookOasis/
     │       ├── plugin_manager.py
     │       ├── catalog.db           ← 구버전 레거시 위치
     │       └── plugin_sources.db    ← 구버전 레거시 위치
-    └── data/
-        └── plugin_manager/          ← 영속 데이터 (../../data/plugin_manager/)
-            ├── plugin_manager.db    # 카탈로그·설정·소스 메타 통합 DB
-            ├── catalog.db.bak       # 통합 마이그레이션 후 구 카탈로그 DB 백업
-            ├── plugin_sources.db.bak # 통합 마이그레이션 후 구 소스 DB 백업
-            └── .migrated            # 구버전 설정 마이그레이션 완료 플래그
+    ├── data/
+    │   └── plugin_manager/          ← 영속 데이터 (../../data/plugin_manager/)
+    │       ├── plugin_manager.db    # 카탈로그·설정·소스 메타 통합 DB
+    │       ├── catalog.db.bak       # 통합 마이그레이션 후 구 카탈로그 DB 백업
+    │       ├── plugin_sources.db.bak # 통합 마이그레이션 후 구 소스 DB 백업
+    │       └── .migrated            # 구버전 설정 마이그레이션 완료 플래그
+    └── cache/
+        └── plugin_manager/          ← 재생성 가능한 캐시 영역
 ```
 
 ### 저장되는 설정 키 (plugin_manager.db.settings)
@@ -228,5 +230,5 @@ update_manifest = {
 - `update_manifest.files` 밖의 코드 폴더 런타임 파일은 기존 정책대로 현재 값을 유지합니다.
 - `plugin_manager` 자기 롤백은 자기 데이터 폴더 안의 `rollback/` 저장소를 스냅샷에서 제외하고 복원 중에도 보존해 재귀 백업을 방지합니다.
 - 롤백은 업데이트 때 생성된 직전 상태 백업을 **1회 소비**합니다. 롤백 성공 후 백업 슬롯을 삭제하므로 방금 사용하던 업데이트 버전은 롤백 대상으로 남지 않으며, 다시 업데이트하기 전까지 추가 롤백은 제공하지 않습니다.
-- 플러그인을 삭제하면 해당 플러그인의 롤백 슬롯도 항상 함께 삭제합니다. 영속 데이터 폴더는 삭제 모달에서 별도로 선택한 경우에만 제거합니다.
+- 플러그인을 삭제하면 해당 플러그인의 롤백 슬롯과 `plugins/cache/<plugin_id>` 캐시 폴더를 항상 함께 삭제합니다. 영속 데이터 폴더는 삭제 모달에서 별도로 선택한 경우에만 제거합니다.
 - 데이터 폴더가 큰 플러그인은 업데이트 전에 전체 스냅샷을 만들기 때문에 시간이 더 걸리고 디스크 사용량이 증가할 수 있습니다. 롤백 슬롯은 플러그인별로 직전 1개만 유지합니다.

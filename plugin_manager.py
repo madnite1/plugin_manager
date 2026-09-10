@@ -246,6 +246,31 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             os.makedirs(target, exist_ok=True)
         return target
 
+    def _get_plugin_cache_dir(self, plugin_id, create=False):
+        """플러그인별 표준 캐시 경로 `plugins/cache/<plugin_id>`를 반환한다.
+
+        캐시는 영속 데이터와 달리 재생성 가능한 영역이므로 플러그인 삭제 시 항상 함께
+        제거한다. 경로 검증은 data 경로와 동일하게 plugins/cache 루트 내부로 제한한다.
+        """
+        pid = str(plugin_id or "").strip()
+        if not pid or not re.fullmatch(r"[A-Za-z0-9_-]+", pid):
+            return None
+        metadata_dir = os.path.realpath(self._get_plugins_base_dir())
+        plugins_dir = os.path.dirname(metadata_dir)
+        cache_root = os.path.realpath(os.path.join(plugins_dir, "cache"))
+        target = os.path.abspath(os.path.join(cache_root, pid))
+        try:
+            if os.path.commonpath((cache_root, target)) != cache_root:
+                return None
+        except ValueError:
+            return None
+        if create:
+            # cache/<plugin_id> 자체가 외부 경로를 가리키는 심볼릭 링크라면 생성에 사용하지 않는다.
+            if os.path.islink(target):
+                return None
+            os.makedirs(target, exist_ok=True)
+        return target
+
     def _get_data_dir(self):
         """플러그인 영속 데이터 디렉터리 (../../data/plugin_manager/) — 업데이트/삭제 시에도 보존"""
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3574,7 +3599,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return target_path, None
 
     def _delete_plugin(self, plugin_id, db_type, delete_data=False):
-        """플러그인 코드와 롤백 백업을 삭제하고, 요청 시 영속 데이터도 함께 삭제한다."""
+        """플러그인 코드·롤백 백업·캐시를 삭제하고, 요청 시 영속 데이터도 함께 삭제한다."""
         if plugin_id in ("plugin_manager", "base.py"):
             return False, "시스템 핵심 플러그인 매니저는 삭제할 수 없습니다."
 
@@ -3586,9 +3611,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, f"존재하지 않는 플러그인입니다: {plugin_id}"
 
         data_dir = self._get_plugin_data_dir(plugin_id)
+        cache_dir = self._get_plugin_cache_dir(plugin_id)
         rollback_slot = self._rollback_slot_dir(plugin_id)
 
         try:
+            # plugins/cache/<plugin_id>는 재생성 가능한 캐시 영역이므로 사용자 확인 없이
+            # 항상 함께 삭제한다. 코드 삭제보다 먼저 처리해 캐시 삭제 실패 시 설치본은 유지한다.
+            cache_deleted = False
+            if cache_dir and os.path.lexists(cache_dir):
+                self._remove_path(cache_dir)
+                cache_deleted = True
+
             shutil.rmtree(pdir)
             self._sources_delete(plugin_id)  # 소스 메타(sqlite)도 함께 정리
 
@@ -3608,8 +3641,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 data_message = f" 영속 데이터(plugins/data/{plugin_id})도 함께 삭제되었습니다."
             else:
                 data_message = f" 영속 데이터(plugins/data/{plugin_id})는 보존됩니다."
+            cache_message = (
+                f" 캐시(plugins/cache/{plugin_id})도 함께 삭제되었습니다."
+                if cache_deleted else
+                f" 캐시(plugins/cache/{plugin_id})는 존재하지 않았습니다."
+            )
             return True, (
                 f"플러그인 '{plugin_id}' 코드와 저장된 롤백 백업이 삭제되었습니다."
+                + cache_message
                 + data_message
             )
         except Exception as e:
