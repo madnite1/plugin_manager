@@ -27,6 +27,40 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
 
 설치 후 온라인 업데이트는 저장된 Git 소스를 기준으로 **저장소 ZIP을 우선 다운로드**하고, ZIP 내부의 최신 `VERSION`과 `update_manifest.files`를 검증한 뒤 적용합니다. 저장소 ZIP 자체를 받을 수 없는 레거시/특수 소스에 한해서만 기존 raw 파일 다운로드 경로를 호환용으로 사용합니다.
 
+### BookOasis 1.1.0+ 선택 계약 검증
+
+Plugin Manager는 Provider를 실행하지 않고 AST로 `home_widget`, `detail_sidebar_widget`, `detail_view` 선언을 분석합니다. 리터럴 선언은 공식 문서 allowlist에 맞춰 검증하고, 일부 값이 변수/함수 호출인 동적 표현식이면 해당 필드만 `판정 불가`로 격리해 설치를 불필요하게 차단하지 않습니다.
+
+- `sessions`: 생략, `"all"`, 또는 `general/adult/audiobook/video` 값의 문자열 리스트를 지원합니다.
+- `home_widget`: `layout`은 `full|grid`, `size`는 `1|2|3`을 검사합니다. `get_dashboard_data()` 직접 구현을 정적으로 확인하지 못하면 경고만 표시합니다.
+- `detail_sidebar_widget`: `get_detail_sidebar_data()` 직접 구현을 정적으로 확인하지 못하면 경고만 표시합니다.
+- `detail_view`: `detail/index.html`, `detail/style.css`, `detail/script.js` 3개 파일이 필요합니다. `update_manifest`를 사용하는 플러그인은 세 파일을 `update_manifest.files`에 각각 명시해야 합니다. `detail/` 디렉토리 축약이나 암묵적 파일 추가는 하지 않습니다.
+- 설치 후 `_verify_installed_plugin_static()`은 기존처럼 Provider id와 선택적 VERSION의 최소 무결성만 확인합니다. 신규 UI 계약 검증을 사후 삭제/롤백 게이트로 사용하지 않아 `force` 설치의 기존 의미를 유지합니다.
+- 설치된 플러그인 카드에는 **홈 / 상세 사이드바 / 상세 뷰** 지원 여부가 표시됩니다. 정적으로 확정할 수 없는 동적 선언은 `판정 불가`로 표시하며, 미설치 카탈로그 항목은 원격 소스를 추가 분석하지 않으므로 지원 여부를 추정하지 않습니다.
+
+### 1.14.25 배포 검증
+
+1.14.25는 BookOasis 1.1.0+ 선택 계약 대응과 플러그인 카드 지원 여부 표시를 포함합니다. 배포 전 다음 항목을 확인했습니다.
+
+- 회귀 테스트 `tests/test_plugin_manager_contracts.py` 14개 전부 통과
+- Python 문법 검사 및 `script.js` 문법 검사 통과
+- 일반/엄격 검증과 `update_manifest`, 릴리즈 준비 검사 통과
+- 기존 설치 플러그인 호환성 회귀 검사를 수행했으며, 기존 통과/실패 판정 및 실패 사유에 신규 회귀가 없음을 확인
+- 1.14.24 설치 상태에서 `update_manifest.files` 8개만 포함한 1.14.25 ZIP 업데이트 성공 확인
+
+1.14.25 배포 ZIP은 아래 8개 파일만 포함해야 합니다. README와 테스트 파일은 배포 ZIP 대상이 아닙니다.
+
+```text
+plugin_manager.py
+__init__.py
+VERSION
+index.html
+style.css
+script.js
+settings.html
+settings.js
+```
+
 ---
 
 ## 데이터 영속성 아키텍처

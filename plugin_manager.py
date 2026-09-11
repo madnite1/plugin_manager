@@ -677,14 +677,68 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             finally:
                 conn.close()
 
+    def _extract_contract_value(self, value_node, module_strings=None):
+        """선택 계약 선언을 가능한 범위까지만 정적으로 해석한다.
+
+        dict 내부 일부 값이 동적 표현식이어도 전체 계약을 버리지 않고 partial 상태로
+        보존한다. unresolved 상태는 실제 값과 분리해 truthy 문자열 오염을 막는다.
+        """
+        module_strings = module_strings or {}
+        if isinstance(value_node, ast.Constant) and value_node.value is None:
+            return None, {"status": "resolved", "unresolved_fields": []}
+        try:
+            return ast.literal_eval(value_node), {"status": "resolved", "unresolved_fields": []}
+        except Exception:
+            pass
+
+        if not isinstance(value_node, ast.Dict):
+            return None, {"status": "unresolved", "unresolved_fields": []}
+
+        value = {}
+        unresolved_fields = []
+        for key_node, item_node in zip(value_node.keys, value_node.values):
+            key = self._resolve_static_string(key_node, module_strings) if key_node is not None else None
+            if not isinstance(key, str) or not key:
+                unresolved_fields.append("<key>")
+                continue
+            try:
+                item_value = ast.literal_eval(item_node)
+            except Exception:
+                item_value = self._resolve_static_string(item_node, module_strings)
+                if item_value is None:
+                    unresolved_fields.append(key)
+                    continue
+            value[key] = item_value
+
+        return value, {
+            "status": "partial" if unresolved_fields else "resolved",
+            "unresolved_fields": unresolved_fields,
+        }
+
+    @staticmethod
+    def _provider_capability(meta, field):
+        """선택 계약 지원 여부를 True/False/None(정적 판정 불가)로 반환한다."""
+        statuses = (meta or {}).get("_contract_status") or {}
+        state = statuses.get(field) or {"status": "absent"}
+        status = state.get("status")
+        if status == "unresolved":
+            return None
+        if status == "partial":
+            return True if isinstance((meta or {}).get(field), dict) else None
+        return bool((meta or {}).get(field))
+
     def _extract_provider_metadata(self, plugin_dir):
         """Provider 클래스의 공개 선언을 코드를 실행하지 않고 AST로 읽는다."""
         if not os.path.isdir(plugin_dir):
             return None
 
+        contract_fields = {
+            "category_tab", "dashboard_widget", "home_widget",
+            "detail_sidebar_widget", "detail_view",
+        }
         fields = {
             "id", "name", "is_searchable", "config_schema",
-            "category_tab", "dashboard_widget", "update_manifest",
+            "update_manifest", *contract_fields,
         }
         try:
             for fname in sorted(os.listdir(plugin_dir)):
@@ -720,11 +774,23 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         "config_schema": [],
                         "category_tab": None,
                         "dashboard_widget": None,
+                        "home_widget": None,
+                        "detail_sidebar_widget": None,
+                        "detail_view": None,
                         "update_manifest": None,
                         "class_name": node.name,
                         "source_file": fname,
+                        "_methods": [],
+                        "_contract_status": {
+                            field: {"status": "absent", "unresolved_fields": []}
+                            for field in contract_fields
+                        },
                     }
                     for stmt in node.body:
+                        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            meta["_methods"].append(stmt.name)
+                            continue
+
                         value_node = None
                         target_name = None
                         if isinstance(stmt, ast.Assign):
@@ -745,11 +811,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                             continue
                         if target_name in ("id", "name"):
                             value = self._resolve_static_string(value_node, module_strings)
-                        else:
-                            try:
-                                value = ast.literal_eval(value_node)
-                            except Exception:
-                                value = None
+                            if value is not None:
+                                meta[target_name] = value
+                            continue
+                        if target_name in contract_fields:
+                            value, status = self._extract_contract_value(value_node, module_strings)
+                            meta[target_name] = value
+                            meta["_contract_status"][target_name] = status
+                            continue
+                        try:
+                            value = ast.literal_eval(value_node)
+                        except Exception:
+                            value = None
                         if value is not None:
                             meta[target_name] = value
 
@@ -858,6 +931,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 category_tab = provider_meta.get("category_tab")
                 dashboard_widget = provider_meta.get("dashboard_widget")
                 update_manifest = provider_meta.get("update_manifest")
+                supports_home_widget = self._provider_capability(provider_meta, "home_widget")
+                supports_detail_sidebar_widget = self._provider_capability(provider_meta, "detail_sidebar_widget")
+                supports_detail_view = self._provider_capability(provider_meta, "detail_view")
 
                 # 2-1. config_schema 또는 공식 커스텀 설정 UI(settings.html) 보유 여부
                 raw_schema = provider_meta.get("config_schema")
@@ -903,6 +979,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "is_searchable": is_searchable,
                     "is_category": bool(category_tab),
                     "is_widget": bool(dashboard_widget),
+                    "supports_home_widget": supports_home_widget,
+                    "supports_detail_sidebar_widget": supports_detail_sidebar_widget,
+                    "supports_detail_view": supports_detail_view,
                     "has_update_manifest": bool(update_manifest) and not _is_monorepo_subdir,
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
@@ -2963,6 +3042,144 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         return ""
 
+    @staticmethod
+    def _valid_plugin_sessions(value):
+        """공식 sessions 계약: 생략 / 'all' / 유효 세션 문자열 리스트."""
+        allowed = {"general", "adult", "audiobook", "video"}
+        if value is None:
+            return True
+        if value == "all":
+            return True
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(item, str) and item in allowed for item in value)
+        )
+
+    def _validate_latest_optional_contracts(self, plugin_dir, provider_meta, manifest_files):
+        """1.0.8~1.1.0+ 선택 계약을 공식 문서 범위에서만 정적으로 검증한다."""
+        checks = []
+        provider_meta = provider_meta or {}
+        statuses = provider_meta.get("_contract_status") or {}
+        methods = set(provider_meta.get("_methods") or [])
+        manifest_set = {os.path.normpath(str(rel)) for rel in (manifest_files or [])}
+        specs = {
+            "home_widget": {
+                "label": "home_widget",
+                "allowed": {"title", "subtitle", "icon", "order", "limit", "sessions", "layout", "size"},
+                "guide": "가이드 §5-1 홈 대시보드 위젯 계약",
+            },
+            "detail_sidebar_widget": {
+                "label": "detail_sidebar_widget",
+                "allowed": {"title", "order", "sessions"},
+                "guide": "가이드 §3 도서 상세 페이지 사이드바 위젯",
+            },
+            "detail_view": {
+                "label": "detail_view",
+                "allowed": {"title", "sessions"},
+                "guide": "가이드 §3 도서 상세 페이지 본문 전체 대체",
+            },
+        }
+        active = []
+
+        for field, spec in specs.items():
+            state = statuses.get(field) or {"status": "absent", "unresolved_fields": []}
+            status = state.get("status", "absent")
+            value = provider_meta.get(field)
+            if status == "absent" or (status == "resolved" and value is None):
+                continue
+            if status == "unresolved":
+                checks.append({
+                    "name": field,
+                    "ok": True,
+                    "warn": True,
+                    "detail": "경고: 동적 표현식이라 정적 검증을 완료할 수 없습니다",
+                    "guide_ref": spec["guide"],
+                })
+                continue
+            if not isinstance(value, dict):
+                checks.append({
+                    "name": field,
+                    "ok": False,
+                    "detail": "선택 계약은 dict 또는 None이어야 합니다",
+                    "guide_ref": spec["guide"],
+                })
+                continue
+
+            active.append(field)
+            problems = []
+            unknown = sorted(set(value) - spec["allowed"])
+            if unknown:
+                problems.append("문서에 없는 필드: " + ", ".join(unknown))
+            if "sessions" in value and not self._valid_plugin_sessions(value.get("sessions")):
+                problems.append("sessions는 'all' 또는 general/adult/audiobook/video 문자열 리스트여야 함")
+
+            if field == "home_widget":
+                if "layout" in value and value.get("layout") not in ("full", "grid"):
+                    problems.append("layout은 'full' 또는 'grid'만 허용")
+                if "size" in value:
+                    size = value.get("size")
+                    if isinstance(size, bool) or not isinstance(size, int) or size not in (1, 2, 3):
+                        problems.append("size는 1/2/3만 허용")
+            elif field == "detail_view":
+                required_ui = ("detail/index.html", "detail/style.css", "detail/script.js")
+                missing_ui = [rel for rel in required_ui if not os.path.isfile(os.path.join(plugin_dir, rel))]
+                if missing_ui:
+                    problems.append("필수 detail UI 파일 없음: " + ", ".join(missing_ui))
+                if manifest_files:
+                    missing_manifest = [rel for rel in required_ui if os.path.normpath(rel) not in manifest_set]
+                    if missing_manifest:
+                        problems.append("update_manifest.files 누락: " + ", ".join(missing_manifest))
+
+            unresolved = list(state.get("unresolved_fields") or [])
+            if problems:
+                checks.append({
+                    "name": field,
+                    "ok": False,
+                    "detail": "; ".join(problems),
+                    "guide_ref": spec["guide"],
+                })
+            elif unresolved:
+                checks.append({
+                    "name": field,
+                    "ok": True,
+                    "warn": True,
+                    "detail": "계약 확인, 동적 필드는 정적 판정 제외: " + ", ".join(unresolved),
+                    "guide_ref": spec["guide"],
+                })
+            else:
+                checks.append({
+                    "name": field,
+                    "ok": True,
+                    "detail": "계약 확인",
+                    "guide_ref": spec["guide"],
+                })
+
+        if "home_widget" in active and "get_dashboard_data" not in methods:
+            checks.append({
+                "name": "home_widget 데이터 메서드",
+                "ok": True,
+                "warn": True,
+                "detail": "경고: get_dashboard_data() 직접 구현을 정적으로 확인할 수 없습니다",
+                "guide_ref": "가이드 §5-1 홈 대시보드 위젯 계약",
+            })
+        if "detail_sidebar_widget" in active and "get_detail_sidebar_data" not in methods:
+            checks.append({
+                "name": "detail_sidebar_widget 데이터 메서드",
+                "ok": True,
+                "warn": True,
+                "detail": "경고: get_detail_sidebar_data() 직접 구현을 정적으로 확인할 수 없습니다",
+                "guide_ref": "가이드 §3 도서 상세 페이지 사이드바 위젯",
+            })
+        if not active and not any((statuses.get(field) or {}).get("status") == "unresolved" for field in specs):
+            checks.append({
+                "name": "최신 선택 계약",
+                "ok": True,
+                "detail": "home_widget/detail_sidebar_widget/detail_view 미선언",
+                "guide_ref": "가이드 호환성 매트릭스 1.0.8~1.1.0+",
+            })
+        return checks
+
     def _validate_plugin_source(self, plugin_dir, detected_id):
         """
         설치 대상 플러그인 소스 정적 검증 (코드 실행 없음 — AST/파일 스캔만).
@@ -2991,8 +3208,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         checks = []
         base_names = ("base.py", "__init__.py")
 
-        # manifest 사전 추출 (VERSION 필수 판정에 사용)
+        # manifest/Provider 메타 사전 추출 (VERSION 및 최신 선택 계약 판정에 사용)
         manifest_files, manifest = self._extract_update_manifest_files(plugin_dir)
+        provider_meta = self._extract_provider_metadata(plugin_dir) or {}
 
         # 1. VERSION 파일 검사 (update_manifest 선언 시 필수, 미선언 시 경고만)
         vpath = os.path.join(plugin_dir, "VERSION")
@@ -3121,7 +3339,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                             elif t.id == "config_schema":
                                 if isinstance(val, (ast.List, ast.Tuple)):
                                     cls_fields.add("config_schema")
-                            elif t.id in ("category_tab", "update_manifest", "dashboard_widget"):
+                            elif t.id in (
+                                "category_tab", "update_manifest", "dashboard_widget",
+                                "home_widget", "detail_sidebar_widget", "detail_view",
+                            ):
                                 if isinstance(val, ast.Dict):
                                     cls_fields.add(t.id)
                     elif isinstance(stmt, ast.FunctionDef):
@@ -3206,6 +3427,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         else:
             checks.append({"name": "필수 메서드", "ok": False, "detail": "클래스 없음",
                            "guide_ref": "가이드 §3 플러그인 클래스 기본 계약 (search/apply 메서드)"})
+
+        # 5-1. 최신 선택 계약(home/detail sidebar/detail view) 정적 검증
+        checks.extend(self._validate_latest_optional_contracts(
+            plugin_dir, provider_meta, manifest_files
+        ))
 
         # 6. 금지 패턴 검사
         if forbidden_hits:
@@ -5113,6 +5339,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "is_searchable": False,
                 "is_category": False,
                 "is_widget": False,
+                "supports_home_widget": None,
+                "supports_detail_sidebar_widget": None,
+                "supports_detail_view": None,
                 "has_update_manifest": False,
                 "has_config": False,
                 "is_system": False,
