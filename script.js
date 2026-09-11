@@ -894,21 +894,6 @@
         });
     }
 
-    function renderCapabilityBadge(value, label, iconClass) {
-        const supported = value === true;
-        const unsupported = value === false;
-        const stateClass = supported
-            ? 'pm-capability-supported'
-            : (unsupported ? 'pm-capability-unsupported' : 'pm-capability-unknown');
-        const stateIcon = supported
-            ? 'fa-solid fa-check'
-            : (unsupported ? 'fa-solid fa-minus' : 'fa-solid fa-question');
-        const stateText = supported ? '지원' : (unsupported ? '미지원' : '판정 불가');
-        return `<span class="pm-capability-badge ${stateClass}" title="${label}: ${stateText}">`
-            + `<i class="${iconClass}"></i><span>${label}</span><i class="${stateIcon} pm-capability-state-icon"></i>`
-            + '</span>';
-    }
-
     // 카드 렌더링
     function renderPlugins() {
         const grid = document.getElementById('pm-plugins-grid');
@@ -977,11 +962,17 @@
                 ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-magnifying-glass"></i> 수동 검색</span>'
                 : '';
 
-            const capabilityBadges = [
-                renderCapabilityBadge(p.supports_home_widget, '홈', 'fa-solid fa-house'),
-                renderCapabilityBadge(p.supports_detail_sidebar_widget, '상세 사이드바', 'fa-solid fa-table-columns'),
-                renderCapabilityBadge(p.supports_detail_view, '상세 뷰', 'fa-solid fa-window-maximize'),
-            ].join('');
+            const homeWidgetBadge = p.supports_home_widget === true
+                ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-house"></i> 홈</span>'
+                : '';
+
+            const detailSidebarBadge = p.supports_detail_sidebar_widget === true
+                ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-table-columns"></i> 상세 사이드바</span>'
+                : '';
+
+            const detailViewBadge = p.supports_detail_view === true
+                ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-window-maximize"></i> 상세 뷰</span>'
+                : '';
 
             const updateBtnHtml = (p.has_update && (p.has_update_manifest || !p.is_system))
                 ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(p.latest_version)})">
@@ -1053,10 +1044,9 @@
                             ${categoryBadge}
                             ${widgetBadge}
                             ${searchableBadge}
-                        </div>
-                        <div class="pm-capabilities-row" aria-label="선택 계약 지원 여부">
-                            <span class="pm-capabilities-label">지원</span>
-                            ${capabilityBadges}
+                            ${homeWidgetBadge}
+                            ${detailSidebarBadge}
+                            ${detailViewBadge}
                         </div>
                     </div>
 
