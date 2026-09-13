@@ -1005,7 +1005,19 @@
                 ? updateCheckFailedBadgeHtml()
                 : (p.update_blocked ? blockedBadgeHtml(p.blocked_reason) : '');
 
-
+            // 위험 설치/카탈로그 검증 실패 상태는 설치 후에도 사라지지 않게 정적으로 표시한다.
+            // 현재 설치 소스가 invalid/unknown이면 그 상태를 우선하고, 카탈로그는 정상/미등록이지만
+            // Git 설치본에 update_manifest가 없으면 업데이트 미지원 상태를 표시한다.
+            const installedCatalogStatus = String(p.catalog_status || '').toLowerCase();
+            const installedValidationMessage = (p.catalog_validation_message || '').trim();
+            let installedValidationBadge = '';
+            if (p.catalog_valid === false || installedCatalogStatus === 'invalid') {
+                installedValidationBadge = ` <span class="pm-badge pm-badge-install-error pm-installed-validation-badge" title="${escapeHtmlAttr(installedValidationMessage || '현재 설치 소스가 카탈로그 검증을 통과하지 못했습니다.')}"><i class="fa-solid fa-triangle-exclamation"></i> 검증 실패</span>`;
+            } else if (installedCatalogStatus === 'unknown') {
+                installedValidationBadge = ` <span class="pm-badge pm-badge-install-error pm-installed-validation-badge" title="${escapeHtmlAttr(installedValidationMessage || '현재 설치 소스의 카탈로그 검증이 아직 완료되지 않았습니다.')}"><i class="fa-solid fa-clock"></i> 검증 대기</span>`;
+            } else if (p.git_url && !p.has_update_manifest) {
+                installedValidationBadge = ' <span class="pm-badge pm-blocked-badge pm-installed-validation-badge" title="이 Git 설치본에는 활성 update_manifest가 없어 Plugin Manager 자동 업데이트를 사용할 수 없습니다."><i class="fa-solid fa-circle-exclamation"></i> 업데이트 미지원</span>';
+            }
 
             const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url && p.has_update_manifest)
                 ? `<select class="pm-update-channel-select" data-id="${p.id}" title="업데이트 경로 선택 — 선택한 경로만 사용하며 폴백하지 않습니다" style="padding:0.35rem 0.5rem;border-radius:6px;background:var(--app-input-bg,rgba(15,23,42,.6));border:1px solid var(--app-border,rgba(255,255,255,.15));color:var(--app-text-primary,#fff);font-size:.78rem;">
@@ -1046,7 +1058,7 @@
                                 </div>
                                 <div>
                                     <h4 class="pm-plugin-name">${p.name}</h4>
-                                    <span class="pm-plugin-id">${p.id} • v${p.version}${updateStatusBadge}</span>
+                                    <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateStatusBadge}</span>
                                 </div>
                             </div>
                             ${settingsBtnHtml}

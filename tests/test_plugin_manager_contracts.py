@@ -586,6 +586,76 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
 
         self.assertEqual(branch, "master")
 
+    def test_installed_invalid_catalog_source_keeps_validation_state(self):
+        installed = {
+            "id": "jazzradio",
+            "name": "Jazz Radio",
+            "version": "1.6.1",
+            "git_url": "https://github.com/colaiuta77/jazzradio",
+            "has_update_manifest": False,
+            "is_installed": True,
+        }
+        invalid_row = {
+            "full_name": "colaiuta77/jazzradio",
+            "html_url": "https://github.com/colaiuta77/jazzradio",
+            "description": "Jazz Radio",
+            "topics": "[]",
+            "default_branch": "main",
+            "pushed_at": "2026-09-08T06:24:16Z",
+            "plugin_id": "jazzradio",
+            "plugin_name": "Jazz Radio",
+            "latest_version": "1.6.1",
+            "is_valid": "invalid",
+            "last_checked": "2026-09-13T14:36:27Z",
+            "install_error": None,
+            "source": "github",
+            "base_url": "https://github.com",
+        }
+        self.manager._catalog_list_valid_repos = lambda db_type=None: []
+        self.manager._catalog_list_repos = lambda db_type=None, valid_only=False: [invalid_row]
+        self.manager._catalog_get_allow_invalid_install = lambda db_type: True
+        self.manager._catalog_meta_dict = lambda db_type: {}
+
+        merged, _ = self.manager._merge_catalog_plugins([installed], "general")
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["catalog_status"], "invalid")
+        self.assertFalse(merged[0]["catalog_valid"])
+        self.assertIn("update_manifest", merged[0]["catalog_validation_message"])
+
+    def test_installed_catalog_state_uses_exact_source_not_same_id_other_repo(self):
+        installed = {
+            "id": "demo",
+            "git_url": "https://github.com/example/current",
+            "has_update_manifest": False,
+            "is_installed": True,
+        }
+        other_row = {
+            "full_name": "other/demo",
+            "html_url": "https://github.com/other/demo",
+            "plugin_id": "demo",
+            "plugin_name": "Demo",
+            "latest_version": "1.0.0",
+            "is_valid": "invalid",
+            "source": "github",
+            "base_url": "https://github.com",
+        }
+        self.manager._catalog_list_valid_repos = lambda db_type=None: []
+        self.manager._catalog_list_repos = lambda db_type=None, valid_only=False: [other_row]
+        self.manager._catalog_get_allow_invalid_install = lambda db_type: True
+        self.manager._catalog_meta_dict = lambda db_type: {}
+
+        merged, _ = self.manager._merge_catalog_plugins([installed], "general")
+
+        self.assertNotIn("catalog_status", merged[0])
+        self.assertNotIn("catalog_valid", merged[0])
+
+    def test_installed_card_renders_persistent_validation_badges(self):
+        script = (Path(__file__).resolve().parents[1] / "script.js").read_text(encoding="utf-8")
+        self.assertIn("pm-installed-validation-badge", script)
+        self.assertIn("검증 실패</span>", script)
+        self.assertIn("업데이트 미지원</span>", script)
+
     def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
         invalid_row = {
             "full_name": "example/broken",

@@ -5481,8 +5481,41 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         catalog_rows = self._catalog_list_repos(db_type, valid_only=False)
         allow_invalid_install = self._catalog_get_allow_invalid_install(db_type)
         merged = list(plugins)
-        # 설치된 플러그인 → 같은 plugin_id의 다른 검증 통과 소스 후보 첨부 (소스 교체용)
+        # 설치된 Git 플러그인도 현재 설치 소스와 일치하는 카탈로그 검증 상태를 유지한다.
+        # 위험 설치로 설치된 뒤 카드가 정상처럼 보이지 않도록 exact git_url 매치만 사용하며,
+        # 같은 plugin_id의 다른 저장소 상태는 현재 설치본에 전파하지 않는다.
         installed_by_id = {p.get("id"): p for p in plugins if p.get("id")}
+        for r in catalog_rows:
+            plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
+            inst = installed_by_id.get(plugin_id)
+            if not inst:
+                continue
+            current_git = str(inst.get("git_url") or "").strip().rstrip("/")
+            if not current_git:
+                continue
+            source = str(r.get("source") or "github")
+            if source == "gitea" and r.get("base_url"):
+                row_git = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
+            else:
+                row_git = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            if str(row_git or "").strip().rstrip("/") != current_git:
+                continue
+            catalog_status = str(r.get("is_valid") or "unknown").strip().lower() or "unknown"
+            catalog_valid = catalog_status == "valid"
+            if catalog_status == "unknown":
+                validation_message = "현재 설치 소스의 카탈로그 검증이 아직 완료되지 않았습니다."
+            elif not catalog_valid and r.get("latest_version"):
+                validation_message = "현재 설치 소스의 VERSION은 확인했지만 Provider 또는 update_manifest 설치 계약 검증에 실패했습니다."
+            elif not catalog_valid:
+                validation_message = "현재 설치 소스의 VERSION, Provider 또는 update_manifest 설치 계약을 확인할 수 없습니다."
+            else:
+                validation_message = ""
+            inst["catalog_status"] = catalog_status
+            inst["catalog_valid"] = catalog_valid
+            inst["catalog_validation_message"] = validation_message
+            break
+
+        # 설치된 플러그인 → 같은 plugin_id의 다른 검증 통과 소스 후보 첨부 (소스 교체용)
         for r in valid_catalog_rows:
             plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
             if plugin_id not in installed_by_id:
