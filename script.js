@@ -8,52 +8,18 @@
     let pendingDeletePluginId = null;
     let catalogMeta = null; // {last_refresh, refresh_interval_hours, topics, refresh_state, refresh_error}
 
-    // 소스 타입 감지: GitHub vs Gitea
-    function getSourceType(gitUrl, catalogSource) {
-        // catalog 데이터에 source가 있으면 우선 사용
-        if (catalogSource) return catalogSource;
-        // git_url로 판단
-        if (!gitUrl) return 'local';
-        const url = gitUrl.toLowerCase();
-        if (url.includes('github.com')) return 'github';
-        // 백엔드 표준 응답은 snake_case(gitea_servers). 구형 camelCase도 호환한다.
-        const giteaServers = catalogMeta
-            ? (Array.isArray(catalogMeta.gitea_servers)
-                ? catalogMeta.gitea_servers
-                : (Array.isArray(catalogMeta.giteaServers) ? catalogMeta.giteaServers : []))
-            : [];
-        let gitHost = '';
-        try { gitHost = new URL(gitUrl).host.toLowerCase(); } catch (_) { /* fallback below */ }
-        // 설정된 Gitea 서버 host와 정확히 일치하면 Gitea로 판정한다.
-        for (const srv of giteaServers) {
-            if (srv.enabled !== false && srv.url) {
-                try {
-                    const host = new URL(srv.url).host.toLowerCase();
-                    if (gitHost && gitHost === host) return 'gitea';
-                } catch (_) { /* ignore invalid URL */ }
-            }
-        }
-        // 기타 gitea 패턴 (gitea. 도메인 등) - fallback
-        if (url.includes('gitea.')) return 'gitea';
-        return 'github'; // 기본값
+    // 사용자에게 보이는 소스 타입은 LOCAL / GIT 두 종류로 단순화한다.
+    // GitHub/Gitea 구분은 백엔드의 인증·카탈로그·업데이트 처리에서만 유지한다.
+    function getSourceType(gitUrl) {
+        return gitUrl ? 'git' : 'local';
     }
 
     function getSourceIcon(sourceType) {
-        switch (sourceType) {
-            case 'gitea': return 'fa-solid fa-server';
-            case 'local': return 'fa-solid fa-folder';
-            case 'github':
-            default: return 'fa-brands fa-github';
-        }
+        return sourceType === 'local' ? 'fa-solid fa-folder' : 'fa-solid fa-code-branch';
     }
 
     function getSourceLabel(sourceType) {
-        switch (sourceType) {
-            case 'gitea': return 'Gitea';
-            case 'local': return '로컬 플러그인';
-            case 'github':
-            default: return 'GitHub';
-        }
+        return sourceType === 'local' ? 'LOCAL' : 'GIT';
     }
 
     // 🎨 테마 감지 (MutationObserver - 가이드 규격)
@@ -411,9 +377,8 @@
         const currentSrc = p && p.git_url ? p.git_url : '';
 
         const rows = candidates.map((c, i) => {
-            const isGitea = c.source === 'gitea';
-            const srcLabel = isGitea ? 'Gitea' : 'GitHub';
-            const srcIcon = isGitea ? 'fa-solid fa-server' : 'fa-brands fa-github';
+            const srcLabel = 'GIT';
+            const srcIcon = 'fa-solid fa-code-branch';
             // 버전 비교 — 다운그레이드 경고
             const cver = c.latest_version || '?';
             let warnDowngrade = '';
@@ -789,7 +754,7 @@
         if (countUninstalled) countUninstalled.textContent = allPlugins.filter(p => !p.is_installed).length;
     }
 
-    // 미설치(카탈로그) 카드 렌더 — GitHub 토픽 검색으로 발견된 저장소
+    // 미설치(카탈로그) 카드 렌더 — Git 카탈로그에서 발견된 저장소
     function renderCatalogCard(p) {
         const cat = p.catalog || {};
         const fullName = cat.full_name || p.git_url || p.id;
@@ -806,8 +771,8 @@
         const desc = cat.description
             ? '<p class="pm-catalog-desc">' + escapeHtml(cat.description) + '</p>'
             : '';
-        // 소스 타입 감지 (catalog.source 우선, 없으면 git_url로 판단)
-        const sourceType = getSourceType(p.git_url, cat.source);
+        // UI 소스 표시는 LOCAL / GIT 두 종류만 사용
+        const sourceType = getSourceType(p.git_url);
         const sourceIcon = getSourceIcon(sourceType);
         const sourceLabel = getSourceLabel(sourceType);
 
@@ -846,7 +811,7 @@
                             ? `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
                                 <i class="fa-solid fa-circle-exclamation"></i> 설치 불가
                                </button>`
-                            : `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="GitHub 저장소에서 설치">
+                            : `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="Git 저장소에서 설치">
                                 <i class="fa-solid fa-download"></i> 설치
                                </button>`}
                     </div>
@@ -945,14 +910,14 @@
                 ? '<span class="pm-badge pm-badge-system">SYSTEM</span>'
                 : '';
 
-            // 소스 타입 감지 (git_url로 GitHub/Gitea/로컬 구분)
+            // UI 소스 타입은 git_url 유무로 GIT/LOCAL 구분
             const sourceType = getSourceType(p.git_url);
             const sourceIcon = getSourceIcon(sourceType);
             const sourceLabel = getSourceLabel(sourceType);
 
             const originBadge = p.git_url
                 ? `<a class="pm-badge pm-badge-git" href="${escapeHtml(p.git_url)}" target="_blank" rel="noopener noreferrer" title="Git 저장소 열기 (${escapeHtml(p.git_url)})" onclick="event.stopPropagation();"><i class="${sourceIcon}"></i> ${sourceLabel}</a>`
-                : '<span class="pm-badge pm-badge-local"><i class="fa-solid fa-folder"></i> 로컬 플러그인</span>';
+                : '<span class="pm-badge pm-badge-local"><i class="fa-solid fa-folder"></i> LOCAL</span>';
 
             const categoryBadge = p.is_category
                 ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-layer-group"></i> 카테고리 뷰</span>'

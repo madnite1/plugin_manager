@@ -38,9 +38,13 @@ Plugin Manager는 Provider를 실행하지 않고 AST로 `home_widget`, `detail_
 - 설치 후 `_verify_installed_plugin_static()`은 기존처럼 Provider id와 선택적 VERSION의 최소 무결성만 확인합니다. 신규 UI 계약 검증을 사후 삭제/롤백 게이트로 사용하지 않아 `force` 설치의 기존 의미를 유지합니다.
 - 설치된 플러그인 카드에는 **실제로 지원하는 홈 / 상세 사이드바 / 상세 뷰만** 기존 **카테고리 뷰**와 같은 기능 배지로 표시합니다. 미지원 또는 정적으로 판정할 수 없는 항목은 카드에 별도 배지를 만들지 않으며, 미설치 카탈로그 항목은 원격 소스를 추가 분석하지 않습니다.
 
-### 1.14.27 저장소 이전/Gitea 표시 수정
+### 1.14.29 소스 표시 단순화
 
-1.14.27부터 카탈로그에 동일 `plugin_id`의 다른 저장소가 발견되면 현재 업데이트가 차단된 상태가 아니어도 **저장소 변경** 버튼을 표시합니다. 따라서 기존 플러그인의 `update_manifest.enabled`가 `False`이거나 현재 업데이트 확인을 수행하지 않는 상태에서도 GitHub → Gitea 같은 저장소 이전 후보를 선택할 수 있습니다. 또한 백엔드의 표준 `gitea_servers` 응답을 기준으로 설치 소스 host를 판별하고 구형 `giteaServers` 필드도 호환하여, `git-235.duckdns.org`처럼 도메인에 `gitea.` 문자열이 없는 Gitea 서버도 올바르게 **Gitea**로 표시합니다.
+1.14.29부터 플러그인 카드와 저장소 변경 UI에서 GitHub/Gitea를 별도 배지로 구분하지 않고 **`GIT` / `LOCAL`** 두 종류만 표시합니다. 저장소 URL, 인증 토큰, 카탈로그 수집, release/tag/branch 처리에는 기존 GitHub/Gitea 구분을 그대로 유지하므로 동작에는 영향이 없습니다.
+
+### 1.14.27 저장소 이전 처리 수정
+
+1.14.27부터 카탈로그에 동일 `plugin_id`의 다른 저장소가 발견되면 현재 업데이트가 차단된 상태가 아니어도 **저장소 변경** 버튼을 표시합니다. 따라서 기존 플러그인의 `update_manifest.enabled`가 `False`이거나 현재 업데이트 확인을 수행하지 않는 상태에서도 GitHub → Gitea 같은 저장소 이전 후보를 선택할 수 있습니다.
 
 ### 1.14.26 UI 정리
 
@@ -143,10 +147,9 @@ https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{bra
 4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
 
 설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 설치는 zip/git
-어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다 — 유효한 GitHub 루트
-주소면 `git_url` / `branch` / `update_channel` / `manifest_files` 이력이 남아 자동
-업데이트·GitHub 배지가 활성화되고, manifest가 없거나 monorepo 서브디렉토리면 레코드가 없어
-로컬 플러그인으로 유지됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
+어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다. 유효한 Git 저장소 소스면
+`git_url` / `branch` / `update_channel` / `manifest_files` 이력이 남아 자동 업데이트와 **GIT** 배지가 활성화되고,
+소스 메타가 없으면 **LOCAL** 플러그인으로 표시됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
 자동으로 DB에 마이그레이션됩니다 — `.zip_source`처럼 git_url이 없는 파일은 삭제 후
 `update_manifest` 기준으로 재판단).
 업데이트 확인과 실제 업데이트는 동일하게 해석한 `branch` / `release` / `tag` ref를 사용하므로 VERSION 확인 대상과 ZIP 설치 대상이 달라지지 않습니다.
