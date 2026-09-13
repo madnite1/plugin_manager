@@ -1229,6 +1229,11 @@ input:checked + .pm-slider:before {
     to { opacity: 1; }
 }
 
+/* 중첩 모달: 검증 확인은 저장소 변경 등 기존 모달보다 항상 위에 표시 */
+.pm-modal-overlay.pm-modal-overlay-top {
+    z-index: 11000;
+}
+
 .pm-modal {
     background: var(--app-bg-card, #1e293b);
     border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
