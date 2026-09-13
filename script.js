@@ -16,15 +16,21 @@
         if (!gitUrl) return 'local';
         const url = gitUrl.toLowerCase();
         if (url.includes('github.com')) return 'github';
-        // 설정된 Gitea 서버들에서 동적으로 확인
-        if (catalogMeta && Array.isArray(catalogMeta.giteaServers)) {
-            for (const srv of catalogMeta.giteaServers) {
-                if (srv.enabled !== false && srv.url) {
-                    try {
-                        const host = new URL(srv.url).host;
-                        if (url.includes(host)) return 'gitea';
-                    } catch (_) { /* ignore invalid URL */ }
-                }
+        // 백엔드 표준 응답은 snake_case(gitea_servers). 구형 camelCase도 호환한다.
+        const giteaServers = catalogMeta
+            ? (Array.isArray(catalogMeta.gitea_servers)
+                ? catalogMeta.gitea_servers
+                : (Array.isArray(catalogMeta.giteaServers) ? catalogMeta.giteaServers : []))
+            : [];
+        let gitHost = '';
+        try { gitHost = new URL(gitUrl).host.toLowerCase(); } catch (_) { /* fallback below */ }
+        // 설정된 Gitea 서버 host와 정확히 일치하면 Gitea로 판정한다.
+        for (const srv of giteaServers) {
+            if (srv.enabled !== false && srv.url) {
+                try {
+                    const host = new URL(srv.url).host.toLowerCase();
+                    if (gitHost && gitHost === host) return 'gitea';
+                } catch (_) { /* ignore invalid URL */ }
             }
         }
         // 기타 gitea 패턴 (gitea. 도메인 등) - fallback
@@ -699,13 +705,11 @@
     function clearCardUpdateStatus(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (card) {
-            // 이전 비동기 업데이트 확인에서 남은 상태 UI를 카드 전체에서 정리한다.
+            // 업데이트 확인 상태만 정리한다. 저장소 교체 후보/버튼은 카탈로그 상태이므로 유지한다.
             card.querySelectorAll('.pm-blocked-badge, .pm-update-check-failed-badge').forEach(el => el.remove());
-            card.querySelectorAll('.pm-btn-replace').forEach(el => el.remove());
         }
         p.update_blocked = false;
         p.blocked_reason = null;
-        p.replace_candidates = [];
         p.update_check_failed = false;
     }
 
@@ -980,9 +984,9 @@
                    </button>`
                 : '';
 
-            // 소스 교체 필요 상태 (업데이트 차단 + 후보 존재)
-            const replaceBtnHtml = (p.update_blocked && Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0)
-                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 저장소로 변경 (업데이트 불가 상태 탈출)">
+            // 동일 plugin_id의 다른 저장소 후보가 있으면 업데이트 차단 여부와 무관하게 교체 가능
+            const replaceBtnHtml = (Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0)
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="동일 플러그인의 다른 저장소로 변경">
                     <i class="fa-solid fa-arrows-rotate"></i> 저장소 변경
                    </button>`
                 : '';
@@ -1136,9 +1140,9 @@
             });
         });
 
-        // Update Button
+        // Update / 저장소 변경 버튼
         document.querySelectorAll('.pm-btn-update').forEach(bindUpdateButton);
-
+        document.querySelectorAll('.pm-btn-replace').forEach(bindReplaceButton);
 
         // Rollback Button
         document.querySelectorAll('.pm-btn-rollback').forEach(btn => {
