@@ -1336,19 +1336,30 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 ref_name = self._fetch_latest_tag(parsed, db_type)
             if not ref_name:
                 return None
+            # 설치 시 저장된 git_url/branch를 업데이트 원본의 최종 기준으로 사용한다.
+            # 플러그인 코드의 raw_base_url이 과거 저장소를 가리키더라도 설치 소스와
+            # 다른 저장소를 조회하지 않는다. 같은 저장소의 monorepo subpath만 보존한다.
             raw_prefix = self._host_zip_base(parsed)[2]
-            resolved_raw = raw_base_url
-            if raw_base_url.startswith(raw_prefix):
-                if parsed["type"] == "gitea" and "/raw/branch/" in raw_base_url:
-                    target_prefix = "/branch/" if mode == "branch" else "/tag/"
-                    resolved_raw = raw_base_url.replace(raw_prefix + "/branch/" + branch, raw_prefix + target_prefix + ref_name, 1)
-                else:
-                    refs_heads = raw_prefix + "/refs/heads/" + branch
-                    if refs_heads in raw_base_url:
-                        target = refs_heads if mode == "branch" else raw_prefix + "/" + ref_name
-                        resolved_raw = raw_base_url.replace(refs_heads, target, 1)
-                    else:
-                        resolved_raw = raw_base_url.replace(raw_prefix + "/" + branch, raw_prefix + "/" + ref_name, 1)
+            manifest_raw = str(raw_base_url or "").strip().rstrip("/")
+            manifest_parsed = self._parse_raw_base_url(manifest_raw)
+            manifest_host = self._host_of_url(manifest_raw).lower()
+            same_repo = bool(
+                manifest_parsed
+                and manifest_parsed[0] == parsed["owner"]
+                and manifest_parsed[1] == parsed["repo"]
+                and (
+                    (parsed["type"] == "github" and manifest_host == "raw.githubusercontent.com")
+                    or (parsed["type"] == "gitea" and manifest_host == str(parsed["host"]).lower())
+                )
+            )
+            subpath = manifest_parsed[3] if same_repo and manifest_parsed else ""
+            if parsed["type"] == "gitea":
+                ref_kind = "branch" if mode == "branch" else "tag"
+                resolved_raw = "{0}/{1}/{2}".format(raw_prefix, ref_kind, ref_name)
+            else:
+                resolved_raw = "{0}/{1}".format(raw_prefix, ref_name)
+            if subpath:
+                resolved_raw += "/" + str(subpath).strip("/")
             return {"mode": mode, "ref_name": ref_name, "raw_base_url": resolved_raw, "git_info": git_info, "parsed": parsed}
         except Exception:
             return None
@@ -1566,12 +1577,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not resolved_ref:
                 return has_update, latest_version, "ref_unavailable"
             base_url = resolved_ref["raw_base_url"]
-            # Gitea 소스면 해당 호스트 토큰 사용 (비공개 저장소 인증)
+            # 인증도 manifest URL이 아니라 실제로 해석된 설치 소스 기준으로 선택한다.
             gitea_token = None
-            raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
-            if raw_parsed:
-                src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
-                gitea_token = self._gitea_token_for_host(db_type, src_host)
+            resolved_parsed = resolved_ref.get("parsed") if isinstance(resolved_ref, dict) else None
+            if resolved_parsed and resolved_parsed.get("type") == "gitea":
+                gitea_token = self._gitea_token_for_host(db_type, resolved_parsed.get("host"))
             try:
                 remote_ver = self._fetch_remote_plugin_version(
                     base_url,
@@ -3602,10 +3612,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         base_url = resolved_ref["raw_base_url"]
 
         gitea_token = None
-        raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
-        if raw_parsed:
-            src_host = re.sub(r"^https?://", "", str(spec["raw_base_url"])).split("/")[0]
-            gitea_token = self._gitea_token_for_host(db_type, src_host)
+        resolved_parsed = resolved_ref.get("parsed") if isinstance(resolved_ref, dict) else None
+        if resolved_parsed and resolved_parsed.get("type") == "gitea":
+            gitea_token = self._gitea_token_for_host(db_type, resolved_parsed.get("host"))
 
         remote_ver = self._fetch_remote_plugin_version(
             base_url,
@@ -5277,36 +5286,45 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             logger.warning("플러그인 자동 업데이트 실행 중 오류 (%s)", db_type, exc_info=True)
 
-    def _catalog_list_valid_repos(self, db_type=None):
-        """is_valid=valid 저장소 목록 (설치 여부 판정용, pushed_at 최신순).
-        db_type이 주어지면 활성화된 Gitea 서버의 base_url에 해당하는 행만 포함."""
+    def _catalog_list_repos(self, db_type=None, valid_only=False):
+        """카탈로그 저장소 목록을 pushed_at 최신순으로 반환한다.
+
+        valid_only=True는 설치/저장소 변경처럼 검증 통과 저장소만 허용할 때 사용한다.
+        미설치 목록은 invalid/unknown도 함께 보여 사용자가 저장소가 사라진 것으로
+        오인하지 않게 한다. db_type이 주어지면 Gitea는 활성 서버만 포함한다.
+        """
         try:
             enabled_hosts = set()
-            if db_type:
+            filter_gitea = db_type is not None
+            if filter_gitea:
                 for s in self._catalog_get_gitea_servers(db_type):
-                    enabled_hosts.add(s["host"])
+                    enabled_hosts.add(str(s.get("host") or "").lower())
+            where = " WHERE is_valid='valid'" if valid_only else ""
             query = (
                 "SELECT full_name, html_url, description, topics, default_branch, pushed_at, "
-                "plugin_id, plugin_name, latest_version, last_checked, install_error, source, base_url FROM repos "
-                "WHERE is_valid='valid' ORDER BY COALESCE(pushed_at, '') DESC"
+                "plugin_id, plugin_name, latest_version, is_valid, last_checked, install_error, source, base_url FROM repos"
+                + where
+                + " ORDER BY COALESCE(pushed_at, '') DESC"
             )
             rows = self._catalog_db_query(query)
-            if enabled_hosts:
-                filtered = []
-                for r in rows:
-                    if r.get("source") == "gitea":
-                        base_url = r.get("base_url") or ""
-                        host = None
-                        if base_url:
-                            host = re.sub(r"^https?://", "", base_url).split("/")[0]
-                        if host and host in enabled_hosts:
-                            filtered.append(r)
-                    else:
+            if not filter_gitea:
+                return rows
+            filtered = []
+            for r in rows:
+                if r.get("source") == "gitea":
+                    base_url = str(r.get("base_url") or "")
+                    host = re.sub(r"^https?://", "", base_url).split("/")[0].lower() if base_url else ""
+                    if host and host in enabled_hosts:
                         filtered.append(r)
-                return filtered
-            return rows
+                else:
+                    filtered.append(r)
+            return filtered
         except Exception:
             return []
+
+    def _catalog_list_valid_repos(self, db_type=None):
+        """설치와 저장소 변경에 사용할 검증 통과 카탈로그 저장소만 반환한다."""
+        return self._catalog_list_repos(db_type, valid_only=True)
 
     @staticmethod
     def _catalog_parse_topics_json(raw):
@@ -5360,16 +5378,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     def _merge_catalog_plugins(self, plugins, db_type):
         """
-        설치된 플러그인 목록에 미설치 카탈로그 항목(valid만) 병합.
-        설치 여부는 응답 시점에 폴더+id 기준 동적 판정 (DB에 저장 안 함 — 설치/삭제 즉시 반영).
-        invalid 저장소는 목록/count에서 제외.
+        설치된 플러그인 목록에 카탈로그 미설치 항목을 병합한다.
+        미설치 목록에는 invalid/unknown도 상태를 표시해 저장소가 사라진 것처럼 보이지 않게 하고,
+        저장소 변경 후보는 기존과 동일하게 valid 저장소만 허용한다.
         """
         installed_ids = {p.get("id") for p in plugins if p.get("id")}
-        catalog_rows = self._catalog_list_valid_repos(db_type)
+        valid_catalog_rows = self._catalog_list_valid_repos(db_type)
+        catalog_rows = self._catalog_list_repos(db_type, valid_only=False)
+        allow_invalid_install = self._catalog_get_allow_invalid_install(db_type)
         merged = list(plugins)
-        # 설치된 플러그인 → 같은 plugin_id의 다른 소스 후보 첨부 (소스 교체용)
+        # 설치된 플러그인 → 같은 plugin_id의 다른 검증 통과 소스 후보 첨부 (소스 교체용)
         installed_by_id = {p.get("id"): p for p in plugins if p.get("id")}
-        for r in catalog_rows:
+        for r in valid_catalog_rows:
             plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
             if plugin_id not in installed_by_id:
                 continue  # 미설치 — 아래 병합 루프에서 처리
@@ -5394,15 +5414,41 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "description": r.get("description"),
             }
             inst.setdefault("replace_candidates", []).append(cand)
+        # 같은 plugin_id가 여러 저장소에 있으면 카드 id 충돌을 막기 위해 1개만 표시한다.
+        # 최신순을 유지하되 같은 id에 valid 행이 있으면 invalid/unknown 행보다 우선한다.
+        uninstalled_rows = {}
         for r in catalog_rows:
             plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
             if plugin_id in installed_ids:
-                continue  # 이미 설치됨
+                continue
+            previous = uninstalled_rows.get(plugin_id)
+            if previous is None:
+                uninstalled_rows[plugin_id] = r
+                continue
+            previous_valid = str(previous.get("is_valid") or "unknown") == "valid"
+            current_valid = str(r.get("is_valid") or "unknown") == "valid"
+            if current_valid and not previous_valid:
+                uninstalled_rows[plugin_id] = r
+
+        for plugin_id, r in uninstalled_rows.items():
             source = str(r.get("source") or "github")
             if source == "gitea" and r.get("base_url"):
                 git_url = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
             else:
                 git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
+            catalog_status = str(r.get("is_valid") or "unknown").strip().lower() or "unknown"
+            catalog_valid = catalog_status == "valid"
+            if catalog_status == "unknown":
+                validation_message = "카탈로그 검증이 아직 완료되지 않았습니다."
+            elif not catalog_valid and r.get("latest_version"):
+                validation_message = "VERSION은 확인했지만 Provider 또는 update_manifest 설치 계약 검증에 실패했습니다."
+            elif not catalog_valid:
+                validation_message = "VERSION, Provider 또는 update_manifest 설치 계약을 확인할 수 없습니다."
+            else:
+                validation_message = ""
+            catalog_install_allowed = catalog_valid or (
+                catalog_status == "invalid" and allow_invalid_install
+            )
             merged.append({
                 "id": plugin_id,
                 "name": str(r.get("plugin_name") or "").strip() or plugin_id,
@@ -5422,6 +5468,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "is_installed": False,
                 "git_url": git_url,
                 "install_error": r.get("install_error"),
+                "catalog_status": catalog_status,
+                "catalog_valid": catalog_valid,
+                "catalog_install_allowed": catalog_install_allowed,
+                "catalog_validation_message": validation_message,
                 "catalog": {
                     "full_name": r["full_name"],
                     "html_url": r.get("html_url"),

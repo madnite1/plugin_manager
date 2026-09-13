@@ -497,6 +497,87 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertEqual(result["replace_candidates"], [candidate])
         self.assertFalse(result.get("update_blocked", False))
 
+    def test_installed_git_source_overrides_stale_manifest_repository(self):
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/betty2859/media_tool",
+            "branch": "main",
+            "update_channel": "branch",
+            "update_channel_explicit": 1,
+        }
+        self.manager._catalog_get_update_path_selection_enabled = lambda db_type: True
+
+        resolved = self.manager._resolve_update_ref(
+            "media_tool",
+            "https://gitea.derekkoo.win/bookoasis/media-tool/raw/branch/main",
+            ["media_tool.py", "VERSION"],
+            "general",
+        )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["parsed"]["type"], "github")
+        self.assertEqual(
+            resolved["raw_base_url"],
+            "https://raw.githubusercontent.com/betty2859/media_tool/main",
+        )
+
+    def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
+        invalid_row = {
+            "full_name": "example/broken",
+            "html_url": "https://github.com/example/broken",
+            "description": "Broken plugin",
+            "topics": "[]",
+            "default_branch": "main",
+            "pushed_at": "2026-09-13T12:00:00Z",
+            "plugin_id": "broken",
+            "plugin_name": "Broken",
+            "latest_version": "1.2.3",
+            "is_valid": "invalid",
+            "last_checked": "2026-09-13T14:00:00Z",
+            "install_error": None,
+            "source": "github",
+            "base_url": "https://github.com",
+        }
+        self.manager._catalog_list_valid_repos = lambda db_type=None: []
+        self.manager._catalog_list_repos = lambda db_type=None, valid_only=False: [invalid_row]
+        self.manager._catalog_get_allow_invalid_install = lambda db_type: False
+        self.manager._catalog_meta_dict = lambda db_type: {}
+
+        merged, _ = self.manager._merge_catalog_plugins([], "general")
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "broken")
+        self.assertFalse(merged[0]["catalog_valid"])
+        self.assertFalse(merged[0]["catalog_install_allowed"])
+        self.assertIn("update_manifest", merged[0]["catalog_validation_message"])
+
+    def test_invalid_uninstalled_catalog_entry_can_offer_risk_install_when_enabled(self):
+        invalid_row = {
+            "full_name": "example/broken",
+            "html_url": "https://github.com/example/broken",
+            "description": "Broken plugin",
+            "topics": "[]",
+            "default_branch": "main",
+            "pushed_at": "2026-09-13T12:00:00Z",
+            "plugin_id": "broken",
+            "plugin_name": "Broken",
+            "latest_version": None,
+            "is_valid": "invalid",
+            "last_checked": "2026-09-13T14:00:00Z",
+            "install_error": None,
+            "source": "github",
+            "base_url": "https://github.com",
+        }
+        self.manager._catalog_list_valid_repos = lambda db_type=None: []
+        self.manager._catalog_list_repos = lambda db_type=None, valid_only=False: [invalid_row]
+        self.manager._catalog_get_allow_invalid_install = lambda db_type: True
+        self.manager._catalog_meta_dict = lambda db_type: {}
+
+        merged, _ = self.manager._merge_catalog_plugins([], "general")
+
+        self.assertEqual(len(merged), 1)
+        self.assertFalse(merged[0]["catalog_valid"])
+        self.assertTrue(merged[0]["catalog_install_allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

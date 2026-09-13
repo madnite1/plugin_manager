@@ -784,6 +784,15 @@
         // 수집된 플러그인 이름 우선, 없으면 owner/repo 표시
         const displayName = (p.name && p.name !== p.id) ? p.name : fullName;
         const installErr = (p.install_error || '').trim();
+        const catalogStatus = String(p.catalog_status || 'valid').toLowerCase();
+        const catalogValid = p.catalog_valid !== false && catalogStatus === 'valid';
+        const validationMessage = (p.catalog_validation_message || '').trim();
+        const catalogInstallAllowed = p.catalog_install_allowed !== false;
+        const validationBadge = catalogValid
+            ? ''
+            : catalogStatus === 'unknown'
+                ? `<span class="pm-badge pm-badge-install-error" title="${escapeHtmlAttr(validationMessage || '카탈로그 검증 대기 중입니다.')}"><i class="fa-solid fa-clock"></i> 검증 대기</span>`
+                : `<span class="pm-badge pm-badge-install-error" title="${escapeHtmlAttr(validationMessage || '카탈로그 검증에 실패했습니다.')}"><i class="fa-solid fa-triangle-exclamation"></i> 검증 실패</span>`;
         const topics = Array.isArray(cat.topics) ? cat.topics : [];
         const topicBadges = topics.map(t =>
             '<span class="pm-badge pm-badge-topic">#' + escapeHtml(t) + '</span>'
@@ -798,6 +807,24 @@
         const sourceType = getSourceType(p.git_url);
         const sourceIcon = getSourceIcon(sourceType);
         const sourceLabel = getSourceLabel(sourceType);
+        let installButton = '';
+        if (installErr) {
+            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
+                                <i class="fa-solid fa-circle-exclamation"></i> 설치 불가
+                             </button>`;
+        } else if (!catalogInstallAllowed) {
+            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="${escapeHtmlAttr(validationMessage || '카탈로그 검증을 통과하지 못해 설치가 차단되었습니다.')}">
+                                <i class="fa-solid fa-shield-halved"></i> 설치 차단
+                             </button>`;
+        } else if (!catalogValid) {
+            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="검증 실패 플러그인 설치 허용 설정에 따라 위험 설치가 가능합니다.">
+                                <i class="fa-solid fa-triangle-exclamation"></i> 위험 설치
+                             </button>`;
+        } else {
+            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="Git 저장소에서 설치">
+                                <i class="fa-solid fa-download"></i> 설치
+                             </button>`;
+        }
 
         return `
             <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}"${installErr ? ` data-install-error="${escapeHtml(installErr)}"` : ''}>
@@ -817,6 +844,7 @@
                     <div class="pm-badges-row">
                         <span class="pm-badge pm-badge-uninstalled"><i class="fa-solid fa-circle-down"></i> 미설치</span>
                         ${installErr ? '<span class="pm-badge pm-badge-install-error"><i class="fa-solid fa-triangle-exclamation"></i> 설치 오류</span>' : ''}
+                        ${validationBadge}
                         ${versionBadge}
                         ${topicBadges}
                     </div>
@@ -830,13 +858,7 @@
                         </a>
                     </div>
                     <div class="pm-card-action-btns">
-                        ${installErr
-                            ? `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
-                                <i class="fa-solid fa-circle-exclamation"></i> 설치 불가
-                               </button>`
-                            : `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="Git 저장소에서 설치">
-                                <i class="fa-solid fa-download"></i> 설치
-                               </button>`}
+                        ${installButton}
                     </div>
                 </div>
                 ${installErr ? `

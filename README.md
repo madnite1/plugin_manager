@@ -38,6 +38,10 @@ Plugin Manager는 Provider를 실행하지 않고 AST로 `home_widget`, `detail_
 - 설치 후 `_verify_installed_plugin_static()`은 기존처럼 Provider id와 선택적 VERSION의 최소 무결성만 확인합니다. 신규 UI 계약 검증을 사후 삭제/롤백 게이트로 사용하지 않아 `force` 설치의 기존 의미를 유지합니다.
 - 설치된 플러그인 카드에는 **실제로 지원하는 홈 / 상세 사이드바 / 상세 뷰만** 기존 **카테고리 뷰**와 같은 기능 배지로 표시합니다. 미지원 또는 정적으로 판정할 수 없는 항목은 카드에 별도 배지를 만들지 않으며, 미설치 카탈로그 항목은 원격 소스를 추가 분석하지 않습니다.
 
+### 1.14.34 카탈로그 검증 상태 표시와 설치 소스 정합성
+
+카탈로그 재검증에서 `invalid` 또는 `unknown`으로 판정된 미설치 저장소를 목록에서 숨기지 않고 `검증 실패`/`검증 대기` 상태로 표시합니다. 검증 실패 설치 허용 설정이 꺼져 있으면 설치 버튼만 차단하고, 켜져 있으면 기존 검증 실패 확인 모달을 거쳐 위험 설치를 선택할 수 있습니다. 저장소 변경 후보는 안전을 위해 기존처럼 `valid` 저장소만 사용합니다. 또한 설치된 플러그인의 `plugin_sources.git_url`/branch를 온라인 업데이트의 최종 원본으로 사용해, 플러그인 코드에 남은 과거 `update_manifest.raw_base_url`이 다른 저장소를 가리키더라도 잘못된 저장소의 VERSION을 조회하지 않습니다.
+
 ### 1.14.33 저장소 변경 후보 실시간 갱신
 
 저장소 변경 모달을 열 때 화면 최초 로드 시점의 `replace_candidates`를 그대로 재사용하지 않고 백엔드에서 최신 카탈로그 후보를 다시 조회합니다. `check_update` 응답은 업데이트 차단 여부와 관계없이 현재 저장소 변경 후보 배열을 항상 포함하며, 비동기 업데이트 확인에서도 카드의 후보와 저장소 변경 버튼을 최신 상태로 동기화합니다. 따라서 카탈로그 DB가 새 버전으로 갱신된 뒤에도 이미 열린 플러그인 매니저 화면의 저장소 변경 모달이 이전 버전을 계속 표시하던 문제를 수정했습니다.
@@ -48,7 +52,7 @@ Plugin Manager는 Provider를 실행하지 않고 AST로 `home_widget`, `detail_
 
 ### 1.14.31 카탈로그/저장소 변경 검증 정합성 수정
 
-카탈로그의 `valid` 판정에서도 Provider의 활성 `update_manifest` 최소 계약을 확인합니다. `update_manifest`가 없거나 비활성/비정상인 저장소는 일반 설치 목록과 저장소 변경 후보에서 제외되며, 저장소 변경은 `force` 여부와 관계없이 유효한 `update_manifest.files`를 필수로 요구합니다. 직접 Git 설치의 `검증 실패시 설치 가능` 옵션은 기존대로 유지합니다. 또한 수동 카탈로그 갱신은 24시간 검증 캐시를 무시하고 전체 저장소를 즉시 재검증해 오래된 `valid` 판정이 남지 않도록 했습니다.
+카탈로그의 `valid` 판정에서도 Provider의 활성 `update_manifest` 최소 계약을 확인합니다. `update_manifest`가 없거나 비활성/비정상인 저장소는 저장소 변경 후보에서는 제외되며, 저장소 변경은 `force` 여부와 관계없이 유효한 `update_manifest.files`를 필수로 요구합니다. 직접 Git 설치의 `검증 실패시 설치 가능` 옵션은 기존대로 유지합니다. 1.14.34부터는 이런 저장소도 일반 미설치 카탈로그 목록에는 검증 상태와 함께 표시됩니다. 또한 수동 카탈로그 갱신은 24시간 검증 캐시를 무시하고 전체 저장소를 즉시 재검증해 오래된 `valid` 판정이 남지 않도록 했습니다.
 
 ### 1.14.30 중첩 검증 모달 표시 수정
 
@@ -162,8 +166,7 @@ https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{bra
 3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
 4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
 
-설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 설치는 zip/git
-어떤 방식이든 **`update_manifest.raw_base_url` 검증 기준**으로 판단합니다. 유효한 Git 저장소 소스면
+설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 유효한 Git 저장소 소스가 저장된 뒤에는 **`plugin_sources.git_url` / `branch`를 온라인 업데이트 원본의 최종 기준**으로 사용합니다. 플러그인 코드의 `update_manifest.raw_base_url`은 배포 파일 목록과 버전 계약을 제공하지만, 과거 저장소 주소가 남아 있더라도 저장된 설치 소스와 다른 저장소로 업데이트 확인을 보내지 않습니다. 유효한 Git 저장소 소스면
 `git_url` / `branch` / `update_channel` / `manifest_files` 이력이 남아 자동 업데이트와 **GIT** 배지가 활성화되고,
 소스 메타가 없으면 **LOCAL** 플러그인으로 표시됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
 자동으로 DB에 마이그레이션됩니다 — `.zip_source`처럼 git_url이 없는 파일은 삭제 후
