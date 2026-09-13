@@ -469,6 +469,34 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
 
         self.assertTrue(self.manager._catalog_repo_needs_verify(row, now=now))
 
+    def test_check_update_always_returns_current_replace_candidates(self):
+        plugins_root = self.root / "plugins"
+        plugin_dir = plugins_root / "demo"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "VERSION").write_text(
+            '{"plugin version": "1.0.0"}\n', encoding="utf-8"
+        )
+        candidate = {
+            "git_url": "https://git.example.com/bookoasis/demo",
+            "latest_version": "2.0.0",
+        }
+
+        self.manager._get_plugins_base_dir = lambda: str(plugins_root)
+        self.manager._discover_provider_map = lambda refresh=False: {
+            "demo": {"update_manifest": None}
+        }
+        self.manager._read_git_source_info = lambda plugin_id: None
+        self.manager._check_plugin_update_detail = lambda *args, **kwargs: (
+            False, "1.0.0", "no_manifest"
+        )
+        self.manager._catalog_replace_candidates = lambda plugin_id, db_type=None: [candidate]
+
+        ok, result = self.manager._check_update_action("demo", "general")
+
+        self.assertTrue(ok)
+        self.assertEqual(result["replace_candidates"], [candidate])
+        self.assertFalse(result.get("update_blocked", False))
+
 
 if __name__ == "__main__":
     unittest.main()

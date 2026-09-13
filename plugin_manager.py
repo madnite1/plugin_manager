@@ -1473,6 +1473,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "latest_version": version,
         }
 
+        # 저장소 변경 후보는 업데이트 차단 여부와 독립적인 카탈로그 상태다.
+        # 프론트가 모달을 열 때 최신 후보/버전을 재조회할 수 있도록 항상 포함한다.
+        try:
+            result["replace_candidates"] = self._catalog_replace_candidates(plugin_id, db_type)
+        except Exception:
+            result["replace_candidates"] = []
+
         # ---- 소스 교체 후보 판정 (설계: update_blocked + blocked_reason) ----
         # A. git 소스 메타 없음 → 즉시 판정 (원격 fetch 불가)
         git_info = None
@@ -1509,10 +1516,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if blocked_reason:
             result["update_blocked"] = True
             result["blocked_reason"] = blocked_reason
-            # 같은 plugin_id의 카탈로그 후보 (현재 소스 제외) — 프론트가 모달에 표시
-            candidates = self._catalog_replace_candidates(plugin_id, db_type)
-            if candidates:
-                result["replace_candidates"] = candidates
 
         return True, result
 

@@ -340,16 +340,19 @@
     // ---- 소스 교체 (replace_git) ----
     // 카드의 replace_candidates를 모달로 보여주고 선택 시 replace_git 호출
 
-    // 교체 후보 서버 재조회 (카드 데이터에 없으면 check_update 응답 기준)
+    // 교체 후보는 모달을 열 때마다 백엔드에서 최신 카탈로그 상태를 다시 읽는다.
+    // 화면 최초 로드 시 받은 replace_candidates는 네트워크 실패 시에만 폴백으로 사용한다.
     async function fetchReplaceCandidates(pluginId) {
         const p = allPlugins.find(x => x.id === pluginId);
-        if (p && Array.isArray(p.replace_candidates)) return p.replace_candidates;
         try {
             const res = await callPluginAction({ action: 'check_update', plugin_id: pluginId });
             const r = res && res.success ? res.message : null;
-            if (r && Array.isArray(r.replace_candidates)) return r.replace_candidates;
-        } catch(e) { /* ignore */ }
-        return [];
+            if (r && Array.isArray(r.replace_candidates)) {
+                if (p) p.replace_candidates = r.replace_candidates;
+                return r.replace_candidates;
+            }
+        } catch(e) { /* 네트워크 실패 시 아래 캐시 폴백 */ }
+        return (p && Array.isArray(p.replace_candidates)) ? p.replace_candidates : [];
     }
 
     function bindReplaceButton(btn) {
@@ -517,6 +520,10 @@
                         clearCardUpdateStatus(p);
                         p.check_status = r.check_status || null;
                         p.latest_version = r.latest_version || p.version;
+                        if (Array.isArray(r.replace_candidates)) {
+                            p.replace_candidates = r.replace_candidates;
+                            syncCardReplaceButton(p);
+                        }
 
                         // DNS/인터넷/timeout 등 일시적인 조회 실패는 저장소 차단으로 취급하지 않는다.
                         if (r.update_check_failed) {
@@ -711,22 +718,38 @@
         }
     }
 
-    // 업데이트 차단 + 소스 교체 후보 있음 — 원인별 배지 + 교체 버튼 (부분 DOM 패치)
-    function patchCardReplace(p) {
+    // 카탈로그 후보 배열과 카드의 저장소 변경 버튼을 동기화한다.
+    function syncCardReplaceButton(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (!card) return;
-        const idEl = card.querySelector('.pm-plugin-id');
-        if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
-            idEl.insertAdjacentHTML('beforeend', blockedBadgeHtml(p.blocked_reason));
-        }
         const actions = card.querySelector('.pm-card-action-btns');
-        if (!actions || actions.querySelector('.pm-btn-replace')) return;
+        if (!actions) return;
+        const existing = actions.querySelector('.pm-btn-replace');
+        const hasCandidates = Array.isArray(p.replace_candidates) && p.replace_candidates.length > 0;
+        if (!hasCandidates) {
+            if (existing) existing.remove();
+            return;
+        }
+        if (existing) return;
         actions.insertAdjacentHTML('afterbegin',
-            `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="다른 저장소로 변경 (업데이트 불가 상태 탈출)">
+            `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-replace" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="동일 플러그인의 다른 저장소로 변경">
                 <i class="fa-solid fa-arrows-rotate"></i> 저장소 변경
                </button>`);
         const btn = actions.querySelector('.pm-btn-replace');
         if (btn) bindReplaceButton(btn);
+    }
+
+    // 업데이트 차단 + 소스 교체 후보 있음 — 차단 배지와 교체 버튼을 각각 동기화
+    function patchCardReplace(p) {
+        const card = document.getElementById(`pm-card-${p.id}`);
+        if (!card) return;
+        if (p.update_blocked) {
+            const idEl = card.querySelector('.pm-plugin-id');
+            if (idEl && !idEl.querySelector('.pm-blocked-badge')) {
+                idEl.insertAdjacentHTML('beforeend', blockedBadgeHtml(p.blocked_reason));
+            }
+        }
+        syncCardReplaceButton(p);
     }
 
     // 업데이트 차단 + 후보 없음 — 원인별 배지만 표시
