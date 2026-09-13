@@ -1123,6 +1123,99 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """브랜치 결정: 명시 → default_branch 설정 → main"""
         return parsed.get("branch") or parsed.get("default_branch") or "main"
 
+    def _catalog_default_branch_for_repo(self, parsed):
+        """카탈로그에 같은 실제 저장소가 있으면 그 default_branch를 반환한다."""
+        if not parsed:
+            return None
+        try:
+            full_name = "{0}/{1}".format(parsed["owner"], parsed["repo"])
+            rows = self._catalog_db_query(
+                "SELECT default_branch, source, base_url FROM repos WHERE full_name=?",
+                (full_name,),
+            )
+            for row in rows:
+                source = str(row.get("source") or "github").lower()
+                if parsed["type"] == "github":
+                    if source != "github":
+                        continue
+                else:
+                    if source != "gitea":
+                        continue
+                    host = self._host_of_url(row.get("base_url") or "").lower()
+                    if host != str(parsed.get("host") or "").lower():
+                        continue
+                branch = str(row.get("default_branch") or "").strip()
+                if branch:
+                    return branch
+        except Exception:
+            pass
+        return None
+
+    def _fetch_repository_default_branch(self, parsed, db_type=None):
+        """카탈로그에 없을 때 저장소 API에서 실제 기본 브랜치를 조회한다."""
+        if not parsed:
+            return None
+        try:
+            headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
+            if parsed["type"] == "github":
+                token = self._catalog_get_github_token(db_type)
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+                api_path = "/".join(("", "repos", parsed["owner"], parsed["repo"]))
+                url = "https://api.github.com{0}".format(api_path)
+            else:
+                token = self._gitea_token_for_host(db_type, parsed["host"])
+                if token:
+                    headers["Authorization"] = "token {0}".format(token)
+                api_path = "/".join(("", "api", "v1", "repos", parsed["owner"], parsed["repo"]))
+                url = "{0}{1}".format(parsed["base"], api_path)
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(data, dict):
+                branch = str(data.get("default_branch") or "").strip()
+                if branch:
+                    return branch
+        except Exception:
+            pass
+        return None
+
+    def _resolve_source_branch(self, parsed, git_info=None, raw_base_url=None, db_type=None):
+        """업데이트/설치에 사용할 branch를 신뢰도 순서로 결정한다.
+
+        우선순위: URL에 명시된 branch → 카탈로그/원격 default_branch →
+        같은 저장소의 update_manifest branch → 저장된 branch → main.
+        """
+        if not parsed:
+            return "main"
+        explicit = str(parsed.get("branch") or "").strip()
+        if explicit:
+            return explicit
+        catalog_branch = self._catalog_default_branch_for_repo(parsed)
+        if catalog_branch:
+            return catalog_branch
+        remote_branch = self._fetch_repository_default_branch(parsed, db_type)
+        if remote_branch:
+            return remote_branch
+        manifest_raw = str(raw_base_url or "").strip().rstrip("/")
+        manifest_parsed = self._parse_raw_base_url(manifest_raw) if manifest_raw else None
+        manifest_host = self._host_of_url(manifest_raw).lower() if manifest_raw else ""
+        same_repo = bool(
+            manifest_parsed
+            and manifest_parsed[0] == parsed["owner"]
+            and manifest_parsed[1] == parsed["repo"]
+            and (
+                (parsed["type"] == "github" and manifest_host == "raw.githubusercontent.com")
+                or (parsed["type"] == "gitea" and manifest_host == str(parsed["host"]).lower())
+            )
+        )
+        if same_repo:
+            manifest_branch = str(manifest_parsed[2] or "").strip()
+            if manifest_branch:
+                return manifest_branch
+        stored = str((git_info or {}).get("branch") or "").strip()
+        return stored or "main"
+
     def _normalize_update_channel(self, value):
         channel = str(value or "branch").strip().lower()
         return channel if channel in _UPDATE_CHANNELS else "branch"
@@ -1322,7 +1415,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             parsed = self._parse_git_repo(git_url)
             if not parsed:
                 return {"mode": "branch", "ref_name": None, "raw_base_url": raw_base_url, "git_info": git_info, "parsed": None}
-            branch = str(git_info.get("branch") or "").strip() or self._host_branch(parsed)
+            branch = self._resolve_source_branch(parsed, git_info, raw_base_url, db_type)
             enabled = self._catalog_get_update_path_selection_enabled(db_type)
             mode = self._effective_update_channel(git_info, enabled)
             ref_name = branch
@@ -2425,12 +2518,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if not zip_url:
             return None, "Git 저장소 URL 형식을 인식할 수 없습니다."
         parsed = self._parse_git_repo(git_url)
-        explicit_branch = ("/tree/" in git_url or "/src/branch/" in git_url)
+        explicit_branch = bool(parsed and parsed.get("branch"))
+        info = self._read_git_source_info(plugin_id) or {} if plugin_id else {}
+        if parsed:
+            branch = self._resolve_source_branch(parsed, info, None, db_type)
         mode = "branch"
         ref_name = branch
         if plugin_id and parsed:
-            info = self._read_git_source_info(plugin_id) or {}
-            ref_name = str(info.get("branch") or branch).strip() or branch
             mode = self._effective_update_channel(
                 info, self._catalog_get_update_path_selection_enabled(db_type)
             )

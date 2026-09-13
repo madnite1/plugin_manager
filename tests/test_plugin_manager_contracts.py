@@ -505,6 +505,8 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
             "update_channel_explicit": 1,
         }
         self.manager._catalog_get_update_path_selection_enabled = lambda db_type: True
+        self.manager._catalog_default_branch_for_repo = lambda parsed: "main"
+        self.manager._fetch_repository_default_branch = lambda parsed, db_type=None: None
 
         resolved = self.manager._resolve_update_ref(
             "media_tool",
@@ -519,6 +521,70 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
             resolved["raw_base_url"],
             "https://raw.githubusercontent.com/betty2859/media_tool/main",
         )
+
+    def test_stale_stored_main_yields_catalog_master_branch(self):
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/grandfoxx/my_reading_summary",
+            "branch": "main",
+            "update_channel": "branch",
+            "update_channel_explicit": 0,
+        }
+        self.manager._catalog_get_update_path_selection_enabled = lambda db_type: False
+        self.manager._catalog_default_branch_for_repo = lambda parsed: "master"
+        self.manager._fetch_repository_default_branch = lambda parsed, db_type=None: (_ for _ in ()).throw(AssertionError("remote lookup should not run"))
+
+        resolved = self.manager._resolve_update_ref(
+            "my_reading_summary",
+            "https://raw.githubusercontent.com/grandfoxx/my_reading_summary/master",
+            ["my_reading_summary.py", "VERSION"],
+            "general",
+        )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["ref_name"], "master")
+        self.assertEqual(
+            resolved["raw_base_url"],
+            "https://raw.githubusercontent.com/grandfoxx/my_reading_summary/master",
+        )
+
+    def test_explicit_git_url_branch_wins_over_catalog_default(self):
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/demo/tree/dev",
+            "branch": "main",
+            "update_channel": "branch",
+            "update_channel_explicit": 0,
+        }
+        self.manager._catalog_get_update_path_selection_enabled = lambda db_type: False
+        self.manager._catalog_default_branch_for_repo = lambda parsed: "master"
+        self.manager._fetch_repository_default_branch = lambda parsed, db_type=None: "master"
+
+        resolved = self.manager._resolve_update_ref(
+            "demo",
+            "https://raw.githubusercontent.com/example/demo/master",
+            ["demo.py", "VERSION"],
+            "general",
+        )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["ref_name"], "dev")
+        self.assertEqual(
+            resolved["raw_base_url"],
+            "https://raw.githubusercontent.com/example/demo/dev",
+        )
+
+    def test_same_repository_manifest_branch_beats_stale_stored_branch_when_default_unknown(self):
+        parsed = self.manager._parse_git_repo("https://github.com/example/demo")
+        self.manager._catalog_default_branch_for_repo = lambda parsed: None
+        self.manager._fetch_repository_default_branch = lambda parsed, db_type=None: None
+
+        branch = self.manager._resolve_source_branch(
+            parsed,
+            {"branch": "main"},
+            "https://raw.githubusercontent.com/example/demo/master",
+            "general",
+        )
+
+        self.assertEqual(branch, "master")
 
     def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
         invalid_row = {
