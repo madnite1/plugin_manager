@@ -770,11 +770,12 @@
         const countInstalled = document.getElementById('pm-count-installed');
         const countUninstalled = document.getElementById('pm-count-uninstalled');
 
+        const installedPlugins = allPlugins.filter(p => p.is_installed);
         if (countAll) countAll.textContent = allPlugins.length;
-        if (countEnabled) countEnabled.textContent = allPlugins.filter(p => p.enabled).length;
-        if (countDisabled) countDisabled.textContent = allPlugins.filter(p => !p.enabled).length;
-        if (countInstalled) countInstalled.textContent = allPlugins.filter(p => p.is_installed).length;
-        if (countUninstalled) countUninstalled.textContent = allPlugins.filter(p => !p.is_installed).length;
+        if (countEnabled) countEnabled.textContent = installedPlugins.filter(p => p.enabled).length;
+        if (countDisabled) countDisabled.textContent = installedPlugins.filter(p => !p.enabled).length;
+        if (countInstalled) countInstalled.textContent = installedPlugins.length;
+        if (countUninstalled) countUninstalled.textContent = allPlugins.length - installedPlugins.length;
     }
 
     // 미설치(카탈로그) 카드 렌더 — Git 카탈로그에서 발견된 저장소
@@ -914,13 +915,19 @@
         if (!grid) return;
 
         let filtered = allPlugins.filter(p => {
-            // Tab filter
-            if (currentFilter === 'enabled' && !p.enabled) return false;
-            if (currentFilter === 'disabled' && p.enabled) return false;
+            // 상태 필터: 활성화/비활성화는 설치된 플러그인에만 의미가 있다.
+            if (currentFilter === 'enabled' && !(p.is_installed && p.enabled)) return false;
+            if (currentFilter === 'disabled' && !(p.is_installed && !p.enabled)) return false;
             if (currentFilter === 'installed' && !p.is_installed) return false;
             if (currentFilter === 'uninstalled' && p.is_installed) return false;
-            if (currentFilter === 'category' && !p.is_category) return false;
-            if (currentFilter === 'widget' && !p.is_widget) return false;
+
+            // 기능 필터: 기능 계약은 현재 설치본의 정적 메타데이터를 기준으로 한다.
+            if (currentFilter === 'category' && !(p.is_installed && p.is_category)) return false;
+            if (currentFilter === 'widget' && !(p.is_installed && p.is_widget)) return false;
+            if (currentFilter === 'detail-view' && !(p.is_installed && p.supports_detail_view === true)) return false;
+            if (currentFilter === 'detail-sidebar' && !(p.is_installed && p.supports_detail_sidebar_widget === true)) return false;
+            if (currentFilter === 'home-widget' && !(p.is_installed && p.supports_home_widget === true)) return false;
+            if (currentFilter === 'searchable' && !(p.is_installed && p.is_searchable)) return false;
 
             // Search text filter
             if (currentSearch) {

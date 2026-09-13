@@ -715,5 +715,36 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertTrue(merged[0]["catalog_install_allowed"])
 
 
+    def test_filter_ui_uses_installed_only_activation_and_complete_features(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "script.js").read_text(encoding="utf-8")
+        index = (root / "index.html").read_text(encoding="utf-8")
+        style = (root / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("const installedPlugins = allPlugins.filter(p => p.is_installed);", script)
+        self.assertIn("currentFilter === 'enabled' && !(p.is_installed && p.enabled)", script)
+        self.assertIn("currentFilter === 'disabled' && !(p.is_installed && !p.enabled)", script)
+
+        expected_filters = {
+            "category": "카테고리 뷰",
+            "widget": "대시보드 위젯",
+            "detail-view": "상세 뷰",
+            "detail-sidebar": "상세 사이드바",
+            "home-widget": "홈",
+            "searchable": "수동 검색",
+        }
+        for filter_id, label in expected_filters.items():
+            self.assertIn(f'data-filter="{filter_id}"', index)
+            self.assertIn(label, index)
+            self.assertIn(f"currentFilter === '{filter_id}'", script)
+
+        self.assertIn('class="pm-filter-groups"', index)
+        self.assertIn('.pm-filter-groups {', style)
+        self.assertIn('.pm-search-box {', style)
+        search_rule = style.split('.pm-search-box {', 1)[1].split('}', 1)[0]
+        self.assertIn('width: 100%;', search_rule)
+
+
+
 if __name__ == "__main__":
     unittest.main()
