@@ -442,6 +442,33 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertTrue(captured["require_manifest"])
         self.assertEqual(captured["git_url"], target_url)
 
+    def test_catalog_reverifies_when_repository_changed_after_last_check(self):
+        now = self.pm_module.datetime(2026, 9, 13, 14, 30, tzinfo=self.pm_module.timezone.utc)
+        row = {
+            "last_checked": "2026-09-13T13:00:20Z",
+            "pushed_at": "2026-09-13T23:12:20+09:00",
+        }
+
+        self.assertTrue(self.manager._catalog_repo_needs_verify(row, now=now))
+
+    def test_catalog_keeps_recent_unchanged_repository_cached(self):
+        now = self.pm_module.datetime(2026, 9, 13, 14, 30, tzinfo=self.pm_module.timezone.utc)
+        row = {
+            "last_checked": "2026-09-13T14:00:00Z",
+            "pushed_at": "2026-09-13T13:30:00Z",
+        }
+
+        self.assertFalse(self.manager._catalog_repo_needs_verify(row, now=now))
+
+    def test_catalog_reverifies_when_ttl_expires(self):
+        now = self.pm_module.datetime(2026, 9, 14, 14, 30, tzinfo=self.pm_module.timezone.utc)
+        row = {
+            "last_checked": "2026-09-13T14:00:00Z",
+            "pushed_at": "2026-09-13T13:30:00Z",
+        }
+
+        self.assertTrue(self.manager._catalog_repo_needs_verify(row, now=now))
+
 
 if __name__ == "__main__":
     unittest.main()

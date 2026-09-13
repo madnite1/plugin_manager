@@ -4723,6 +4723,35 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
     # ---- 갱신 로직 ----
 
+    @staticmethod
+    def _catalog_parse_timestamp(raw):
+        """GitHub/Gitea 시간 문자열을 UTC aware datetime으로 정규화한다."""
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _catalog_repo_needs_verify(self, row, now=None):
+        """TTL 이내라도 저장소가 마지막 검증 뒤 변경됐으면 즉시 재검증한다."""
+        last_checked = self._catalog_parse_timestamp((row or {}).get("last_checked"))
+        if last_checked is None:
+            return True
+
+        pushed_at = self._catalog_parse_timestamp((row or {}).get("pushed_at"))
+        if pushed_at is not None and pushed_at > last_checked:
+            return True
+
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        return (now_dt.astimezone(timezone.utc) - last_checked).total_seconds() >= _CATALOG_VERIFY_TTL_SECONDS
+
     def _catalog_refresh_once(self, db_type, force_verify=False):
         """
         카탈로그 1회 갱신: 토픽별 Search API → repos upsert → VERSION 판별.
@@ -4866,29 +4895,19 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 )
                 removed += 1
 
-            # 4. VERSION 판별 (rate 보호: 저장소 20개 초과 시 24시간 내 검증 결과 재사용)
+            # 4. VERSION 판별
+            # 저장소 20개 초과 시 24시간 검증 캐시를 사용하되, 마지막 검증 뒤
+            # 저장소 pushed_at/updated_at이 갱신됐으면 TTL과 무관하게 즉시 재검증한다.
             now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             repo_rows = self._catalog_db_query(
-                "SELECT full_name, default_branch, is_valid, last_checked, source, base_url FROM repos"
+                "SELECT full_name, default_branch, pushed_at, is_valid, last_checked, source, base_url FROM repos"
             )
             rows_to_check = []
             if force_verify:
                 rows_to_check = repo_rows
             elif len(repo_rows) > _CATALOG_VERIFY_MAX_REPOS:
                 for r in repo_rows:
-                    if not r.get("last_checked"):
-                        rows_to_check.append(r)
-                        continue
-                    try:
-                        # Python 3.10 이하 fromisoformat은 'Z' 미지원 → +00:00 치환, naive면 UTC 부여
-                        parsed = datetime.fromisoformat(
-                            str(r["last_checked"]).replace("Z", "+00:00")
-                        )
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=timezone.utc)
-                        if (datetime.now(timezone.utc) - parsed).total_seconds() >= _CATALOG_VERIFY_TTL_SECONDS:
-                            rows_to_check.append(r)
-                    except Exception:
+                    if self._catalog_repo_needs_verify(r):
                         rows_to_check.append(r)
             else:
                 rows_to_check = repo_rows
