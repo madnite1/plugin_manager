@@ -156,11 +156,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         elif action == "replace_git":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
             git_url = str(item_data.get("git_url", "")).strip()
+            force = item_data.get("force") in (True, 1, "1", "true", "True")
             if not plugin_id:
                 return False, "교체할 플러그인 ID가 누락되었습니다."
             if not git_url:
                 return False, "새 Git 저장소 URL이 누락되었습니다."
-            return self._replace_plugin(plugin_id, git_url, db_type)
+            return self._replace_plugin(plugin_id, git_url, db_type, force=force)
 
         elif action == "update_all":
             return self._update_all_plugins(db_type)
@@ -2479,7 +2480,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             raise ValueError("다운로드된 저장소에서 플러그인 디렉토리를 찾을 수 없습니다.")
         return target_plugin_dir
 
-    def _install_from_git(self, git_url, db_type, force=False, backup_dir=None):
+    def _install_from_git(self, git_url, db_type, force=False, backup_dir=None, require_manifest=False):
         """
         GitHub/Gitea 저장소 URL 을 통한 플러그인 설치 (git 바이너리 불필요).
         force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
@@ -2531,8 +2532,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             has_manifest = bool(manifest_files)
             manifest_files = manifest_files or []  # 폴백 진행 시 None 방지
             if not has_manifest:
+                if require_manifest:
+                    return False, (
+                        "저장소 변경 대상에는 유효한 update_manifest.files가 필요합니다. "
+                        "자동 업데이트 계약이 없는 저장소로는 소스를 변경할 수 없습니다."
+                    )
                 # update_manifest 없는 저장소 → "검증 실패시 설치 가능" 옵션 게이트
-                # (구조 실패가 아닌 옵션 우회 구간으로 취급 — ON 시에만 폴백 진행)
+                # (직접 Git 설치에 한해 ON 시 폴백 진행)
                 allow_invalid = self._catalog_get_allow_invalid_install(db_type)
                 if not allow_invalid:
                     return False, (
@@ -2704,13 +2710,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _replace_plugin(self, plugin_id, new_git_url, db_type):
+    def _replace_plugin(self, plugin_id, new_git_url, db_type, force=False):
         """설치된 플러그인의 소스를 교체 (백업 → 재설치 → 실패 시 롤백).
 
         설계: 소스마다 파일 구조/update_manifest/subpath가 다를 수 있어
         git_url 메타만 바꾸는 대신 폴더 재설치 방식으로 안전하게 교체.
         - 백업: plugins/data/plugin_manager/work/replace_backup_<id> (플러그인 폴더 전체 + 소스 메타)
-        - 재설치: _install_from_git(new_git_url, backup_dir=백업경로)
+        - 재설치: _install_from_git(new_git_url, backup_dir=백업경로, require_manifest=True)
         - 성공: 백업 삭제, 실패: 백업 복원 (소스 메타도 원복)
         """
         base_dir = self._get_plugins_base_dir()
@@ -2749,7 +2755,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, f"소스 교체 백업 실패: {str(e)}"
 
         # 3. 재설치 (실패 시 backup_dir로 롤백)
-        ok, msg = self._install_from_git(new_git_url, db_type, force=False, backup_dir=backup_dir)
+        ok, msg = self._install_from_git(
+            new_git_url, db_type, force=force, backup_dir=backup_dir, require_manifest=True
+        )
         if not ok:
             # _install_from_git이 backup_dir에서 복원했으면 여기서는 정리만
             if os.path.exists(backup_dir):
@@ -4548,6 +4556,36 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     })
         return {"items": out}
 
+    @staticmethod
+    def _catalog_manifest_is_installable(manifest, provider_filename):
+        """카탈로그/저장소 변경 후보에 사용할 최소 update_manifest 계약 검사."""
+        if not isinstance(manifest, dict) or manifest.get("enabled") is not True:
+            return False
+        if str(manifest.get("provider") or "").strip() != "github-raw":
+            return False
+        raw_base_url = str(manifest.get("raw_base_url") or "").strip()
+        if not re.match(r"^https?://", raw_base_url, re.IGNORECASE):
+            return False
+        version_file = str(manifest.get("version_file") or "").strip()
+        version_key = str(manifest.get("version_key") or "").strip()
+        if version_file != "VERSION" or version_key != "plugin version":
+            return False
+        files = manifest.get("files")
+        if not isinstance(files, (list, tuple)) or not files:
+            return False
+        normalized = []
+        for rel in files:
+            if not isinstance(rel, str) or not rel.strip():
+                return False
+            clean = os.path.normpath(rel.strip()).replace("\\", "/")
+            if clean in (".", "..") or clean.startswith("../") or clean.startswith("/"):
+                return False
+            normalized.append(clean)
+        if len(normalized) != len(set(normalized)):
+            return False
+        provider_clean = os.path.normpath(str(provider_filename or "")).replace("\\", "/")
+        return version_file in normalized and provider_clean in normalized
+
     def _catalog_check_repo_version(self, full_name, default_branch, source="github", base_url=None, db_type=None):
         """
         VERSION에서는 공식 계약인 `plugin version`만 버전 정보로 사용한다.
@@ -4569,11 +4607,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not version:
                 return "invalid", None, None, None
             fallback_id = str(full_name).split("/")[-1]
-            provider_id, name = self._catalog_fetch_plugin_meta(
+            provider_id, name, manifest_ok = self._catalog_fetch_plugin_meta(
                 full_name, branch, fallback_id, source, base_url, db_type
             )
-            plugin_id = provider_id or fallback_id
-            return "valid", plugin_id, version, name
+            if not provider_id or not manifest_ok:
+                return "invalid", provider_id or fallback_id, version, name
+            return "valid", provider_id, version, name
         except Exception:
             return "invalid", None, None, None
 
@@ -4589,7 +4628,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         VERSION의 비공식 id/name 메타데이터는 사용하지 않는다. 저장소 이름과 `provider.py`는
         원격 소스 파일을 찾기 위한 후보로만 사용하며, 실제 식별값은 Provider 클래스에서 읽는다.
-        반환: (plugin_id, plugin_name). 찾지 못하면 각각 None.
+        반환: (plugin_id, plugin_name, manifest_ok). 찾지 못하면 (None, None, False).
         """
         filenames = []
         candidate = str(candidate_id or "").strip()
@@ -4634,6 +4673,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
                     provider_id = None
                     provider_name = None
+                    provider_manifest = None
                     for stmt in node.body:
                         value_node = None
                         targets = []
@@ -4656,6 +4696,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                                 value = self._resolve_static_string(value_node, module_constants)
                                 if isinstance(value, str) and value.strip():
                                     provider_name = value.strip()
+                            elif target.id == "update_manifest":
+                                try:
+                                    value = ast.literal_eval(value_node)
+                                except Exception:
+                                    value = None
+                                if isinstance(value, dict):
+                                    provider_manifest = value
 
                     is_provider = any("BaseMetadataProvider" in base for base in bases)
                     if not is_provider and provider_id is not None:
@@ -4665,15 +4712,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     if provider_id and not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
                         provider_id = None
                     if provider_id or provider_name:
-                        return provider_id, provider_name
+                        manifest_ok = self._catalog_manifest_is_installable(
+                            provider_manifest, filename
+                        )
+                        return provider_id, provider_name, manifest_ok
             except Exception:
                 continue
 
-        return None, None
+        return None, None, False
 
     # ---- 갱신 로직 ----
 
-    def _catalog_refresh_once(self, db_type):
+    def _catalog_refresh_once(self, db_type, force_verify=False):
         """
         카탈로그 1회 갱신: 토픽별 Search API → repos upsert → VERSION 판별.
         중복 실행 방지: meta refresh_state=running 이면 즉시 return.
@@ -4822,7 +4872,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "SELECT full_name, default_branch, is_valid, last_checked, source, base_url FROM repos"
             )
             rows_to_check = []
-            if len(repo_rows) > _CATALOG_VERIFY_MAX_REPOS:
+            if force_verify:
+                rows_to_check = repo_rows
+            elif len(repo_rows) > _CATALOG_VERIFY_MAX_REPOS:
                 for r in repo_rows:
                     if not r.get("last_checked"):
                         rows_to_check.append(r)
@@ -4876,7 +4928,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         자동 업데이트가 ON이면 설치 플러그인 일괄 갱신까지 실행 (응답은 즉시)."""
         def _run():
             try:
-                self._catalog_refresh_once(db_type)
+                self._catalog_refresh_once(db_type, force_verify=True)
             finally:
                 # 수동 갱신 후에도 설정(PM_AUTO_UPDATE)에 따라 자동 업데이트 수행
                 self._catalog_run_auto_update(db_type)

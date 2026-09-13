@@ -373,5 +373,75 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertIsNone(cards[0]["supports_detail_view"])
 
 
+    def test_catalog_manifest_requires_update_contract(self):
+        valid = {
+            "enabled": True,
+            "provider": "github-raw",
+            "raw_base_url": "https://raw.githubusercontent.com/example/demo/main",
+            "files": ["demo.py", "__init__.py", "VERSION"],
+            "version_file": "VERSION",
+            "version_key": "plugin version",
+        }
+        self.assertTrue(self.manager._catalog_manifest_is_installable(valid, "demo.py"))
+
+        missing = dict(valid)
+        missing.pop("files")
+        self.assertFalse(self.manager._catalog_manifest_is_installable(missing, "demo.py"))
+
+        disabled = dict(valid)
+        disabled["enabled"] = False
+        self.assertFalse(self.manager._catalog_manifest_is_installable(disabled, "demo.py"))
+
+    def test_catalog_repo_without_manifest_is_invalid(self):
+        self.manager._fetch_text = lambda *args, **kwargs: '{"plugin version": "1.2.3"}'
+        self.manager._catalog_fetch_plugin_meta = lambda *args, **kwargs: (
+            "demo", "Demo", False
+        )
+
+        status, plugin_id, version, name = self.manager._catalog_check_repo_version(
+            "example/demo", "main"
+        )
+
+        self.assertEqual(status, "invalid")
+        self.assertEqual(plugin_id, "demo")
+        self.assertEqual(version, "1.2.3")
+        self.assertEqual(name, "Demo")
+
+    def test_replace_git_forwards_force_but_always_requires_manifest(self):
+        plugin_dir = self.root / "plugins" / "demo"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "demo.py").write_text("x = 1\n", encoding="utf-8")
+        work_dir = self.root / "work"
+        work_dir.mkdir()
+        target_url = "https://example.invalid/demo"
+        captured = {}
+
+        self.manager._get_plugins_base_dir = lambda: str(plugin_dir.parent)
+        self.manager._validate_plugin_path = lambda plugin_id: (str(plugin_dir), None)
+        self.manager._catalog_replace_candidates = lambda plugin_id, db_type=None: [
+            {"git_url": target_url}
+        ]
+        self.manager._get_work_dir = lambda: str(work_dir)
+        self.manager._read_git_source_info = lambda plugin_id: None
+
+        def fake_install(git_url, db_type, force=False, backup_dir=None, require_manifest=False):
+            captured.update({
+                "git_url": git_url,
+                "force": force,
+                "backup_dir": backup_dir,
+                "require_manifest": require_manifest,
+            })
+            return False, "blocked"
+
+        self.manager._install_from_git = fake_install
+
+        ok, _ = self.manager._replace_plugin("demo", target_url, "general", force=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(captured["force"])
+        self.assertTrue(captured["require_manifest"])
+        self.assertEqual(captured["git_url"], target_url)
+
+
 if __name__ == "__main__":
     unittest.main()
