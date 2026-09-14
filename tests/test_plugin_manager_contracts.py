@@ -191,6 +191,31 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
 
         self.assertEqual(spec["files"], ["demo.py", "VERSION"])
 
+    def test_update_manifest_status_distinguishes_missing_disabled_invalid_and_unsupported(self):
+        valid = {
+            "enabled": True,
+            "provider": "github-raw",
+            "raw_base_url": "https://raw.githubusercontent.com/example/demo/main",
+            "files": ["demo.py", "VERSION"],
+            "version_file": "VERSION",
+            "version_key": "plugin version",
+        }
+
+        self.assertEqual(self.manager._classify_update_manifest("demo", None), "missing")
+        self.assertEqual(
+            self.manager._classify_update_manifest("demo", {**valid, "enabled": False}),
+            "disabled",
+        )
+        self.assertEqual(
+            self.manager._classify_update_manifest("demo", {"enabled": True}),
+            "invalid",
+        )
+        self.assertEqual(
+            self.manager._classify_update_manifest("demo", valid, is_monorepo_subdir=True),
+            "unsupported",
+        )
+        self.assertEqual(self.manager._classify_update_manifest("demo", valid), "enabled")
+
     def test_latest_contract_metadata_and_methods_are_discovered(self):
         plugin_dir = self.root / "demo"
         plugin_dir.mkdir()
@@ -654,7 +679,10 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         script = (Path(__file__).resolve().parents[1] / "script.js").read_text(encoding="utf-8")
         self.assertIn("pm-installed-validation-badge", script)
         self.assertIn("검증 실패</span>", script)
-        self.assertIn("업데이트 미지원</span>", script)
+        self.assertIn("업데이트 비활성", script)
+        self.assertIn("업데이트 정보 없음", script)
+        self.assertIn("업데이트 설정 오류", script)
+        self.assertIn("업데이트 미지원", script)
 
     def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
         invalid_row = {
@@ -722,8 +750,12 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         style = (root / "style.css").read_text(encoding="utf-8")
 
         self.assertIn("const installedPlugins = allPlugins.filter(p => p.is_installed);", script)
-        self.assertIn("currentFilter === 'enabled' && !(p.is_installed && p.enabled)", script)
-        self.assertIn("currentFilter === 'disabled' && !(p.is_installed && !p.enabled)", script)
+        self.assertIn("currentStatusFilter === 'enabled' && !(p.is_installed && p.enabled)", script)
+        self.assertIn("currentStatusFilter === 'disabled' && !(p.is_installed && !p.enabled)", script)
+        self.assertIn('id="pm-status-filter"', index)
+        self.assertIn('id="pm-feature-filter"', index)
+        self.assertIn('id="pm-status-enabled" value="enabled"', index)
+        self.assertIn('id="pm-status-disabled" value="disabled"', index)
 
         expected_filters = {
             "category": "카테고리 뷰",
@@ -734,15 +766,17 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
             "searchable": "수동 검색",
         }
         for filter_id, label in expected_filters.items():
-            self.assertIn(f'data-filter="{filter_id}"', index)
+            self.assertIn(f'value="{filter_id}"', index)
             self.assertIn(label, index)
-            self.assertIn(f"currentFilter === '{filter_id}'", script)
+            self.assertIn(f"currentFeatureFilter === '{filter_id}'", script)
 
-        self.assertIn('class="pm-filter-groups"', index)
-        self.assertIn('.pm-filter-groups {', style)
+        self.assertNotIn('class="pm-filter-groups"', index)
+        self.assertIn('.pm-filter-select {', style)
         self.assertIn('.pm-search-box {', style)
+        controls_rule = style.split('.pm-controls-bar {', 1)[1].split('}', 1)[0]
+        self.assertIn('flex-direction: row;', controls_rule)
         search_rule = style.split('.pm-search-box {', 1)[1].split('}', 1)[0]
-        self.assertIn('width: 100%;', search_rule)
+        self.assertIn('flex: 1 1 320px;', search_rule)
 
 
 

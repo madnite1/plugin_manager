@@ -967,6 +967,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     _rp = self._parse_raw_base_url(_raw_url)
                     _is_monorepo_subdir = bool(_rp and _rp[3])
 
+                update_manifest_status = self._classify_update_manifest(
+                    plugin_id, update_manifest, _is_monorepo_subdir
+                )
+
                 rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
                 plugin_data_dir = self._get_plugin_data_dir(plugin_id)
 
@@ -983,7 +987,14 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "supports_home_widget": supports_home_widget,
                     "supports_detail_sidebar_widget": supports_detail_sidebar_widget,
                     "supports_detail_view": supports_detail_view,
-                    "has_update_manifest": bool(update_manifest) and not _is_monorepo_subdir,
+                    "has_update_manifest": update_manifest_status == "enabled",
+                    "update_manifest_present": isinstance(update_manifest, dict) and bool(update_manifest),
+                    "update_manifest_enabled": bool(
+                        isinstance(update_manifest, dict)
+                        and update_manifest
+                        and update_manifest.get("enabled") is True
+                    ),
+                    "update_manifest_status": update_manifest_status,
                     "has_config": has_config,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
@@ -1005,6 +1016,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
 
     _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+
+    def _classify_update_manifest(self, plugin_id, manifest, is_monorepo_subdir=False):
+        """카드/업데이트 로직이 공유하는 update_manifest 상태를 분류한다."""
+        if not isinstance(manifest, dict) or not manifest:
+            return "missing"
+        if manifest.get("enabled") is not True:
+            return "disabled"
+        if is_monorepo_subdir:
+            return "unsupported"
+        if not self._build_update_spec(plugin_id, manifest):
+            return "invalid"
+        return "enabled"
 
     def _build_update_spec(self, plugin_id, manifest):
         """update_manifest 검증 + 업데이트 spec 구성 (코어 _validate_update_manifest 축소판)"""
@@ -5590,6 +5613,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "supports_detail_sidebar_widget": None,
                 "supports_detail_view": None,
                 "has_update_manifest": False,
+                "update_manifest_present": False,
+                "update_manifest_enabled": False,
+                "update_manifest_status": "missing",
                 "has_config": False,
                 "is_system": False,
                 "is_installed": False,

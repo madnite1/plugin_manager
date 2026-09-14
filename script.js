@@ -3,7 +3,8 @@
     console.log('[PluginManager] Fullpage UI Script Loaded.');
 
     let allPlugins = [];
-    let currentFilter = 'all';
+    let currentStatusFilter = 'all';
+    let currentFeatureFilter = 'all';
     let currentSearch = '';
     let pendingDeletePluginId = null;
     let catalogMeta = null; // {last_refresh, refresh_interval_hours, topics, refresh_state, refresh_error}
@@ -709,6 +710,40 @@
         return ' <span class="pm-badge pm-update-check-failed-badge" title="DNS, 인터넷 연결 또는 원격 서버의 일시적인 문제로 업데이트 확인에 실패했습니다. 저장소 연결은 차단하지 않습니다.">업데이트 확인 실패</span>';
     }
 
+    function updateManifestBadgeHtml(p) {
+        if (!p || !p.git_url) return '';
+        const status = p.update_manifest_status || (p.has_update_manifest ? 'enabled' : 'missing');
+        const states = {
+            disabled: {
+                label: '업데이트 비활성',
+                title: 'update_manifest는 있지만 enabled=false로 자동 업데이트가 비활성화되어 있습니다.',
+                icon: 'fa-circle-pause',
+                className: 'pm-update-state-disabled'
+            },
+            missing: {
+                label: '업데이트 정보 없음',
+                title: '이 Git 설치본은 update_manifest를 제공하지 않습니다.',
+                icon: 'fa-circle-info',
+                className: 'pm-update-state-missing'
+            },
+            invalid: {
+                label: '업데이트 설정 오류',
+                title: 'update_manifest는 있지만 현재 업데이트 규약에 맞지 않습니다.',
+                icon: 'fa-triangle-exclamation',
+                className: 'pm-update-state-invalid'
+            },
+            unsupported: {
+                label: '업데이트 미지원',
+                title: '현재 설치 구조에서는 Plugin Manager 자동 업데이트를 지원하지 않습니다.',
+                icon: 'fa-circle-exclamation',
+                className: 'pm-update-state-unsupported'
+            }
+        };
+        const state = states[status];
+        if (!state) return '';
+        return ` <span class="pm-badge pm-update-state-badge ${state.className} pm-installed-validation-badge" title="${escapeHtmlAttr(state.title)}"><i class="fa-solid ${state.icon}"></i> ${state.label}</span>`;
+    }
+
     function patchCardUpdateCheckFailed(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (!card) return;
@@ -762,20 +797,26 @@
         }
     }
 
-    // 카운트 배지 업데이트
+    // 상태 드롭다운 카운트 업데이트 — 활성화/비활성화는 설치된 플러그인만 집계한다.
     function updateCounts() {
-        const countAll = document.getElementById('pm-count-all');
-        const countEnabled = document.getElementById('pm-count-enabled');
-        const countDisabled = document.getElementById('pm-count-disabled');
-        const countInstalled = document.getElementById('pm-count-installed');
-        const countUninstalled = document.getElementById('pm-count-uninstalled');
-
         const installedPlugins = allPlugins.filter(p => p.is_installed);
-        if (countAll) countAll.textContent = allPlugins.length;
-        if (countEnabled) countEnabled.textContent = installedPlugins.filter(p => p.enabled).length;
-        if (countDisabled) countDisabled.textContent = installedPlugins.filter(p => !p.enabled).length;
-        if (countInstalled) countInstalled.textContent = installedPlugins.length;
-        if (countUninstalled) countUninstalled.textContent = allPlugins.length - installedPlugins.length;
+        const total = allPlugins.length;
+        const installed = installedPlugins.length;
+        const uninstalled = total - installed;
+        const enabled = installedPlugins.filter(p => p.enabled).length;
+        const disabled = installedPlugins.filter(p => !p.enabled).length;
+
+        const labels = [
+            ['pm-status-all', `상태 · 전체 (${total})`],
+            ['pm-status-installed', `상태 · 설치됨 (${installed})`],
+            ['pm-status-uninstalled', `상태 · 미설치 (${uninstalled})`],
+            ['pm-status-enabled', `상태 · 활성화 (${enabled})`],
+            ['pm-status-disabled', `상태 · 비활성화 (${disabled})`],
+        ];
+        labels.forEach(([id, text]) => {
+            const option = document.getElementById(id);
+            if (option) option.textContent = text;
+        });
     }
 
     // 미설치(카탈로그) 카드 렌더 — Git 카탈로그에서 발견된 저장소
@@ -916,18 +957,19 @@
 
         let filtered = allPlugins.filter(p => {
             // 상태 필터: 활성화/비활성화는 설치된 플러그인에만 의미가 있다.
-            if (currentFilter === 'enabled' && !(p.is_installed && p.enabled)) return false;
-            if (currentFilter === 'disabled' && !(p.is_installed && !p.enabled)) return false;
-            if (currentFilter === 'installed' && !p.is_installed) return false;
-            if (currentFilter === 'uninstalled' && p.is_installed) return false;
+            if (currentStatusFilter === 'enabled' && !(p.is_installed && p.enabled)) return false;
+            if (currentStatusFilter === 'disabled' && !(p.is_installed && !p.enabled)) return false;
+            if (currentStatusFilter === 'installed' && !p.is_installed) return false;
+            if (currentStatusFilter === 'uninstalled' && p.is_installed) return false;
 
-            // 기능 필터: 기능 계약은 현재 설치본의 정적 메타데이터를 기준으로 한다.
-            if (currentFilter === 'category' && !(p.is_installed && p.is_category)) return false;
-            if (currentFilter === 'widget' && !(p.is_installed && p.is_widget)) return false;
-            if (currentFilter === 'detail-view' && !(p.is_installed && p.supports_detail_view === true)) return false;
-            if (currentFilter === 'detail-sidebar' && !(p.is_installed && p.supports_detail_sidebar_widget === true)) return false;
-            if (currentFilter === 'home-widget' && !(p.is_installed && p.supports_home_widget === true)) return false;
-            if (currentFilter === 'searchable' && !(p.is_installed && p.is_searchable)) return false;
+            // 기능 필터는 상태 필터와 독립적으로 적용한다.
+            // 현재 기능 계약은 설치된 플러그인의 정적 메타데이터를 기준으로 한다.
+            if (currentFeatureFilter === 'category' && !(p.is_installed && p.is_category)) return false;
+            if (currentFeatureFilter === 'widget' && !(p.is_installed && p.is_widget)) return false;
+            if (currentFeatureFilter === 'detail-view' && !(p.is_installed && p.supports_detail_view === true)) return false;
+            if (currentFeatureFilter === 'detail-sidebar' && !(p.is_installed && p.supports_detail_sidebar_widget === true)) return false;
+            if (currentFeatureFilter === 'home-widget' && !(p.is_installed && p.supports_home_widget === true)) return false;
+            if (currentFeatureFilter === 'searchable' && !(p.is_installed && p.is_searchable)) return false;
 
             // Search text filter
             if (currentSearch) {
@@ -1012,9 +1054,7 @@
                 ? updateCheckFailedBadgeHtml()
                 : (p.update_blocked ? blockedBadgeHtml(p.blocked_reason) : '');
 
-            // 위험 설치/카탈로그 검증 실패 상태는 설치 후에도 사라지지 않게 정적으로 표시한다.
-            // 현재 설치 소스가 invalid/unknown이면 그 상태를 우선하고, 카탈로그는 정상/미등록이지만
-            // Git 설치본에 update_manifest가 없으면 업데이트 미지원 상태를 표시한다.
+            // 위험 설치/카탈로그 검증 상태와 update_manifest 상태는 서로 다른 의미이므로 각각 표시한다.
             const installedCatalogStatus = String(p.catalog_status || '').toLowerCase();
             const installedValidationMessage = (p.catalog_validation_message || '').trim();
             let installedValidationBadge = '';
@@ -1022,9 +1062,8 @@
                 installedValidationBadge = ` <span class="pm-badge pm-badge-install-error pm-installed-validation-badge" title="${escapeHtmlAttr(installedValidationMessage || '현재 설치 소스가 카탈로그 검증을 통과하지 못했습니다.')}"><i class="fa-solid fa-triangle-exclamation"></i> 검증 실패</span>`;
             } else if (installedCatalogStatus === 'unknown') {
                 installedValidationBadge = ` <span class="pm-badge pm-badge-install-error pm-installed-validation-badge" title="${escapeHtmlAttr(installedValidationMessage || '현재 설치 소스의 카탈로그 검증이 아직 완료되지 않았습니다.')}"><i class="fa-solid fa-clock"></i> 검증 대기</span>`;
-            } else if (p.git_url && !p.has_update_manifest) {
-                installedValidationBadge = ' <span class="pm-badge pm-blocked-badge pm-installed-validation-badge" title="이 Git 설치본에는 활성 update_manifest가 없어 Plugin Manager 자동 업데이트를 사용할 수 없습니다."><i class="fa-solid fa-circle-exclamation"></i> 업데이트 미지원</span>';
             }
+            const updateManifestBadge = updateManifestBadgeHtml(p);
 
             const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url && p.has_update_manifest)
                 ? `<select class="pm-update-channel-select" data-id="${p.id}" title="업데이트 경로 선택 — 선택한 경로만 사용하며 폴백하지 않습니다" style="padding:0.35rem 0.5rem;border-radius:6px;background:var(--app-input-bg,rgba(15,23,42,.6));border:1px solid var(--app-border,rgba(255,255,255,.15));color:var(--app-text-primary,#fff);font-size:.78rem;">
@@ -1065,7 +1104,7 @@
                                 </div>
                                 <div>
                                     <h4 class="pm-plugin-name">${p.name}</h4>
-                                    <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateStatusBadge}</span>
+                                    <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateManifestBadge}${updateStatusBadge}</span>
                                 </div>
                             </div>
                             ${settingsBtnHtml}
@@ -1762,15 +1801,22 @@
             });
         }
 
-        // Tabs Filter
-        document.querySelectorAll('.pm-tab-btn').forEach(btn => {
-            btn.addEventListener('click', function() {
-                document.querySelectorAll('.pm-tab-btn').forEach(b => b.classList.remove('active'));
-                this.classList.add('active');
-                currentFilter = this.getAttribute('data-filter') || 'all';
+        // 상태/기능 필터 — 서로 독립적인 드롭다운으로 결합 적용
+        const statusFilter = document.getElementById('pm-status-filter');
+        if (statusFilter) {
+            statusFilter.addEventListener('change', function() {
+                currentStatusFilter = this.value || 'all';
                 renderPlugins();
             });
-        });
+        }
+
+        const featureFilter = document.getElementById('pm-feature-filter');
+        if (featureFilter) {
+            featureFilter.addEventListener('change', function() {
+                currentFeatureFilter = this.value || 'all';
+                renderPlugins();
+            });
+        }
 
         // Search Input
         const searchInput = document.getElementById('pm-search-input');

@@ -82,34 +82,27 @@
 
     <!-- Filter & Search Bar -->
     <div class="pm-controls-bar">
+        <select id="pm-status-filter" class="pm-filter-select pm-status-filter" aria-label="설치 상태 필터">
+            <option id="pm-status-all" value="all">상태 · 전체 (0)</option>
+            <option id="pm-status-installed" value="installed">상태 · 설치됨 (0)</option>
+            <option id="pm-status-uninstalled" value="uninstalled">상태 · 미설치 (0)</option>
+            <option id="pm-status-enabled" value="enabled">상태 · 활성화 (0)</option>
+            <option id="pm-status-disabled" value="disabled">상태 · 비활성화 (0)</option>
+        </select>
+
+        <select id="pm-feature-filter" class="pm-filter-select pm-feature-filter" aria-label="기능 필터">
+            <option value="all">기능 · 전체</option>
+            <option value="category">기능 · 카테고리 뷰</option>
+            <option value="widget">기능 · 대시보드 위젯</option>
+            <option value="detail-view">기능 · 상세 뷰</option>
+            <option value="detail-sidebar">기능 · 상세 사이드바</option>
+            <option value="home-widget">기능 · 홈</option>
+            <option value="searchable">기능 · 수동 검색</option>
+        </select>
+
         <div class="pm-search-box">
             <i class="fa-solid fa-magnifying-glass pm-search-icon"></i>
             <input type="text" id="pm-search-input" class="pm-search-input" placeholder="플러그인 이름 또는 ID 검색..." />
-        </div>
-
-        <div class="pm-filter-groups">
-            <div class="pm-filter-group">
-                <span class="pm-filter-label">상태</span>
-                <div class="pm-tabs pm-tabs-status">
-                    <button class="pm-tab-btn active" data-filter="all">전체 <span id="pm-count-all" class="pm-count-badge">0</span></button>
-                    <button class="pm-tab-btn" data-filter="installed">설치됨 <span id="pm-count-installed" class="pm-count-badge">0</span></button>
-                    <button class="pm-tab-btn" data-filter="uninstalled">미설치 <span id="pm-count-uninstalled" class="pm-count-badge">0</span></button>
-                    <button class="pm-tab-btn" data-filter="enabled">활성화 <span id="pm-count-enabled" class="pm-count-badge">0</span></button>
-                    <button class="pm-tab-btn" data-filter="disabled">비활성화 <span id="pm-count-disabled" class="pm-count-badge">0</span></button>
-                </div>
-            </div>
-
-            <div class="pm-filter-group">
-                <span class="pm-filter-label">기능</span>
-                <div class="pm-tabs pm-tabs-features">
-                    <button class="pm-tab-btn" data-filter="category">카테고리 뷰</button>
-                    <button class="pm-tab-btn" data-filter="widget">대시보드 위젯</button>
-                    <button class="pm-tab-btn" data-filter="detail-view">상세 뷰</button>
-                    <button class="pm-tab-btn" data-filter="detail-sidebar">상세 사이드바</button>
-                    <button class="pm-tab-btn" data-filter="home-widget">홈</button>
-                    <button class="pm-tab-btn" data-filter="searchable">수동 검색</button>
-                </div>
-            </div>
         </div>
     </div>
 
