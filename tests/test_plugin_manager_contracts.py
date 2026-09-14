@@ -191,7 +191,7 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
 
         self.assertEqual(spec["files"], ["demo.py", "VERSION"])
 
-    def test_update_manifest_status_distinguishes_missing_disabled_invalid_and_unsupported(self):
+    def test_update_manifest_status_distinguishes_missing_disabled_invalid_and_enabled(self):
         valid = {
             "enabled": True,
             "provider": "github-raw",
@@ -212,9 +212,52 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             self.manager._classify_update_manifest("demo", valid, is_monorepo_subdir=True),
-            "unsupported",
+            "enabled",
         )
         self.assertEqual(self.manager._classify_update_manifest("demo", valid), "enabled")
+
+    def test_monorepo_subdir_manifest_can_check_remote_version(self):
+        manifest = {
+            "enabled": True,
+            "provider": "github-raw",
+            "raw_base_url": (
+                "https://raw.githubusercontent.com/example/mono/main/"
+                "plugins/metadata/demo"
+            ),
+            "files": ["demo.py", "VERSION"],
+            "version_file": "VERSION",
+            "version_key": "plugin version",
+        }
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/mono",
+            "branch": "main",
+        }
+        self.manager._resolve_update_ref = lambda *args, **kwargs: {
+            "mode": "branch",
+            "ref_name": "main",
+            "raw_base_url": (
+                "https://raw.githubusercontent.com/example/mono/main/"
+                "plugins/metadata/demo"
+            ),
+            "parsed": {
+                "type": "github",
+                "host": "github.com",
+                "owner": "example",
+                "repo": "mono",
+            },
+        }
+        self.manager._fetch_remote_plugin_version = lambda *args, **kwargs: "2.0.0"
+
+        has_update, latest, status = self.manager._check_plugin_update_detail(
+            "demo",
+            "1.0.0",
+            {"update_manifest": manifest},
+            "general",
+        )
+
+        self.assertTrue(has_update)
+        self.assertEqual(latest, "2.0.0")
+        self.assertEqual(status, "ok")
 
     def test_latest_contract_metadata_and_methods_are_discovered(self):
         plugin_dir = self.root / "demo"

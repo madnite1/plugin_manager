@@ -960,16 +960,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 default_update_channel = self._default_update_channel(git_url)
                 effective_update_channel = self._effective_update_channel(git_info, update_path_selection)
 
-                # 4-2. monorepo 서브디렉토리 플러그인은 update_manifest 있어도 업데이트 불가 처리
-                _is_monorepo_subdir = False
-                if update_manifest and isinstance(update_manifest, dict):
-                    _raw_url = str(update_manifest.get("raw_base_url") or "").strip().rstrip("/")
-                    _rp = self._parse_raw_base_url(_raw_url)
-                    _is_monorepo_subdir = bool(_rp and _rp[3])
-
-                update_manifest_status = self._classify_update_manifest(
-                    plugin_id, update_manifest, _is_monorepo_subdir
-                )
+                # update_manifest 자체의 유효성으로 업데이트 지원 여부를 판정한다.
+                # raw_base_url의 저장소 서브디렉토리는 _resolve_update_ref()가 보존하므로
+                # monorepo/subdir이라는 이유만으로 자동 업데이트를 차단하지 않는다.
+                update_manifest_status = self._classify_update_manifest(plugin_id, update_manifest)
 
                 rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
                 plugin_data_dir = self._get_plugin_data_dir(plugin_id)
@@ -1018,13 +1012,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 
     def _classify_update_manifest(self, plugin_id, manifest, is_monorepo_subdir=False):
-        """카드/업데이트 로직이 공유하는 update_manifest 상태를 분류한다."""
+        """카드/업데이트 로직이 공유하는 update_manifest 상태를 분류한다.
+
+        ``is_monorepo_subdir``는 구버전 호출부 호환을 위해 남겨 두지만 지원 판정에는
+        사용하지 않는다. 유효한 manifest의 subpath는 업데이트 ref 해석 단계에서 보존된다.
+        """
         if not isinstance(manifest, dict) or not manifest:
             return "missing"
         if manifest.get("enabled") is not True:
             return "disabled"
-        if is_monorepo_subdir:
-            return "unsupported"
         if not self._build_update_spec(plugin_id, manifest):
             return "invalid"
         return "enabled"
@@ -1681,12 +1677,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not spec:
                 return has_update, latest_version, "no_source"
 
-            # monorepo 서브디렉토리 플러그인 — 릴리즈 태그가 저장소 전체 기준이라
-            # 버전 비교가 불가능하므로 로컬 플러그인으로 취급하고 업데이트 체크 생략
-            raw_parsed = self._parse_raw_base_url(spec["raw_base_url"])
-            if raw_parsed and raw_parsed[3]:
-                return has_update, latest_version, "no_manifest"
-
+            # monorepo/subdir manifest도 정상 업데이트 대상으로 처리한다.
+            # _resolve_update_ref()가 선택한 branch/release/tag ref에 기존 subpath를 다시 붙여
+            # 해당 플러그인 디렉터리의 VERSION/files를 그대로 조회한다.
             resolved_ref = self._resolve_update_ref(
                 plugin_id, spec["raw_base_url"], spec.get("files"), db_type
             )
