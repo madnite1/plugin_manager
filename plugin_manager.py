@@ -4748,32 +4748,73 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _catalog_fetch_plugin_meta(self, full_name, branch, candidate_id, source="github", base_url=None, db_type=None):
         """Provider Python 소스에서 공식 클래스 필드 `id`와 `name`을 AST로 추출한다.
 
-        VERSION의 비공식 id/name 메타데이터는 사용하지 않는다. 저장소 이름과 `provider.py`는
-        원격 소스 파일을 찾기 위한 후보로만 사용하며, 실제 식별값은 Provider 클래스에서 읽는다.
+        VERSION의 비공식 id/name 메타데이터는 사용하지 않는다. 저장소 이름은 원격 소스
+        파일을 찾기 위한 힌트로만 사용하며, 실제 식별값은 Provider 클래스에서 읽는다.
+        저장소명과 Provider 파일명이 다를 수 있으므로 하이픈/언더바 변형과 __init__.py의
+        상대 import도 후보에 포함한다.
         반환: (plugin_id, plugin_name, manifest_ok). 찾지 못하면 (None, None, False).
         """
         filenames = []
+
+        def add_filename(filename):
+            filename = str(filename or "").strip().replace("\\", "/")
+            if not filename or not filename.endswith(".py"):
+                return
+            normalized = os.path.normpath(filename).replace("\\", "/")
+            if normalized in (".", "..") or normalized.startswith("../") or normalized.startswith("/"):
+                return
+            if normalized not in filenames:
+                filenames.append(normalized)
+
         candidate = str(candidate_id or "").strip()
         if candidate:
-            filenames.append(candidate + ".py")
-        if "provider.py" not in filenames:
-            filenames.append("provider.py")
+            add_filename(candidate + ".py")
+            add_filename(candidate.replace("-", "_") + ".py")
+        add_filename("provider.py")
 
         token = None
         if source == "gitea" and base_url:
             token = self._gitea_token_for_host(db_type, self._host_of_url(base_url))
 
-        for filename in filenames:
+        def source_url(filename):
+            if source == "gitea" and base_url:
+                return "{0}/{1}/raw/branch/{2}/{3}".format(
+                    base_url, full_name, branch, filename
+                )
+            return "https://raw.githubusercontent.com/{0}/{1}/{2}".format(
+                full_name, branch, filename
+            )
+
+        # 우선 저장소명 기반의 저비용 후보를 확인하고, 모두 실패했을 때만 __init__.py의
+        # 상대 import를 따라 실제 Provider 모듈을 추가 탐색한다.
+        candidate_index = 0
+        init_checked = False
+        while True:
+            if candidate_index >= len(filenames):
+                if init_checked:
+                    break
+                init_checked = True
+                try:
+                    init_text = self._fetch_text(source_url("__init__.py"), timeout=15, token=token)
+                    if init_text:
+                        init_tree = ast.parse(init_text)
+                        for node in ast.walk(init_tree):
+                            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                                continue
+                            if node.module:
+                                add_filename(node.module.replace(".", "/") + ".py")
+                            else:
+                                for alias in node.names:
+                                    add_filename(str(alias.name or "").replace(".", "/") + ".py")
+                except Exception:
+                    pass
+                if candidate_index >= len(filenames):
+                    break
+
+            filename = filenames[candidate_index]
+            candidate_index += 1
             try:
-                if source == "gitea" and base_url:
-                    src_url = "{0}/{1}/raw/branch/{2}/{3}".format(
-                        base_url, full_name, branch, filename
-                    )
-                else:
-                    src_url = "https://raw.githubusercontent.com/{0}/{1}/{2}".format(
-                        full_name, branch, filename
-                    )
-                source_text = self._fetch_text(src_url, timeout=15, token=token)
+                source_text = self._fetch_text(source_url(filename), timeout=15, token=token)
             except Exception:
                 continue
             if not source_text:

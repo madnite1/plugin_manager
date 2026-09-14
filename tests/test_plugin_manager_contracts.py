@@ -475,6 +475,52 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertEqual(version, "1.2.3")
         self.assertEqual(name, "Demo")
 
+    def test_catalog_provider_discovery_does_not_require_repo_name_match(self):
+        provider_source = '''
+from plugins.metadata.base import BaseMetadataProvider
+
+class M3UPlayerPlugin(BaseMetadataProvider):
+    id = "bookoasis_m3u_player"
+    name = "ALIVE 라이브 플레이어"
+    is_searchable = False
+    config_schema = []
+    update_manifest = {
+        "enabled": True,
+        "provider": "github-raw",
+        "raw_base_url": "https://raw.githubusercontent.com/venushoon/bookoasis-m3u-player/main",
+        "files": ["bookoasis_m3u_player.py", "__init__.py", "VERSION"],
+        "version_file": "VERSION",
+        "version_key": "plugin version",
+    }
+    def search(self, db_type, query): return []
+    def apply(self, db_type, book_id, item_data): return True, "ok"
+'''
+        responses = {
+            "https://raw.githubusercontent.com/venushoon/bookoasis-m3u-player/main/__init__.py":
+                "from .bookoasis_m3u_player import M3UPlayerPlugin\n",
+            "https://raw.githubusercontent.com/venushoon/bookoasis-m3u-player/main/bookoasis_m3u_player.py":
+                provider_source,
+        }
+        requested = []
+
+        def fake_fetch(url, *args, **kwargs):
+            requested.append(url)
+            return responses.get(url)
+
+        self.manager._fetch_text = fake_fetch
+
+        plugin_id, name, manifest_ok = self.manager._catalog_fetch_plugin_meta(
+            "venushoon/bookoasis-m3u-player", "main", "bookoasis-m3u-player"
+        )
+
+        self.assertEqual(plugin_id, "bookoasis_m3u_player")
+        self.assertEqual(name, "ALIVE 라이브 플레이어")
+        self.assertTrue(manifest_ok)
+        self.assertIn(
+            "https://raw.githubusercontent.com/venushoon/bookoasis-m3u-player/main/bookoasis_m3u_player.py",
+            requested,
+        )
+
     def test_replace_git_forwards_force_but_always_requires_manifest(self):
         plugin_dir = self.root / "plugins" / "demo"
         plugin_dir.mkdir(parents=True)
