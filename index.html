@@ -62,19 +62,19 @@
             <div class="pm-card pm-install-card">
                 <div class="pm-card-header">
                     <h3 class="pm-card-title">
-                        <i class="fa-brands fa-github" style="color: var(--app-accent, #8b5cf6);"></i> Git 저장소 URL 설치
+                        <i class="fa-brands fa-github" style="color: var(--app-accent, #8b5cf6);"></i> 저장소 URL 설치
                     </h3>
-                    <span class="pm-badge pm-badge-feature">GIT 설치</span>
+                    <span class="pm-badge pm-badge-feature">저장소 ZIP</span>
                 </div>
                 <div class="pm-install-form">
                     <div class="pm-input-group" style="align-items: stretch;">
                         <input type="text" id="pm-git-url-input" class="pm-input" placeholder="https://github.com/user/repo" style="border-radius: 8px 0 0 8px;" />
                         <button id="pm-btn-git-install" class="pm-btn pm-btn-accent">
-                            <i class="fa-brands fa-git-alt"></i> Git 설치
+                            <i class="fa-solid fa-file-zipper"></i> 저장소 설치
                         </button>
                     </div>
                     <div class="pm-install-tips">
-                        <span><i class="fa-solid fa-lightbulb"></i> 팁: <code>update_manifest</code> 를 선언한 플러그인 저장소만 지원. 저장소 다운로드 후 <code>update_manifest.files</code> 목록에 있는 파일만 남기고 나머지는 전부 삭제됩니다.</span>
+                        <span><i class="fa-solid fa-lightbulb"></i> 팁: Git 프로그램을 설치하지 않고 저장소의 HTTP ZIP을 내려받습니다. 업데이트 시 <code>plugins/metadata/&lt;plugin_id&gt;</code> 폴더 전체를 새 패키지로 교체하며 <code>data</code>/<code>cache</code>는 보존합니다.</span>
                     </div>
                 </div>
             </div>

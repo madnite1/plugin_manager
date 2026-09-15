@@ -19,13 +19,13 @@ BookOasis 메타데이터 플러그인을 웹 UI에서 직접 설치·업데이�
   https://github.com/madnite1/plugin_manager
   ```
 
-- **ZIP 업로드 설치** — 저장소 소스를 ZIP 으로 묶어 업로드 (루트에 `update_manifest` 필수)
-  - 같은 `plugin_id`가 이미 설치되어 있으면 신규 설치가 아니라 **ZIP 업데이트**로 처리합니다.
-  - `update_manifest.files`에 선언된 관리 파일만 추가·교체·삭제하고, 목록 밖의 DB·캐시·노드 식별자 등 런타임 데이터는 보존합니다.
-  - 업데이트 전에 기존 플러그인 폴더를 임시 백업하고, 핫 리로드/로드 검증 실패 시 기존 버전으로 자동 복원합니다.
-  - 기존 Git 소스 정보가 있는 플러그인은 ZIP 업데이트만으로 업데이트 원본 저장소가 바뀌지 않습니다.
+- **ZIP 업로드 설치** — 플러그인 전체 폴더가 들어 있는 ZIP을 업로드합니다. `update_manifest`는 필수가 아닙니다.
+  - 같은 `plugin_id`가 이미 설치되어 있으면 신규 설치가 아니라 **전체 폴더 교체 업데이트**로 처리합니다.
+  - `plugins/metadata/<plugin_id>`는 새 패키지 기준으로 통째로 교체하고, `plugins/data/<plugin_id>`와 `plugins/cache/<plugin_id>`는 보존합니다.
+  - 업데이트 전에 기존 코드와 영속 데이터를 백업하고, 핫 리로드/사후 검증 실패 시 기존 상태로 자동 복원합니다.
+  - 기존 저장소 소스 정보가 있는 플러그인은 ZIP 업데이트만으로 업데이트 원본 저장소가 바뀌지 않습니다.
 
-설치 후 온라인 업데이트는 저장된 Git 소스를 기준으로 **저장소 ZIP을 우선 다운로드**하고, ZIP 내부의 최신 `VERSION`과 `update_manifest.files`를 검증한 뒤 적용합니다. 저장소 ZIP 자체를 받을 수 없는 레거시/특수 소스에 한해서만 기존 raw 파일 다운로드 경로를 호환용으로 사용합니다.
+설치 후 온라인 업데이트는 저장된 저장소 URL과 `branch` / `release` / `tag` 전략을 기준으로 **HTTP ZIP을 다운로드**합니다. `git clone`이나 Git 바이너리는 사용하지 않습니다. ZIP 내부의 `plugin_id`와 `VERSION`을 검증한 뒤 `plugins/metadata/<plugin_id>` 폴더 전체를 새 패키지로 교체합니다. 별도 설치 소스가 없는 오래된 설치본에 한해 `update_manifest`를 레거시 raw fallback 힌트로만 사용할 수 있습니다.
 
 ### BookOasis 1.1.0+ 선택 계약 검증
 
@@ -34,7 +34,7 @@ Plugin Manager는 Provider를 실행하지 않고 AST로 `home_widget`, `detail_
 - `sessions`: 생략, `"all"`, 또는 `general/adult/audiobook/video` 값의 문자열 리스트를 지원합니다.
 - `home_widget`: `layout`은 `full|grid`, `size`는 `1|2|3`을 검사합니다. `get_dashboard_data()` 직접 구현을 정적으로 확인하지 못하면 경고만 표시합니다.
 - `detail_sidebar_widget`: `get_detail_sidebar_data()` 직접 구현을 정적으로 확인하지 못하면 경고만 표시합니다.
-- `detail_view`: `detail/index.html`, `detail/style.css`, `detail/script.js` 3개 파일이 필요합니다. `update_manifest`를 사용하는 플러그인은 세 파일을 `update_manifest.files`에 각각 명시해야 합니다. `detail/` 디렉토리 축약이나 암묵적 파일 추가는 하지 않습니다.
+- `detail_view`: `detail/index.html`, `detail/style.css`, `detail/script.js` 3개 파일이 필요합니다. 업데이트는 플러그인 폴더 전체를 교체하므로 `update_manifest.files`에 별도 등록할 필요가 없습니다.
 - 설치 후 `_verify_installed_plugin_static()`은 기존처럼 Provider id와 선택적 VERSION의 최소 무결성만 확인합니다. 신규 UI 계약 검증을 사후 삭제/롤백 게이트로 사용하지 않아 `force` 설치의 기존 의미를 유지합니다.
 - 설치된 플러그인 카드에는 **실제로 지원하는 홈 / 상세 사이드바 / 상세 뷰만** 기존 **카테고리 뷰**와 같은 기능 배지로 표시합니다. 미지원 또는 정적으로 판정할 수 없는 항목은 카드에 별도 배지를 만들지 않으며, 미설치 카탈로그 항목은 원격 소스를 추가 분석하지 않습니다.
 
@@ -173,16 +173,13 @@ https://<host>/<org>/<repo>[/src/branch/<branch>]      # Gitea 등 (archive/{bra
 
 설치 절차:
 
-1. 지정된 설치 브랜치의 소스 ZIP 다운로드 (표준 라이브러리만 사용, git 바이너리 불필요)
-2. 저장소 루트에서 `update_manifest` 를 AST 로 추출 (없으면 설치 거부)
-3. `update_manifest.files` 목록에 있는 파일만 남기고 **전부 삭제** (`.git`, `docs/`, 숨김 파일 포함)
-4. `plugins/metadata/<plugin_id>` 로 복사 → 소스 메타 저장 → 활성화 + hot reload
+1. 지정된 저장소 ref의 소스 ZIP을 HTTP로 다운로드합니다. Git 바이너리나 `git clone`은 사용하지 않습니다.
+2. ZIP을 안전하게 해제하고 Provider의 `plugin_id`와 기본 플러그인 계약을 정적으로 검증합니다.
+3. 신규 설치는 플러그인 전체 폴더를 `plugins/metadata/<plugin_id>`로 복사합니다.
+4. 기존 설치본이면 새 폴더를 staging한 뒤 기존 `plugins/metadata/<plugin_id>` 전체와 교체하고 hot reload/사후 검증을 수행합니다.
+5. `plugins/data/<plugin_id>`와 `plugins/cache/<plugin_id>`는 코드 폴더 밖에 있으므로 업데이트에서 보존됩니다.
 
-설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 유효한 Git 저장소 소스가 저장된 뒤에는 **`plugin_sources.git_url` / `branch`를 온라인 업데이트 원본의 최종 기준**으로 사용합니다. 플러그인 코드의 `update_manifest.raw_base_url`은 배포 파일 목록과 버전 계약을 제공하지만, 과거 저장소 주소가 남아 있더라도 저장된 설치 소스와 다른 저장소로 업데이트 확인을 보내지 않습니다. 유효한 Git 저장소 소스면
-`git_url` / `branch` / `update_channel` / `manifest_files` 이력이 남아 자동 업데이트와 **GIT** 배지가 활성화되고,
-소스 메타가 없으면 **LOCAL** 플러그인으로 표시됩니다 (이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회
-자동으로 DB에 마이그레이션됩니다 — `.zip_source`처럼 git_url이 없는 파일은 삭제 후
-`update_manifest` 기준으로 재판단).
+설치 시 소스 메타가 `plugins/data/plugin_manager/plugin_manager.db`의 `plugin_sources` 테이블에 저장됩니다. 저장소 소스가 저장된 뒤에는 **`plugin_sources.git_url` / `branch` / `update_channel`을 온라인 업데이트 원본의 최종 기준**으로 사용합니다. `update_manifest`는 일반 설치·업데이트의 필수 조건이 아니며, 별도 소스 메타가 없는 레거시 설치본에서만 선택적인 fallback 힌트로 사용합니다. 저장소 소스가 있으면 자동 업데이트와 저장소 기반 상태가 활성화되고, 소스 메타가 없으면 **LOCAL** 플러그인으로 표시됩니다. 이전 버전의 `.git_source`/`.zip_source` 파일은 설치 후 최초 1회 DB로 마이그레이션됩니다.
 업데이트 확인과 실제 업데이트는 동일하게 해석한 `branch` / `release` / `tag` ref를 사용하므로 VERSION 확인 대상과 ZIP 설치 대상이 달라지지 않습니다.
 
 ---
@@ -226,29 +223,17 @@ Plugin Manager도 일반 플러그인과 동일한 입력 경로를 지원합니
 
 업데이트/소스 교체/롤백 중 사용하는 임시 작업 폴더는 `plugins/data/plugin_manager/work/` 아래에 격리하여 `plugins/metadata` 플러그인 탐색 대상에 노출되지 않게 합니다. 또한 구버전이 `plugins/metadata` 루트에 남긴 `.pm_*` 임시 폴더는 자기 업데이트 성공 시뿐 아니라 `start_background_service()` 실행 시에도 정리하므로, 구버전 코드가 업데이트 요청을 끝까지 처리해 즉시 정리하지 못한 경우에도 새 버전 로드 또는 BookOasis 재기동 시 자동 제거됩니다.
 
-### ZIP 우선 온라인 업데이트 정책
+### HTTP ZIP 전체 폴더 업데이트 정책
 
-- 기존 설치 소스를 보존하고 저장소 ZIP을 먼저 받습니다.
-- 최신 ZIP 내부의 `plugin_id`, `VERSION`, `update_manifest.files`를 최종 기준으로 사용합니다.
-- 최신 manifest의 신규/삭제 파일을 반영하고, manifest 밖 런타임 데이터는 보존합니다.
-- ZIP 패키지 검증 실패는 raw로 우회하지 않고 중단합니다.
-- ZIP 자체 다운로드 실패에 한해서만 기존 raw 파일 업데이트를 호환용 fallback으로 사용합니다.
-- 업데이트 후 로드 검증 실패 시 전체 백업에서 자동 복원합니다.
+- 기존 설치 소스를 보존하고 선택한 `branch` / `release` / `tag`의 저장소 ZIP을 HTTP로 받습니다.
+- 최신 ZIP 내부의 `plugin_id`와 `VERSION`을 최종 기준으로 사용합니다.
+- 새 패키지의 플러그인 폴더 전체를 staging 검증한 뒤 `plugins/metadata/<plugin_id>` 전체와 교체합니다.
+- 코드 폴더 안에서 새 버전에 사라진 파일은 자연스럽게 제거되며 별도 파일 목록 관리가 필요하지 않습니다.
+- `plugins/data/<plugin_id>`와 `plugins/cache/<plugin_id>`는 업데이트에서 보존합니다.
+- ZIP 다운로드 또는 패키지 검증 실패는 다른 업데이트 경로로 자동 폴백하지 않고 중단합니다.
+- 업데이트 후 hot reload/사후 검증 실패 시 코드와 영속 데이터 백업에서 자동 복원합니다.
 
-
-`update_manifest` 선언으로 자기 자신도 자동 업데이트 가능:
-
-```python
-update_manifest = {
-    "enabled": True,
-    "provider": "github-raw",
-    "raw_base_url": "https://raw.githubusercontent.com/madnite1/plugin_manager/main",
-    "files": ["plugin_manager.py", "__init__.py", "VERSION", "index.html", "style.css", "script.js", "settings.html", "settings.js"],
-    "version_file": "VERSION",
-    "version_key": "plugin version",
-    "show_sample_update_button": False,
-}
-```
+`update_manifest`는 선택적인 레거시/self-update 힌트로만 남아 있으며 Plugin Manager의 일반 저장소 설치·업데이트에는 필요하지 않습니다. Plugin Manager 자기 업데이트도 저장된 저장소 소스 + `VERSION` + 전체 패키지 검증으로 처리합니다.
 
 ### 업데이트 경로 (자체 업데이트 엔진, 코어 PluginService 미사용)
 
@@ -258,11 +243,9 @@ update_manifest = {
 - **release** — 최신 Release의 tag만 사용합니다. Release가 없거나 ref를 얻지 못하면 업데이트를 차단합니다.
 - **tag** — 태그 목록에서 가장 높은 SemVer 태그만 사용합니다. 태그가 없으면 업데이트를 차단합니다.
 
-세 경로 사이의 자동 폴백은 없습니다. 업데이트 확인용 `VERSION`, 원격 `update_manifest`, 실제 다운로드 ZIP은 모두 같은 선택 ref를 기준으로 처리합니다.
+세 경로 사이의 자동 폴백은 없습니다. 업데이트 확인용 `VERSION`과 실제 다운로드 ZIP은 모두 같은 선택 ref를 기준으로 처리합니다.
 
-`enabled: True`는 필수 게이트 — 없으면 업데이트 대상 목록에 포함되지 않습니다.
-버전 비교 규칙: SemVer core(`MAJOR.MINOR.PATCH`)만 비교, `v` 접두사·pre-release 접미사 무시,
-로컬 < 원격일 때만 업데이트 허용.
+저장된 저장소 소스와 정상 `VERSION`이 있으면 `update_manifest` 없이도 업데이트 대상이 됩니다. 버전 비교는 SemVer core(`MAJOR.MINOR.PATCH`)만 사용하고 `v` 접두사·pre-release 접미사는 무시하며, 로컬 < 원격일 때만 업데이트를 허용합니다.
 
 ---
 
@@ -305,7 +288,7 @@ update_manifest = {
 - 업데이트 후 로드 검증에 실패하면 사용자 롤백을 기다리지 않고 코드와 영속 데이터를 모두 자동 복구합니다.
 - 업데이트/소스 교체/롤백용 임시 코드 작업본은 `plugins/data/plugin_manager/work/` 아래에 두어 `plugins/metadata` 플러그인 탐색 대상과 분리합니다.
 - `plugin_manager` 자기 업데이트 성공 시와 이후 백그라운드 서비스 시작 시 구버전이 `plugins/metadata` 루트에 남긴 `.pm_*` 임시 작업 잔재를 자동 삭제합니다.
-- `update_manifest.files` 밖의 코드 폴더 런타임 파일은 기존 정책대로 현재 값을 유지합니다.
+- `plugins/metadata/<plugin_id>`는 업데이트 시 새 패키지로 전체 교체되므로 코드 폴더 안의 구버전 전용 파일은 자동으로 제거됩니다. 영속 상태는 반드시 `plugins/data/<plugin_id>`에 둡니다.
 - `plugin_manager` 자기 롤백은 자기 데이터 폴더 안의 `rollback/` 저장소를 스냅샷에서 제외하고 복원 중에도 보존해 재귀 백업을 방지합니다.
 - 롤백은 업데이트 때 생성된 직전 상태 백업을 **1회 소비**합니다. 롤백 성공 후 백업 슬롯을 삭제하므로 방금 사용하던 업데이트 버전은 롤백 대상으로 남지 않으며, 다시 업데이트하기 전까지 추가 롤백은 제공하지 않습니다.
 - 플러그인을 삭제하면 해당 플러그인의 롤백 슬롯과 `plugins/cache/<plugin_id>` 캐시 폴더를 항상 함께 삭제합니다. 영속 데이터 폴더는 삭제 모달에서 별도로 선택한 경우에만 제거합니다.

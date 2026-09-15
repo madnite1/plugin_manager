@@ -874,6 +874,58 @@ input:checked + .pm-slider:before {
     border-color: rgba(139, 92, 246, 0.7);
 }
 
+/* 미설치 플러그인 설치 진행 상태 — 실제 단계별 퍼센트가 없는 작업이므로 인디터미넌트 표시 */
+.pm-catalog-card.pm-installing {
+    border-style: solid;
+    border-color: var(--app-accent, #6366f1);
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.18), 0 8px 20px rgba(0, 0, 0, 0.2);
+}
+
+.pm-install-progress {
+    margin: 0.8rem 0 0.1rem;
+    padding: 0.65rem 0.75rem;
+    border-radius: 8px;
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid rgba(99, 102, 241, 0.22);
+}
+
+.pm-install-progress-label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.5rem;
+    color: var(--app-text-secondary, #cbd5e1);
+    font-size: 0.76rem;
+    font-weight: 600;
+}
+
+.pm-install-progress-track {
+    height: 4px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(148, 163, 184, 0.18);
+}
+
+.pm-install-progress-track > span {
+    display: block;
+    width: 42%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--app-accent, #6366f1);
+    animation: pmInstallProgress 1.15s ease-in-out infinite;
+}
+
+@keyframes pmInstallProgress {
+    0% { transform: translateX(-125%); }
+    100% { transform: translateX(340%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .pm-install-progress-track > span {
+        animation-duration: 2.5s;
+    }
+}
+
 .pm-catalog-avatar {
     background: linear-gradient(135deg, rgba(139, 92, 246, 0.25), rgba(99, 102, 241, 0.15));
     border: 1px solid rgba(139, 92, 246, 0.35);

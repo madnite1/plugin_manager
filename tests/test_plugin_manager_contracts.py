@@ -376,15 +376,15 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         detail_check = next(item for item in checks if item["name"] == "detail_view")
         self.assertIn("필수 detail UI 파일 없음", detail_check["detail"])
 
-    def test_detail_view_requires_exact_manifest_entries(self):
+    def test_detail_view_does_not_depend_on_manifest_file_entries(self):
         plugin_dir = self.root / "demo"
         write_latest_contract_provider(plugin_dir, include_all_detail_manifest=False)
 
         ok, checks = self.manager._validate_plugin_source(str(plugin_dir), "demo")
 
-        self.assertFalse(ok)
+        self.assertTrue(ok, checks)
         detail_check = next(item for item in checks if item["name"] == "detail_view")
-        self.assertIn("detail/script.js", detail_check["detail"])
+        self.assertTrue(detail_check["ok"])
 
     def test_missing_optional_data_methods_warn_only(self):
         plugin_dir = self.root / "demo"
@@ -460,7 +460,7 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         disabled["enabled"] = False
         self.assertFalse(self.manager._catalog_manifest_is_installable(disabled, "demo.py"))
 
-    def test_catalog_repo_without_manifest_is_invalid(self):
+    def test_catalog_repo_without_manifest_is_valid_when_version_and_provider_exist(self):
         self.manager._fetch_text = lambda *args, **kwargs: '{"plugin version": "1.2.3"}'
         self.manager._catalog_fetch_plugin_meta = lambda *args, **kwargs: (
             "demo", "Demo", False
@@ -470,7 +470,7 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
             "example/demo", "main"
         )
 
-        self.assertEqual(status, "invalid")
+        self.assertEqual(status, "valid")
         self.assertEqual(plugin_id, "demo")
         self.assertEqual(version, "1.2.3")
         self.assertEqual(name, "Demo")
@@ -521,7 +521,7 @@ class M3UPlayerPlugin(BaseMetadataProvider):
             requested,
         )
 
-    def test_replace_git_forwards_force_but_always_requires_manifest(self):
+    def test_replace_git_forwards_force_without_requiring_manifest(self):
         plugin_dir = self.root / "plugins" / "demo"
         plugin_dir.mkdir(parents=True)
         (plugin_dir / "demo.py").write_text("x = 1\n", encoding="utf-8")
@@ -553,7 +553,7 @@ class M3UPlayerPlugin(BaseMetadataProvider):
 
         self.assertFalse(ok)
         self.assertTrue(captured["force"])
-        self.assertTrue(captured["require_manifest"])
+        self.assertFalse(captured["require_manifest"])
         self.assertEqual(captured["git_url"], target_url)
 
     def test_catalog_reverifies_when_repository_changed_after_last_check(self):
@@ -735,7 +735,7 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["catalog_status"], "invalid")
         self.assertFalse(merged[0]["catalog_valid"])
-        self.assertIn("update_manifest", merged[0]["catalog_validation_message"])
+        self.assertIn("Provider 계약", merged[0]["catalog_validation_message"])
 
     def test_installed_catalog_state_uses_exact_source_not_same_id_other_repo(self):
         installed = {
@@ -764,14 +764,14 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertNotIn("catalog_status", merged[0])
         self.assertNotIn("catalog_valid", merged[0])
 
-    def test_installed_card_renders_persistent_validation_badges(self):
+    def test_installed_card_uses_source_based_update_controls(self):
         script = (Path(__file__).resolve().parents[1] / "script.js").read_text(encoding="utf-8")
         self.assertIn("pm-installed-validation-badge", script)
         self.assertIn("검증 실패</span>", script)
-        self.assertIn("업데이트 비활성", script)
-        self.assertIn("업데이트 정보 없음", script)
-        self.assertIn("업데이트 설정 오류", script)
-        self.assertIn("업데이트 미지원", script)
+        self.assertIn("p.is_installed && (p.git_url || p.has_update_manifest)", script)
+        self.assertIn("catalogMeta.update_path_selection_enabled && p.git_url", script)
+        self.assertNotIn("업데이트 정보 없음", script)
+        self.assertNotIn("updateManifestBadgeHtml", script)
 
     def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
         invalid_row = {
@@ -801,7 +801,7 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertEqual(merged[0]["id"], "broken")
         self.assertFalse(merged[0]["catalog_valid"])
         self.assertFalse(merged[0]["catalog_install_allowed"])
-        self.assertIn("update_manifest", merged[0]["catalog_validation_message"])
+        self.assertIn("Provider 계약", merged[0]["catalog_validation_message"])
 
     def test_invalid_uninstalled_catalog_entry_can_offer_risk_install_when_enabled(self):
         invalid_row = {
@@ -831,6 +831,100 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertFalse(merged[0]["catalog_valid"])
         self.assertTrue(merged[0]["catalog_install_allowed"])
 
+
+    def test_manifestless_git_source_can_check_update(self):
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/demo",
+            "branch": "main",
+        }
+        self.manager._resolve_update_ref = lambda *args, **kwargs: {
+            "mode": "branch",
+            "ref_name": "main",
+            "raw_base_url": "https://raw.githubusercontent.com/example/demo/main",
+            "parsed": {"type": "github", "host": "github.com"},
+        }
+        self.manager._fetch_remote_plugin_version = lambda *args, **kwargs: "2.0.0"
+
+        has_update, latest, status = self.manager._check_plugin_update_detail(
+            "demo", "1.0.0", {"update_manifest": None}, "general"
+        )
+
+        self.assertTrue(has_update)
+        self.assertEqual(latest, "2.0.0")
+        self.assertEqual(status, "ok")
+
+    def test_full_folder_update_removes_old_code_without_touching_external_data(self):
+        plugins_root = self.root / "plugins"
+        dest = plugins_root / "metadata" / "demo"
+        target = self.root / "package" / "demo"
+        work = plugins_root / "data" / "plugin_manager" / "work"
+        data_dir = plugins_root / "data" / "demo"
+        cache_dir = plugins_root / "cache" / "demo"
+        for d in (dest, target, work, data_dir, cache_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        write_provider(dest)
+        write_provider(target)
+        (dest / "old_only.js").write_text("old", encoding="utf-8")
+        (target / "new_only.js").write_text("new", encoding="utf-8")
+        (target / "VERSION").write_text('{"plugin version": "2.0.0"}\n', encoding="utf-8")
+        (data_dir / "state.db").write_text("persistent", encoding="utf-8")
+        (cache_dir / "thumb.bin").write_text("cache", encoding="utf-8")
+
+        class Gateway:
+            value = "1"
+            def get_setting(self, key, default=None): return self.value
+            def set_setting(self, key, value): self.value = value
+
+        gateway = Gateway()
+        self.manager._get_work_dir = lambda: str(work)
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/demo", "branch": "main"
+        }
+        self.manager._prepare_plugin_data_snapshot = lambda plugin_id: {
+            "existed": False, "path": None
+        }
+        self.manager._cleanup_plugin_data_snapshot = lambda snapshot: None
+        self.manager._write_rollback_snapshot = lambda *args, **kwargs: True
+        self.manager.get_db_gateway = lambda db_type: gateway
+        self.manager._hot_reload_plugin = lambda plugin_id: True
+
+        ok, message = self.manager._update_existing_from_zip(
+            str(target), str(dest), "demo", [], "general"
+        )
+
+        self.assertTrue(ok, message)
+        self.assertFalse((dest / "old_only.js").exists())
+        self.assertTrue((dest / "new_only.js").is_file())
+        self.assertEqual((data_dir / "state.db").read_text(encoding="utf-8"), "persistent")
+        self.assertEqual((cache_dir / "thumb.bin").read_text(encoding="utf-8"), "cache")
+
+    def test_self_update_validation_does_not_require_manifest(self):
+        current = self.root / "current_pm"
+        target = self.root / "target_pm"
+        for root, version in ((current, "1.0.0"), (target, "2.0.0")):
+            root.mkdir(parents=True)
+            (root / "plugin_manager.py").write_text(
+                "from plugins.metadata.base import BaseMetadataProvider\n"
+                "class PM(BaseMetadataProvider):\n"
+                "    id = 'plugin_manager'\n"
+                "    name = 'Plugin Manager'\n"
+                "    is_searchable = False\n"
+                "    config_schema = []\n"
+                "    def search(self, db_type, query): return []\n"
+                "    def apply(self, db_type, book_id, item_data): return True, 'ok'\n",
+                encoding="utf-8",
+            )
+            (root / "VERSION").write_text(
+                '{"plugin version": "' + version + '"}\n', encoding="utf-8"
+            )
+
+        ok, error, version = self.manager._validate_self_update_package(
+            str(target), str(current)
+        )
+
+        self.assertTrue(ok, error)
+        self.assertIsNone(error)
+        self.assertEqual(version, "2.0.0")
 
     def test_filter_ui_uses_installed_only_activation_and_complete_features(self):
         root = Path(__file__).resolve().parents[1]

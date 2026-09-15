@@ -982,6 +982,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     "supports_detail_sidebar_widget": supports_detail_sidebar_widget,
                     "supports_detail_view": supports_detail_view,
                     "has_update_manifest": update_manifest_status == "enabled",
+                    "update_supported": bool(git_url or update_manifest_status == "enabled"),
                     "update_manifest_present": isinstance(update_manifest, dict) and bool(update_manifest),
                     "update_manifest_enabled": bool(
                         isinstance(update_manifest, dict)
@@ -1610,8 +1611,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             git_info = self._read_git_source_info(plugin_id)
         except Exception:
             git_info = None
-        has_manifest = bool(provider_meta.get("update_manifest"))
-
         has_update, latest_version, fetch_status = self._check_plugin_update_detail(
             plugin_id, version, provider_meta, db_type
         )
@@ -1632,10 +1631,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         blocked_reason = None
         if fetch_status in ("no_source", "http_404", "parse_failed", "ref_unavailable"):
             blocked_reason = fetch_status
-        if not has_manifest and blocked_reason is None:
-            # update_manifest 자체가 없으면 업데이트 계약 부재 — 교체 제안 대상은 아니나 정보성 표시
-            blocked_reason = None
-
         if blocked_reason:
             result["update_blocked"] = True
             result["blocked_reason"] = blocked_reason
@@ -1643,60 +1638,103 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         return True, result
 
     def _check_plugin_update_detail(self, plugin_id, local_version, provider_meta, db_type=None):
-        """_check_plugin_update 확장 — 업데이트 가능 여부 + fetch 상태 분류.
+        """설치 소스 우선으로 업데이트 가능 여부와 조회 상태를 반환한다.
 
-        반환: (has_update, latest_version, fetch_status)
-        fetch_status:
-          - 'no_source'  : git 소스 메타 없음 (원격 URL 결정 불가)
-          - 'no_manifest': update_manifest 없음 (업데이트 계약 없음 — 차단 아님)
-          - 'ok'         : fetch 성공 (has_update로 최신 여부 판단)
-          - 'http_404'   : 원격 fetch 404 (저장소/파일 삭제)
-          - 'fetch_failed': 그 외 네트워크/HTTP 오류
-          - 'parse_failed': fetch는 됐지만 버전 파싱 실패
-          - 'ref_unavailable': 선택한 release/tag ref가 없음
+        정상 Git 설치본은 update_manifest를 전혀 사용하지 않는다. 저장된 git_url과
+        branch/release/tag 전략으로 원격 VERSION을 확인하고, 저장소 루트 VERSION이 없는
+        monorepo는 ZIP에서 동일 plugin_id 폴더를 찾아 VERSION을 확인한다.
+        소스 메타가 없는 레거시 설치본만 선택적 update_manifest를 fallback으로 사용한다.
         """
         has_update = False
         latest_version = local_version
-        fetch_status = "no_manifest"
 
-        update_manifest = provider_meta.get("update_manifest") if isinstance(provider_meta, dict) else None
-        if not (update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled")):
-            return has_update, latest_version, fetch_status
-
-        # git 소스 메타 없음 → 원격 fetch 불가 (A 조건)
-        git_info = None
         try:
             git_info = self._read_git_source_info(plugin_id)
         except Exception:
             git_info = None
-        if not git_info:
-            return has_update, latest_version, "no_source"
 
+        if git_info:
+            git_url = str(git_info.get("git_url") or "").strip()
+            parsed = self._parse_git_repo(git_url)
+            if not parsed:
+                return has_update, latest_version, "no_source"
+            resolved_ref = self._resolve_update_ref(plugin_id, None, None, db_type)
+            if not resolved_ref:
+                return has_update, latest_version, "ref_unavailable"
+
+            base_url = resolved_ref.get("raw_base_url")
+            token = None
+            resolved_parsed = resolved_ref.get("parsed") or parsed
+            if resolved_parsed and resolved_parsed.get("type") == "gitea":
+                token = self._gitea_token_for_host(db_type, resolved_parsed.get("host"))
+
+            fetch_error = None
+            remote_ver = None
+            try:
+                remote_ver = self._fetch_remote_plugin_version(
+                    base_url,
+                    version_file="VERSION",
+                    version_key="plugin version",
+                    token=token,
+                    raise_fetch_error=True,
+                )
+            except Exception as e:
+                fetch_error = e
+
+            # 저장소 루트에 VERSION이 없는 monorepo는 실제 업데이트 ZIP에서 정확한
+            # plugin_id 폴더를 찾아 버전을 확인한다. 일반 저장소는 이 경로를 타지 않는다.
+            if not remote_ver:
+                zip_info, _zip_err = self._download_repository_zip(
+                    git_url, db_type, plugin_id=plugin_id
+                )
+                if zip_info:
+                    temp_dir = tempfile.mkdtemp(prefix="bo_plugin_check_zip_")
+                    try:
+                        target_plugin_dir = self._extract_repository_zip(
+                            zip_info["zip_bytes"], temp_dir, expected_plugin_id=plugin_id
+                        )
+                        remote_ver = self._read_local_plugin_version(
+                            target_plugin_dir, "VERSION", "plugin version"
+                        )
+                    except Exception:
+                        remote_ver = None
+                    finally:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if not remote_ver:
+                if isinstance(fetch_error, HTTPError) and fetch_error.code == 404:
+                    return has_update, latest_version, "http_404"
+                if fetch_error is not None:
+                    return has_update, latest_version, "fetch_failed"
+                return has_update, latest_version, "parse_failed"
+            if self._can_update_to_version(local_version, remote_ver):
+                return True, remote_ver, "ok"
+            return has_update, remote_ver, "ok"
+
+        # 레거시 fallback: 별도 설치 소스가 없는 경우에만 플러그인의 선택 선언을 사용한다.
+        update_manifest = provider_meta.get("update_manifest") if isinstance(provider_meta, dict) else None
+        if not (update_manifest and isinstance(update_manifest, dict) and update_manifest.get("enabled")):
+            return has_update, latest_version, "no_source"
         try:
             spec = self._build_update_spec(plugin_id, update_manifest)
             if not spec:
                 return has_update, latest_version, "no_source"
-
-            # monorepo/subdir manifest도 정상 업데이트 대상으로 처리한다.
-            # _resolve_update_ref()가 선택한 branch/release/tag ref에 기존 subpath를 다시 붙여
-            # 해당 플러그인 디렉터리의 VERSION/files를 그대로 조회한다.
             resolved_ref = self._resolve_update_ref(
                 plugin_id, spec["raw_base_url"], spec.get("files"), db_type
             )
             if not resolved_ref:
                 return has_update, latest_version, "ref_unavailable"
             base_url = resolved_ref["raw_base_url"]
-            # 인증도 manifest URL이 아니라 실제로 해석된 설치 소스 기준으로 선택한다.
-            gitea_token = None
+            token = None
             resolved_parsed = resolved_ref.get("parsed") if isinstance(resolved_ref, dict) else None
             if resolved_parsed and resolved_parsed.get("type") == "gitea":
-                gitea_token = self._gitea_token_for_host(db_type, resolved_parsed.get("host"))
+                token = self._gitea_token_for_host(db_type, resolved_parsed.get("host"))
             try:
                 remote_ver = self._fetch_remote_plugin_version(
                     base_url,
                     version_file=spec["version_file"],
                     version_key=spec["version_key"],
-                    token=gitea_token,
+                    token=token,
                     raise_fetch_error=True,
                 )
             except HTTPError as e:
@@ -2146,23 +2184,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             shutil.rmtree(dest_dir, ignore_errors=True)
             shutil.copytree(previous_dir, dest_dir)
 
-            # 코드 관리 목록 밖의 런타임 파일은 롤백 전 현재 값을 유지한다.
-            current_files, _ = self._extract_update_manifest_files(swap_dir)
-            previous_files, _ = self._extract_update_manifest_files(previous_dir)
-            managed_union = {
-                os.path.normpath(str(x)).lstrip("./").lstrip("/")
-                for x in list(current_files or []) + list(previous_files or [])
-            }
-            for walk_root, _dirs, files in os.walk(swap_dir):
-                for fname in files:
-                    src = os.path.join(walk_root, fname)
-                    rel = os.path.normpath(os.path.relpath(src, swap_dir))
-                    if rel in managed_union:
-                        continue
-                    dst = os.path.join(dest_dir, rel)
-                    os.makedirs(os.path.dirname(dst) or dest_dir, exist_ok=True)
-                    shutil.copy2(src, dst)
-
             # 새 형식의 롤백 슬롯은 영속 데이터도 업데이트 직전 상태로 복원한다.
             # plugin_manager 자기 롤백에서는 rollback/ 자체는 보존된다.
             if has_data_snapshot:
@@ -2251,23 +2272,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False
 
     def _validate_self_update_package(self, target_plugin_dir, dest_dir):
-        """Plugin Manager 자기 업데이트 패키지의 버전과 로드 계약을 선검증한다."""
-        new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
-        new_spec = self._build_update_spec("plugin_manager", new_manifest)
-        if not new_files or not new_spec:
-            return False, "Plugin Manager 자기 업데이트에는 유효한 update_manifest.files가 필요합니다.", None
-
-        old_files, old_manifest = self._extract_update_manifest_files(dest_dir)
-        old_spec = self._build_update_spec("plugin_manager", old_manifest)
-        if not old_files or not old_spec:
-            return False, "현재 Plugin Manager의 update_manifest를 확인할 수 없어 자기 업데이트를 중단했습니다.", None
-
-        local_ver = self._read_local_plugin_version(
-            dest_dir, old_spec["version_file"], old_spec["version_key"]
-        )
-        remote_ver = self._read_local_plugin_version(
-            target_plugin_dir, new_spec["version_file"], new_spec["version_key"]
-        )
+        """Plugin Manager 자기 업데이트 패키지를 manifest와 무관하게 선검증한다."""
+        local_ver = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version")
+        remote_ver = self._read_local_plugin_version(target_plugin_dir, "VERSION", "plugin version")
         if not local_ver or not remote_ver:
             return False, "Plugin Manager 현재/대상 VERSION을 확인할 수 없어 자기 업데이트를 중단했습니다.", None
         if not self._can_update_to_version(local_ver, remote_ver):
@@ -2275,40 +2282,29 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 f"Plugin Manager 자기 업데이트는 상위 버전만 허용합니다: "
                 f"현재 {local_ver}, 대상 {remote_ver}."
             ), None
+        verified_ok, verify_error = self._verify_installed_plugin_static(
+            target_plugin_dir, "plugin_manager", expected_version=remote_ver
+        )
+        if not verified_ok:
+            return False, f"Plugin Manager 대상 패키지 검증 실패: {verify_error}", None
         return True, None, remote_ver
 
     def _update_existing_from_zip(self, target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=False):
-        """동일 plugin_id ZIP을 기존 플러그인의 트랜잭션형 업데이트로 적용한다.
+        """동일 plugin_id 패키지로 기존 플러그인 폴더 전체를 트랜잭션형 교체한다.
 
-        update_manifest.files를 관리 파일 목록으로 사용해 코드/UI를 교체하고,
-        업데이트 직전 `plugins/data/<plugin_id>` 전체를 롤백 스냅샷으로 함께 보관한다.
-        업데이트 후 로드 검증에 실패하면 코드와 영속 데이터를 모두 직전 상태로 복구한다.
+        `plugins/metadata/<plugin_id>`는 전부 교체 가능한 코드/런타임 영역으로 취급한다.
+        영속 데이터(`plugins/data/<plugin_id>`)와 캐시(`plugins/cache/<plugin_id>`)는 코드 폴더
+        밖에 있으므로 업데이트에서 건드리지 않는다. 교체 전 현재 코드와 영속 데이터는
+        롤백 스냅샷으로 보관하며, hot reload/사후 검증 실패 시 둘 다 직전 상태로 복구한다.
         """
-        old_files, _old_manifest = self._extract_update_manifest_files(dest_dir)
-        new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
-        if not new_files:
-            return False, (
-                f"기존 플러그인 '{plugin_id}'을 ZIP으로 업데이트하려면 update_manifest.files가 필요합니다. "
-                "기존 런타임 데이터를 보호하기 위해 전체 폴더 덮어쓰기는 수행하지 않았습니다."
-            )
+        if not os.path.isdir(target_plugin_dir):
+            return False, "업데이트 대상 플러그인 폴더를 찾을 수 없습니다."
 
-        self_target_version = None
-        if plugin_id == "plugin_manager":
-            self_ok, self_err, self_target_version = self._validate_self_update_package(
-                target_plugin_dir, dest_dir
-            )
-            if not self_ok:
-                return False, self_err
-
-        new_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in new_files}
-        old_managed = {os.path.normpath(str(x)).lstrip("./").lstrip("/") for x in (old_files or [])}
-        if any((not p or p.startswith("..") or p.startswith("/")) for p in new_managed):
-            return False, "update_manifest.files에 유효하지 않은 경로가 포함되어 있습니다."
-
-        base_dir = self._get_plugins_base_dir()
-        backup_dir = os.path.join(self._get_work_dir(), f"zip_backup_{plugin_id}")
-        if os.path.exists(backup_dir):
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        work_dir = self._get_work_dir()
+        stage_dir = os.path.join(work_dir, f"full_stage_{plugin_id}")
+        backup_dir = os.path.join(work_dir, f"full_backup_{plugin_id}")
+        self._remove_path(stage_dir)
+        self._remove_path(backup_dir)
 
         old_git_info = None
         try:
@@ -2318,6 +2314,36 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         old_version = self._read_local_plugin_version(dest_dir, "VERSION", "plugin version") or "알 수 없음"
         new_version = self._read_local_plugin_version(target_plugin_dir, "VERSION", "plugin version") or "알 수 없음"
+
+        # 새 패키지는 현재 설치본을 건드리기 전에 work 영역에 완전히 준비한다.
+        try:
+            shutil.copytree(
+                target_plugin_dir,
+                stage_dir,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".github", "__pycache__", "*.pyc", "__MACOSX", ".DS_Store"
+                ),
+            )
+        except Exception as e:
+            self._remove_path(stage_dir)
+            return False, f"새 플러그인 패키지 staging 실패: {e}"
+
+        expected_stage_version = None if new_version == "알 수 없음" else new_version
+        staged_ok, staged_error = self._verify_installed_plugin_static(
+            stage_dir, plugin_id, expected_version=expected_stage_version
+        )
+        if not staged_ok:
+            self._remove_path(stage_dir)
+            return False, f"새 플러그인 패키지 사전 검증 실패: {staged_error}"
+
+        self_target_version = None
+        if plugin_id == "plugin_manager":
+            self_ok, self_err, self_target_version = self._validate_self_update_package(
+                stage_dir, dest_dir
+            )
+            if not self_ok:
+                self._remove_path(stage_dir)
+                return False, self_err
 
         enabled_key = f"PLUGIN_ENABLED_{plugin_id}"
         try:
@@ -2330,43 +2356,34 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             old_enabled = "1"
 
         data_snapshot = None
+        swapped_old = False
         try:
-            # 코드와 영속 데이터 모두 새 코드가 실행되기 전에 확보한다.
-            shutil.copytree(dest_dir, backup_dir)
             data_snapshot = self._prepare_plugin_data_snapshot(plugin_id)
 
-            for rel in sorted(old_managed - new_managed, reverse=True):
-                target = os.path.join(dest_dir, rel)
-                if os.path.isfile(target) or os.path.islink(target):
-                    os.remove(target)
-                elif os.path.isdir(target):
-                    shutil.rmtree(target, ignore_errors=True)
-
-            for rel in sorted(new_managed):
-                self._copy_managed_file(target_plugin_dir, dest_dir, rel)
+            # metadata와 data는 같은 plugins 트리 아래에 있으므로 rename 기반으로 교체한다.
+            # 두 rename 사이 프로세스가 종료되는 극단적 상황은 startup recovery에서 다룬다.
+            os.replace(dest_dir, backup_dir)
+            swapped_old = True
+            os.replace(stage_dir, dest_dir)
 
             self.get_db_gateway('general').set_setting(enabled_key, old_enabled)
             self._hot_reload_plugin(plugin_id)
 
-            expected_version = self_target_version if plugin_id == "plugin_manager" else None
+            expected_version = self_target_version if plugin_id == "plugin_manager" else expected_stage_version
             verified_ok, verify_error = self._verify_installed_plugin_static(
                 dest_dir, plugin_id, expected_version=expected_version
             )
             if not verified_ok:
-                logger.warning("ZIP 업데이트 후 플러그인 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
-                restored = self._restore_plugin_backup(
-                    backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
-                )
-                return False, (
-                    f"검증 실패: '{plugin_id}' ZIP 업데이트 후 설치 파일의 Provider 계약을 확인할 수 없습니다. "
-                    + ("기존 코드와 데이터로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
-                )
+                raise RuntimeError(f"교체 후 정적 검증 실패: {verify_error}")
 
+            # 수동 ZIP 설치처럼 별도 소스 메타가 없는 경우에만 선택적 manifest를 레거시
+            # fallback 소스 힌트로 활용한다. 정상 Git 업데이트 경로는 manifest를 사용하지 않는다.
             if not old_git_info:
                 try:
+                    _manifest_files, new_manifest = self._extract_update_manifest_files(dest_dir)
                     raw_base_url = str((new_manifest or {}).get("raw_base_url") or "").strip().rstrip("/")
                     if raw_base_url:
-                        self._ensure_git_source_from_raw_base_url(plugin_id, raw_base_url, list(new_managed))
+                        self._ensure_git_source_from_raw_base_url(plugin_id, raw_base_url, [])
                 except Exception:
                     pass
 
@@ -2379,19 +2396,22 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 data_stage=(data_snapshot or {}).get("path"),
                 data_existed=(data_snapshot or {}).get("existed"),
             )
-            shutil.rmtree(backup_dir, ignore_errors=True)
+            self._remove_path(backup_dir)
+
             legacy_pm_removed = []
             if plugin_id == "plugin_manager":
                 legacy_pm_removed = self._cleanup_legacy_metadata_workdirs()
+
             passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
             warns = [c["detail"] for c in source_checks if c.get("warn")]
             result_msg = (
-                f"동일 ID ZIP을 감지하여 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
-                f"(관리 파일 {len(new_managed)}개 갱신, 코드와 plugins/data/{plugin_id} 롤백 백업 생성, "
-                f"검증 통과: {', '.join(passed)})"
+                f"'{plugin_id}' 플러그인 폴더 전체를 새 패키지로 교체했습니다. "
+                f"(코드 전체 교체, plugins/data/{plugin_id}·plugins/cache/{plugin_id} 유지"
+                + (f", 검증 통과: {', '.join(passed)}" if passed else "")
+                + ")"
             )
             if force:
-                result_msg += " [경고] 검증 실패 항목을 무시하고 업데이트했습니다."
+                result_msg += " [경고] 일반 검증 실패 항목을 사용자 승인으로 무시했습니다."
             if rollback_saved:
                 result_msg += f" 이전 버전(v{old_version})의 코드와 영속 데이터 롤백 백업을 보관했습니다."
             else:
@@ -2403,17 +2423,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return True, result_msg
         except Exception as e:
             restored = False
-            if os.path.isdir(backup_dir):
-                restored = self._restore_plugin_backup(
-                    backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
-                )
+            try:
+                if swapped_old and os.path.isdir(backup_dir):
+                    restored = self._restore_plugin_backup(
+                        backup_dir, dest_dir, plugin_id, data_snapshot=data_snapshot
+                    )
+            except Exception:
+                logger.exception("전체 폴더 업데이트 실패 후 복구 실패 (id=%s)", plugin_id)
             return False, (
-                f"ZIP 플러그인 업데이트 중 오류가 발생했습니다: {str(e)} "
-                + ("(기존 코드와 데이터 자동 복원 완료)" if restored else "(기존 버전 자동 복원 실패)")
+                f"플러그인 폴더 교체 중 오류가 발생했습니다: {e}. "
+                + ("기존 코드와 데이터로 자동 복원했습니다." if restored else "기존 버전 자동 복원에도 실패했습니다.")
             )
         finally:
-            if os.path.exists(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
+            self._remove_path(stage_dir)
+            self._remove_path(backup_dir)
             self._cleanup_plugin_data_snapshot(data_snapshot)
 
     def _install_from_zip(self, zip_data_b64, filename, db_type, force=False):
@@ -2580,8 +2603,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 last_err = str(e)
         return None, f"저장소 ZIP 다운로드 실패 ({mode} {ref_name}): {last_err or '알 수 없는 오류'}"
 
-    def _extract_repository_zip(self, zip_bytes, temp_dir):
-        """저장소 ZIP을 Zip Slip 검사 후 해제하고 플러그인 루트를 반환한다."""
+    def _extract_repository_zip(self, zip_bytes, temp_dir, expected_plugin_id=None):
+        """저장소 ZIP을 Zip Slip 검사 후 해제하고 플러그인 루트를 반환한다.
+
+        expected_plugin_id가 있으면 monorepo 안에서도 동일 Provider id의 플러그인 폴더를
+        찾아 반환한다. 업데이트/저장소 변경에서 다른 플러그인을 잘못 선택하지 않기 위함이다.
+        """
         import io
         import zipfile
 
@@ -2593,108 +2620,55 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         for member in zip_file.namelist():
             member_clean = os.path.normpath(member)
             if (member_clean.startswith("..") or member_clean.startswith("/")
-                    or member_clean.startswith("\\\\")):
+                    or member_clean.startswith("\\")):
                 raise ValueError(
                     f"보안 경고: 압축 파일 내 유효하지 않은 상위 경로가 포함되어 있습니다: {member}"
                 )
         zip_file.extractall(temp_dir)
-        target_plugin_dir = self._find_plugin_root_dir(temp_dir)
+        if expected_plugin_id:
+            target_plugin_dir = self._find_plugin_root_dir_for_id(temp_dir, expected_plugin_id)
+        else:
+            target_plugin_dir = self._find_plugin_root_dir(temp_dir)
         if not target_plugin_dir:
+            if expected_plugin_id:
+                raise ValueError(
+                    f"다운로드된 저장소에서 플러그인 '{expected_plugin_id}' 폴더를 찾을 수 없습니다."
+                )
             raise ValueError("다운로드된 저장소에서 플러그인 디렉토리를 찾을 수 없습니다.")
         return target_plugin_dir
 
     def _install_from_git(self, git_url, db_type, force=False, backup_dir=None, require_manifest=False):
-        """
-        GitHub/Gitea 저장소 URL 을 통한 플러그인 설치 (git 바이너리 불필요).
-        force=True: 1차 정적 검증 실패 시에도 경고만 하고 설치 계속 (설정/사용자 확인 후).
-        backup_dir: 지정 시 설치 실패(로드 검증 포함) 후 해당 디렉토리로 롤백 (소스 교체용).
+        """GitHub/Gitea 저장소 ZIP으로 플러그인을 설치하거나 전체 폴더 교체 업데이트한다.
 
-        절차:
-          1. 저장소 소스를 HTTP ZIP 으로 다운로드 (urllib 표준 라이브러리만 사용)
-          2. 다운로드된 코드에서 update_manifest 를 AST 로 안전하게 추출
-          3. update_manifest.files 목록에 있는 파일만 남기고 전부 삭제
-          4. plugins/metadata/<plugin_id> 로 복사 후 활성화 + 핫 리로드
+        update_manifest는 설치/업데이트의 필수 조건이 아니다. 설치 소스는 plugin_sources DB에
+        기록하고, 이후 branch/release/tag 전략으로 선택한 저장소 ZIP 전체를 사용한다.
+        `backup_dir`/`require_manifest` 인자는 구버전 내부 호출 호환을 위해 유지하지만 새 경로는
+        공통 전체 폴더 교체 엔진의 자체 백업/롤백을 사용한다.
         """
         git_url = str(git_url or "").strip()
         if not git_url:
             return False, "Git 저장소 URL이 누락되었습니다."
-
-        # URL scheme 안전성 검증 (http/https 만 허용 — git 바이너리 의존 없음)
         if not re.match(r'^https?://', git_url, re.IGNORECASE):
             return False, "지원하지 않는 Git URL 형식입니다. (http/https URL만 허용)"
-
-        zip_url, branch = self._build_repo_zip_url(git_url)
-        if not zip_url:
+        if not self._build_repo_zip_url(git_url)[0]:
             return False, "Git 저장소 URL 형식을 인식할 수 없습니다."
 
         temp_dir = tempfile.mkdtemp(prefix="bo_plugin_git_")
-        dest_dir = None  # except 롤백에서 참조 (초기화)
-
         try:
-            import io
-            import zipfile
-
-            # 1. 설치/업데이트 공통 저장소 ZIP 획득 정책 사용
             zip_info, zip_err = self._download_repository_zip(git_url, db_type)
             if not zip_info:
                 return False, zip_err or "저장소 ZIP 다운로드 실패"
-            zip_bytes = zip_info["zip_bytes"]
-            used_url = zip_info["used_url"]
-            branch = zip_info["branch"]
-            release_tag = zip_info["ref_name"] if zip_info["ref_type"] == "release" else None
-            release_zip_url = used_url if zip_info["ref_type"] == "release" else None
 
-            # 2~3. 안전하게 압축 해제 + 플러그인 루트 탐색
             try:
-                target_plugin_dir = self._extract_repository_zip(zip_bytes, temp_dir)
+                target_plugin_dir = self._extract_repository_zip(zip_info["zip_bytes"], temp_dir)
             except ValueError as e:
                 return False, str(e)
 
-            # 4. update_manifest.files 추출 + 플러그인 ID 감지
-            manifest_files, manifest = self._extract_update_manifest_files(target_plugin_dir)
-            has_manifest = bool(manifest_files)
-            manifest_files = manifest_files or []  # 폴백 진행 시 None 방지
-            if not has_manifest:
-                if require_manifest:
-                    return False, (
-                        "저장소 변경 대상에는 유효한 update_manifest.files가 필요합니다. "
-                        "자동 업데이트 계약이 없는 저장소로는 소스를 변경할 수 없습니다."
-                    )
-                # update_manifest 없는 저장소 → "검증 실패시 설치 가능" 옵션 게이트
-                # (직접 Git 설치에 한해 ON 시 폴백 진행)
-                allow_invalid = self._catalog_get_allow_invalid_install(db_type)
-                if not allow_invalid:
-                    return False, (
-                        "다운로드된 저장소에서 update_manifest 를 찾을 수 없습니다. "
-                        "이 저장소는 자동 업데이트 계약(update_manifest)이 없는 저장소입니다. "
-                        "설치하려면 플러그인 매니저 설정에서 '검증 실패시 설치 가능'을 켠 후 다시 시도하세요."
-                    )
-                if not force:
-                    # 옵션 ON + 최초 시도 → 프론트 confirm 유도 (기존 __VALIDATION_FAILED__ 마커 재사용)
-                    import json as _json
-                    return False, (
-                        "이 저장소는 update_manifest 가 없어 자동 업데이트가 불가합니다. "
-                        "그래도 설치할까요? (전체 파일이 플러그인 폴더로 복사됩니다)\n"
-                        "__VALIDATION_FAILED__" + _json.dumps({
-                            "validation_failed": True,
-                            "allow_invalid_install": True,
-                            "checks": [{
-                                "name": "update_manifest 선언",
-                                "ok": False,
-                                "detail": "update_manifest 가 없습니다. 업데이트/배지가 비활성화됩니다.",
-                                "guide_ref": "§3.1",
-                            }],
-                            "guide_refs": ["§3.1"],
-                        }, ensure_ascii=False)
-                    )
-                # force=True (사용자 confirm 통과) → 아래 폴백 경로로 진행 (전체 복사 설치)
             plugin_id = self._detect_plugin_id(target_plugin_dir)
             if not plugin_id:
                 return False, "플러그인 ID를 식별할 수 없습니다. (Provider 클래스의 공식 id 필드 필요)"
-
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
                 return False, f"유효하지 않은 플러그인 ID입니다 (영문/숫자/언더바/하이픈만 허용): {plugin_id}"
-
             if plugin_id in ("base.py", "base", "__pycache__"):
                 return False, "시스템 예약어는 덮어쓸 수 없습니다."
 
@@ -2702,150 +2676,89 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if err or not dest_dir:
                 return False, err or "유효하지 않은 플러그인 경로입니다."
 
-            # 5. files 목록 경로 안전성 검증 (경로 이탈 차단 — manifest 있을 때만)
-            for rel in manifest_files:
-                rel_clean = os.path.normpath(str(rel))
-                if (rel_clean.startswith("..") or rel_clean.startswith("/")
-                        or rel_clean.startswith("\\") or rel_clean in (".", "")):
-                    return False, f"update_manifest 에 유효하지 않은 파일 경로가 포함되어 있습니다: {rel}"
-
-            # 5-1. 1차 검증: 정적 소스 검증 (코드 실행 없음 — AST/파일 스캔, zip 설치와 동일 기준)
-            #      prune 전에 수행해야 UI 번들/VERSION/symlink 등 전체 파일 기준 검사 가능
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
             if not source_ok and not force:
                 return self._validation_fail_response(source_checks, db_type)
 
-            # 이미 설치된 동일 ID는 폴더 삭제/재설치 대신 트랜잭션형 업데이트를 사용한다.
-            # Plugin Manager 자기 자신도 이 경로를 사용하므로 실행 중 코드 교체 실패 시 롤백 가능하다.
+            # manifest는 레거시 fallback 힌트로만 기록한다. 실제 교체 범위에는 사용하지 않는다.
+            manifest_files, _manifest = self._extract_update_manifest_files(target_plugin_dir)
+            manifest_files = manifest_files or []
+
             if os.path.isdir(dest_dir):
                 ok, msg = self._update_existing_from_zip(
                     target_plugin_dir, dest_dir, plugin_id, source_checks, db_type, force=force
                 )
                 if not ok:
                     return False, msg
-                git_source_info = {
-                    "git_url": git_url,
-                    "branch": branch,
-                    "installed_at": datetime.now().isoformat(),
-                    "manifest_files": manifest_files,
-                }
-                self._sources_set(plugin_id, git_source_info)
-                source_label = (
-                    f"릴리즈 태그 {release_tag}"
-                    if (release_zip_url and used_url == release_zip_url)
-                    else f"브랜치 {branch}"
-                )
-                return True, (
-                    f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인을 안전하게 업데이트했습니다. "
-                    f"{msg}"
-                )
-
-            # 6. manifest 있을 때만 목록 외 전부 삭제 (.git 등 포함 안전 처리)
-            #    manifest 없음(폴백) → 전체 복사, prune 스킵 (빈 목록이면 전부 삭제 위험)
-            if has_manifest:
-                try:
-                    self._prune_plugin_dir(target_plugin_dir, manifest_files)
-                except Exception as e:
-                    return False, f"플러그인 파일 정리 중 오류가 발생했습니다: {str(e)}"
-
-            # 7. 이전 코드 디렉토리 교체 후 복사. plugins/data/<plugin_id>는 dest_dir 밖의
-            #    별도 영속 영역이므로 이 삭제의 영향을 받지 않는다.
-            #    (manifest 없음 → ZIP 방식 ignore 패턴으로 전체 복사)
-            if os.path.exists(dest_dir):
-                shutil.rmtree(dest_dir)
-            if has_manifest:
-                shutil.copytree(target_plugin_dir, dest_dir)
             else:
                 shutil.copytree(
-                    target_plugin_dir, dest_dir,
+                    target_plugin_dir,
+                    dest_dir,
                     ignore=shutil.ignore_patterns(
                         ".git", ".github", "__pycache__", "*.pyc", "__MACOSX", ".DS_Store"
-                    )
+                    ),
                 )
+                self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
+                self._hot_reload_plugin(plugin_id)
+                expected_version = self._read_local_plugin_version(
+                    dest_dir, "VERSION", "plugin version"
+                )
+                verified_ok, verify_error = self._verify_installed_plugin_static(
+                    dest_dir, plugin_id, expected_version=expected_version
+                )
+                if not verified_ok:
+                    logger.warning("Git 설치 후 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
+                    self._remove_path(dest_dir)
+                    return False, (
+                        f"검증 실패: '{plugin_id}' 설치 파일의 Provider 계약을 확인할 수 없습니다. "
+                        "설치 폴더를 삭제했습니다."
+                    )
 
-            # 8. Git 소스 메타 정보 저장 (sqlite plugin_sources — .git_source 파일 미생성)
             git_source_info = {
                 "git_url": git_url,
-                "branch": branch,
+                "branch": zip_info.get("branch"),
                 "installed_at": datetime.now().isoformat(),
                 "manifest_files": manifest_files,
             }
             self._sources_set(plugin_id, git_source_info)
 
-            # 9. 활성화 + 핫 리로드
-            self.get_db_gateway('general').set_setting(f"PLUGIN_ENABLED_{plugin_id}", "1")
-            self._hot_reload_plugin(plugin_id)
-
-            # 2차 검증: 설치된 파일에서 Provider 계약을 다시 정적으로 확인한다.
-            verified_ok, verify_error = self._verify_installed_plugin_static(dest_dir, plugin_id)
-            if not verified_ok:
-                logger.warning("Git 설치 후 정적 검증 실패 (id=%s): %s", plugin_id, verify_error)
-                if os.path.exists(dest_dir):
-                    shutil.rmtree(dest_dir, ignore_errors=True)
-                if backup_dir and os.path.isdir(backup_dir):
-                    # 소스 교체 실패 → 이전 소스 폴더 복원
-                    try:
-                        shutil.copytree(backup_dir, dest_dir)
-                    except Exception as rb_e:
-                        print(f"[PluginManager] replace rollback copy error: {rb_e}")
-                return False, (
-                    f"검증 실패: '{plugin_id}' 설치 파일의 Provider 계약을 확인할 수 없습니다. "
-                    f"(클래스 id와 폴더명이 일치하는지 확인 필요) — 설치 폴더를 삭제했습니다."
-                )
-
             passed = [c["name"] for c in source_checks if c.get("ok") and not c.get("warn")]
             warns = [c["detail"] for c in source_checks if c.get("warn")]
-            source_label = (
-                f"릴리즈 태그 {release_tag}"
-                if (release_zip_url and used_url == release_zip_url)
-                else f"브랜치 {branch}"
-            )
+            ref_type = zip_info.get("ref_type") or "branch"
+            ref_name = zip_info.get("ref_name") or zip_info.get("branch") or "알 수 없음"
+            source_label = f"{ref_type} {ref_name}"
+            if os.path.isdir(dest_dir) and backup_dir is not None:
+                # 구버전 소스 변경 호출부가 남긴 임시 백업이 있으면 새 엔진 성공 후 정리한다.
+                try:
+                    if os.path.isdir(backup_dir):
+                        shutil.rmtree(backup_dir, ignore_errors=True)
+                except Exception:
+                    pass
             result_msg = (
-                f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인이 성공적으로 설치 및 활성화되었습니다! "
+                f"Git 저장소({source_label})에서 '{plugin_id}' 플러그인을 설치했습니다. "
+                "플러그인 코드 폴더 전체를 패키지 기준으로 관리하며 update_manifest는 필요하지 않습니다."
             )
-            if has_manifest:
-                result_msg += (
-                    f"(update_manifest 기준 {len(manifest_files)}개 파일만 유지, 검증 통과: {', '.join(passed)})"
-                )
-            else:
-                result_msg += (
-                    "(update_manifest 가 없는 저장소 — 전체 파일이 복사되었으며, 자동 업데이트/업데이트 버튼이 비활성화됩니다)"
-                )
             if force:
-                result_msg += " [경고] 검증 실패 항목을 무시하고 설치했습니다."
+                result_msg += " [경고] 일반 검증 실패 항목을 사용자 승인으로 무시했습니다."
+            if passed:
+                result_msg += " 검증 통과: " + ", ".join(passed)
             if warns:
                 result_msg += " 경고: " + "; ".join(warns)
-            if backup_dir and os.path.isdir(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)  # 백업 성공 → 정리
             return True, result_msg
-
         except Exception as e:
-            # 소스 교체 실패 → 원본 복원 시도 (dest_dir은 try 내부에서 정의됨)
-            if backup_dir and os.path.isdir(backup_dir) and dest_dir:
-                try:
-                    if os.path.exists(dest_dir):
-                        shutil.rmtree(dest_dir, ignore_errors=True)
-                    shutil.copytree(backup_dir, dest_dir)
-                except Exception as rb_e:
-                    print(f"[PluginManager] replace rollback (except) error: {rb_e}")
             return False, f"Git 플러그인 설치 중 오류가 발생했습니다: {str(e)}"
         finally:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _replace_plugin(self, plugin_id, new_git_url, db_type, force=False):
-        """설치된 플러그인의 소스를 교체 (백업 → 재설치 → 실패 시 롤백).
+        """설치된 플러그인을 같은 plugin_id의 다른 카탈로그 저장소 패키지로 교체한다.
 
-        설계: 소스마다 파일 구조/update_manifest/subpath가 다를 수 있어
-        git_url 메타만 바꾸는 대신 폴더 재설치 방식으로 안전하게 교체.
-        - 백업: plugins/data/plugin_manager/work/replace_backup_<id> (플러그인 폴더 전체 + 소스 메타)
-        - 재설치: _install_from_git(new_git_url, backup_dir=백업경로, require_manifest=True)
-        - 성공: 백업 삭제, 실패: 백업 복원 (소스 메타도 원복)
+        카탈로그 후보 검증만 통과하면 update_manifest 유무와 관계없이 공통 전체 폴더 교체
+        엔진을 사용한다. 실패 시 공통 엔진이 기존 코드와 영속 데이터를 자동 복원한다.
         """
-        base_dir = self._get_plugins_base_dir()
         if not re.fullmatch(r"[A-Za-z0-9_\-]+", plugin_id or ""):
             return False, f"유효하지 않은 플러그인 ID입니다: {plugin_id}"
-
         pdir, err = self._validate_plugin_path(plugin_id)
         if err or not pdir:
             return False, err or "유효하지 않은 플러그인 ID입니다."
@@ -2854,7 +2767,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         if plugin_id in ("base.py", "base"):
             return False, "시스템 핵심 파일은 소스를 교체할 수 없습니다."
 
-        # 1. 후보 검증: 카탈로그에 같은 plugin_id + 유효한 소스가 있는지
         candidates = self._catalog_replace_candidates(plugin_id, db_type)
         candidate_urls = {str(c["git_url"]).rstrip("/") for c in candidates}
         if new_git_url.rstrip("/") not in candidate_urls:
@@ -2863,34 +2775,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "(카탈로그 갱신 후 다시 시도하세요)"
             )
 
-        # 2. 백업 (플러그인 폴더 + 소스 메타)
-        backup_dir = os.path.join(self._get_work_dir(), f"replace_backup_{plugin_id}")
-        old_git_info = None
-        try:
-            old_git_info = self._read_git_source_info(plugin_id)
-        except Exception:
-            old_git_info = None
-        if os.path.exists(backup_dir):
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        try:
-            shutil.copytree(pdir, backup_dir)
-        except Exception as e:
-            return False, f"소스 교체 백업 실패: {str(e)}"
-
-        # 3. 재설치 (실패 시 backup_dir로 롤백)
         ok, msg = self._install_from_git(
-            new_git_url, db_type, force=force, backup_dir=backup_dir, require_manifest=True
+            new_git_url, db_type, force=force, require_manifest=False
         )
         if not ok:
-            # _install_from_git이 backup_dir에서 복원했으면 여기서는 정리만
-            if os.path.exists(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            return False, f"소스 교체 실패 (원본 복원됨): {msg}"
-
-        # 4. 성공 — 교체된 소스로 재활성화 + 소스 메타 정리 완료 (_install_from_git이 갱신)
-        return True, (
-            f"플러그인 '{plugin_id}' 소스가 교체되었습니다: {new_git_url}"
-        )
+            return False, f"소스 교체 실패 (기존 코드/데이터는 자동 복원됨): {msg}"
+        return True, f"플러그인 '{plugin_id}' 소스가 교체되었습니다: {new_git_url}. {msg}"
 
     def _build_repo_zip_url(self, git_url):
         """
@@ -3039,6 +2929,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return subdirs[0]
 
         return start_dir
+
+    def _find_plugin_root_dir_for_id(self, start_dir, plugin_id):
+        """압축 트리에서 정확히 같은 Provider id를 가진 플러그인 루트를 찾는다."""
+        expected = str(plugin_id or "").strip()
+        if not expected:
+            return self._find_plugin_root_dir(start_dir)
+        for root, dirs, _files in os.walk(start_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__MACOSX"]
+            if not self._is_plugin_directory(root):
+                continue
+            detected = self._detect_plugin_id(root)
+            if detected == expected:
+                return root
+        return None
 
     def _is_plugin_directory(self, dpath):
         """디렉토리가 유효한 플러그인 구성 요소들을 포함하고 있는지 판별"""
@@ -3193,7 +3097,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         provider_meta = provider_meta or {}
         statuses = provider_meta.get("_contract_status") or {}
         methods = set(provider_meta.get("_methods") or [])
-        manifest_set = {os.path.normpath(str(rel)) for rel in (manifest_files or [])}
         specs = {
             "home_widget": {
                 "label": "home_widget",
@@ -3257,10 +3160,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 missing_ui = [rel for rel in required_ui if not os.path.isfile(os.path.join(plugin_dir, rel))]
                 if missing_ui:
                     problems.append("필수 detail UI 파일 없음: " + ", ".join(missing_ui))
-                if manifest_files:
-                    missing_manifest = [rel for rel in required_ui if os.path.normpath(rel) not in manifest_set]
-                    if missing_manifest:
-                        problems.append("update_manifest.files 누락: " + ", ".join(missing_manifest))
 
             unresolved = list(state.get("unresolved_fields") or [])
             if problems:
@@ -3343,7 +3242,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         manifest_files, manifest = self._extract_update_manifest_files(plugin_dir)
         provider_meta = self._extract_provider_metadata(plugin_dir) or {}
 
-        # 1. VERSION 파일 검사 (update_manifest 선언 시 필수, 미선언 시 경고만)
+        # 1. VERSION 파일 검사. Provider 런타임 계약과 업데이트 계약은 분리한다.
+        # VERSION이 없거나 비표준이어도 플러그인 자체는 유효할 수 있으며,
+        # Plugin Manager의 자동 업데이트 버전 판정만 사용할 수 없다.
         vpath = os.path.join(plugin_dir, "VERSION")
         vfile_ok = False
         vdetail = ""
@@ -3369,15 +3270,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         else:
             vdetail = "VERSION 파일 없음"
 
-        if manifest_files:
-            if vfile_ok:
-                checks.append({"name": "VERSION", "ok": True, "detail": vdetail,
-                               "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
-            else:
-                checks.append({"name": "VERSION", "ok": False,
-                               "detail": "update_manifest 선언 시 VERSION 필수 — " + vdetail,
-                               "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
-        elif vfile_ok:
+        if vfile_ok:
             checks.append({"name": "VERSION", "ok": True, "detail": vdetail,
                            "guide_ref": "가이드 §2 디렉토리 구조 (VERSION 필수) / §7 릴리즈 절차"})
         else:
@@ -3600,7 +3493,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             checks.append({"name": "심볼릭 링크", "ok": True, "detail": "없음",
                            "guide_ref": "가이드 §2.1 보안 제약 (외부 심볼릭 링크 접근 차단)"})
 
-        # 8. update_manifest 규격 검사 (선언된 경우에만)
+        # 8. update_manifest는 선택적인 self-update/fallback 선언이다.
+        # 잘못된 선언은 일반 플러그인 유효성 판정을 실패시키지 않는다.
         if manifest_files:
             problems = []
             m_provider = str(manifest.get("provider") or "").strip()
@@ -3617,8 +3511,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not str(manifest.get("raw_base_url") or "").strip():
                 problems.append("raw_base_url이 비어 있음")
             if problems:
-                checks.append({"name": "update_manifest", "ok": False,
-                               "detail": "; ".join(problems[:4]),
+                checks.append({"name": "update_manifest", "ok": True, "warn": True,
+                               "detail": "경고: 선택적 업데이트 선언 오류 — " + "; ".join(problems[:4]),
                                "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
             elif m_version_key_missing:
                 checks.append({"name": "update_manifest", "ok": True, "warn": True,
@@ -3630,7 +3524,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                                "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
         else:
             checks.append({"name": "update_manifest", "ok": True,
-                           "detail": "미선언 (업데이트 미지원)",
+                           "detail": "미선언 (선택 계약)",
                            "guide_ref": "가이드 §3.1 플러그인 내부 업데이트 계약 (update_manifest 규격)"})
 
         # 9. UI 번들 검사 (category_tab 선언 시 index.html/script.js/style.css 필수)
@@ -3786,66 +3680,41 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             shutil.rmtree(temp_root, ignore_errors=True)
 
     def _update_plugin(self, plugin_id, db_type):
-        """저장소 ZIP 우선으로 최신 manifest를 적용하는 안전한 온라인 업데이트."""
+        """선택한 branch/release/tag의 저장소 ZIP으로 플러그인 폴더 전체를 교체한다."""
         pdir, err = self._validate_plugin_path(plugin_id)
         if err or not pdir:
             return False, err or "유효하지 않은 플러그인 ID입니다."
         if not os.path.isdir(pdir):
             return False, f"플러그인을 찾을 수 없습니다: {plugin_id}"
 
-        # 현재 설치본 manifest는 코드를 import하지 않고 AST로 읽는다.
-        _old_manifest_files, old_manifest = self._extract_update_manifest_files(pdir)
-        old_spec = self._build_update_spec(plugin_id, old_manifest)
-        if not old_spec:
-            return False, "update_manifest 가 없거나 유효하지 않아 업데이트할 수 없습니다."
-
-        local_ver = self._read_local_plugin_version(
-            pdir, old_spec["version_file"], old_spec["version_key"]
-        )
+        local_ver = self._read_local_plugin_version(pdir, "VERSION", "plugin version")
         if not local_ver:
-            return False, "현재 설치 버전을 확인할 수 없어 안전한 업데이트를 중단했습니다."
-
-        # 저장된 설치 소스를 우선하고, 없을 때만 기존 raw_base_url에서 추론한다.
-        git_info = self._read_git_source_info(plugin_id)
-        if not git_info:
-            git_info = self._ensure_git_source_from_raw_base_url(
-                plugin_id, old_spec["raw_base_url"], old_spec.get("files")
+            return False, (
+                "현재 설치본의 VERSION을 확인할 수 없어 자동 업데이트할 수 없습니다. "
+                "플러그인 실행 자체와 업데이트 지원 여부는 별개입니다."
             )
+
+        git_info = self._read_git_source_info(plugin_id)
         git_url = str((git_info or {}).get("git_url") or "").strip()
-
-        # Plugin Manager 자기 업데이트는 공식 ZIP 패키지만 허용한다. raw fallback은 사용하지 않는다.
-        if plugin_id == "plugin_manager" and (not git_url or not self._build_repo_zip_url(git_url)[0]):
-            return False, "Plugin Manager 자기 업데이트용 저장소 ZIP 소스를 결정할 수 없어 업데이트를 중단했습니다."
-
-        # 저장소 ZIP 경로를 구성할 수 없는 레거시/특수 소스만 기존 raw 경로 사용.
         if not git_url or not self._build_repo_zip_url(git_url)[0]:
-            ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
-            if ok:
-                msg += " (저장소 ZIP 소스를 결정할 수 없어 raw 호환 경로 사용)"
-            return ok, msg
+            # 소스 메타가 없는 오래된 설치본에 한해 선택적 update_manifest raw 경로를 지원한다.
+            _files, manifest = self._extract_update_manifest_files(pdir)
+            if self._build_update_spec(plugin_id, manifest):
+                return self._update_plugin_raw_legacy(plugin_id, db_type)
+            return False, "업데이트에 사용할 Git/게시판 소스 정보가 없습니다."
 
         zip_info, zip_err = self._download_repository_zip(git_url, db_type, plugin_id=plugin_id)
         if not zip_info:
-            if plugin_id == "plugin_manager":
-                return False, (
-                    f"Plugin Manager 저장소 ZIP 다운로드에 실패했습니다: {zip_err or '알 수 없는 오류'}. "
-                    "자기 업데이트는 raw fallback 없이 중단합니다."
-                )
-            # 네트워크/404/호스트 archive 미지원처럼 ZIP 자체를 얻지 못한 경우만 raw fallback.
-            ok, msg = self._update_plugin_raw_legacy(plugin_id, db_type)
-            if ok:
-                msg += f" (ZIP 다운로드 실패로 raw 호환 경로 사용: {zip_err})"
-            elif zip_err:
-                msg = f"{zip_err}; raw 호환 업데이트도 실패했습니다: {msg}"
-            return ok, msg
+            return False, zip_err or "저장소 ZIP 다운로드에 실패했습니다."
 
-        # 여기부터는 ZIP을 정상 수신한 상태다. 패키지 검증 실패는 raw로 우회하지 않는다.
         temp_dir = tempfile.mkdtemp(prefix="bo_plugin_update_zip_")
         try:
             try:
-                target_plugin_dir = self._extract_repository_zip(zip_info["zip_bytes"], temp_dir)
+                target_plugin_dir = self._extract_repository_zip(
+                    zip_info["zip_bytes"], temp_dir, expected_plugin_id=plugin_id
+                )
             except ValueError as e:
-                return False, f"저장소 ZIP 검증 실패: {e} (raw fallback 하지 않음)"
+                return False, f"저장소 ZIP 검증 실패: {e}"
 
             remote_plugin_id = self._detect_plugin_id(target_plugin_dir)
             if remote_plugin_id != plugin_id:
@@ -3854,29 +3723,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     f"{remote_plugin_id or '알 수 없음'} != {plugin_id}. 업데이트를 중단했습니다."
                 )
 
-            new_files, new_manifest = self._extract_update_manifest_files(target_plugin_dir)
-            new_spec = self._build_update_spec(plugin_id, new_manifest)
-            if not new_files or not new_spec:
-                return False, (
-                    "저장소 ZIP의 최신 update_manifest가 없거나 유효하지 않습니다. "
-                    "원격 배포 패키지 오류로 판단하여 raw fallback 없이 중단했습니다."
-                )
-
-            # manifest에 선언된 모든 관리 파일이 ZIP에 실제 존재하는지 적용 전에 선검증한다.
-            missing = []
-            for rel in new_spec["files"]:
-                rel_clean = os.path.normpath(str(rel)).lstrip("./").lstrip("/")
-                if not os.path.isfile(os.path.join(target_plugin_dir, rel_clean)):
-                    missing.append(rel_clean)
-            if missing:
-                return False, (
-                    "최신 update_manifest.files에 선언됐지만 ZIP에 없는 파일이 있습니다: "
-                    + ", ".join(missing[:8])
-                    + ". raw fallback 없이 중단했습니다."
-                )
-
             remote_ver = self._read_local_plugin_version(
-                target_plugin_dir, new_spec["version_file"], new_spec["version_key"]
+                target_plugin_dir, "VERSION", "plugin version"
             )
             if not remote_ver:
                 return False, "저장소 ZIP 내부 VERSION을 확인할 수 없어 업데이트를 중단했습니다."
@@ -3889,11 +3737,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
             if not source_ok:
                 details = [c.get("detail") for c in source_checks if not c.get("ok") and c.get("detail")]
-                return False, (
-                    "저장소 ZIP 정적 검증에 실패했습니다: "
-                    + "; ".join(details[:4])
-                    + " (raw fallback 하지 않음)"
-                )
+                return False, "저장소 ZIP 정적 검증에 실패했습니다: " + "; ".join(details[:4])
 
             ok, msg = self._update_existing_from_zip(
                 target_plugin_dir, pdir, plugin_id, source_checks, db_type, force=False
@@ -3901,21 +3745,17 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not ok:
                 return False, msg
 
-            # 저장소/브랜치 정책은 그대로 유지하고 새 managed file 목록만 갱신한다.
+            # 설치 소스와 사용자가 선택한 업데이트 경로 설정은 그대로 유지한다.
             if git_info:
                 refreshed = dict(git_info)
-                refreshed["manifest_files"] = list(new_spec["files"])
+                refreshed["installed_at"] = datetime.now().isoformat()
                 self._sources_set(plugin_id, refreshed)
 
-            if zip_info.get("ref_type") == "release":
-                source_label = f"릴리즈 {zip_info['ref_name']}"
-            elif zip_info.get("ref_type") == "tag":
-                source_label = f"태그 {zip_info.get('ref_name') or '알 수 없음'}"
-            else:
-                source_label = f"브랜치 {zip_info.get('ref_name') or '알 수 없음'}"
+            ref_type = zip_info.get("ref_type") or "branch"
+            ref_name = zip_info.get("ref_name") or "알 수 없음"
             return True, (
-                f"'{plugin_id}' 플러그인이 저장소 ZIP의 최신 update_manifest 기준으로 "
-                f"v{remote_ver} 업데이트되었습니다 ({source_label})."
+                f"'{plugin_id}' 플러그인을 {ref_type} {ref_name} 패키지 기준으로 "
+                f"v{remote_ver} 업데이트했습니다. metadata/{plugin_id} 폴더 전체가 교체되었습니다."
             )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -3928,7 +3768,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         for p in plugins:
             pid = p['id']
-            if p.get('has_update_manifest'):
+            if p.get('git_url') or p.get('has_update_manifest'):
                 ok, msg = self._update_plugin(pid, db_type)
                 if ok:
                     updated_count += 1
@@ -4729,10 +4569,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if not version:
                 return "invalid", None, None, None
             fallback_id = str(full_name).split("/")[-1]
-            provider_id, name, manifest_ok = self._catalog_fetch_plugin_meta(
+            provider_id, name, _manifest_ok = self._catalog_fetch_plugin_meta(
                 full_name, branch, fallback_id, source, base_url, db_type
             )
-            if not provider_id or not manifest_ok:
+            if not provider_id:
                 return "invalid", provider_id or fallback_id, version, name
             return "valid", provider_id, version, name
         except Exception:
@@ -5562,9 +5402,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if catalog_status == "unknown":
                 validation_message = "현재 설치 소스의 카탈로그 검증이 아직 완료되지 않았습니다."
             elif not catalog_valid and r.get("latest_version"):
-                validation_message = "현재 설치 소스의 VERSION은 확인했지만 Provider 또는 update_manifest 설치 계약 검증에 실패했습니다."
+                validation_message = "현재 설치 소스의 VERSION은 확인했지만 Provider 계약 검증에 실패했습니다."
             elif not catalog_valid:
-                validation_message = "현재 설치 소스의 VERSION, Provider 또는 update_manifest 설치 계약을 확인할 수 없습니다."
+                validation_message = "현재 설치 소스의 VERSION 또는 Provider 계약을 확인할 수 없습니다."
             else:
                 validation_message = ""
             inst["catalog_status"] = catalog_status
@@ -5625,9 +5465,9 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             if catalog_status == "unknown":
                 validation_message = "카탈로그 검증이 아직 완료되지 않았습니다."
             elif not catalog_valid and r.get("latest_version"):
-                validation_message = "VERSION은 확인했지만 Provider 또는 update_manifest 설치 계약 검증에 실패했습니다."
+                validation_message = "VERSION은 확인했지만 Provider 계약 검증에 실패했습니다."
             elif not catalog_valid:
-                validation_message = "VERSION, Provider 또는 update_manifest 설치 계약을 확인할 수 없습니다."
+                validation_message = "VERSION 또는 Provider 계약을 확인할 수 없습니다."
             else:
                 validation_message = ""
             catalog_install_allowed = catalog_valid or (
@@ -5647,6 +5487,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "supports_detail_sidebar_widget": None,
                 "supports_detail_view": None,
                 "has_update_manifest": False,
+                "update_supported": bool(git_url and r.get("latest_version")),
                 "update_manifest_present": False,
                 "update_manifest_enabled": False,
                 "update_manifest_status": "missing",

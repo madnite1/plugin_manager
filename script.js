@@ -8,6 +8,9 @@
     let currentSearch = '';
     let pendingDeletePluginId = null;
     let catalogMeta = null; // {last_refresh, refresh_interval_hours, topics, refresh_state, refresh_error}
+    // 미설치 카탈로그 플러그인 설치 진행 상태.
+    // 목록이 비동기로 다시 렌더링돼도 설치 중 표시가 사라지지 않도록 DOM이 아닌 상태로도 유지한다.
+    const catalogInstallInFlight = new Set();
 
     // 사용자에게 보이는 소스 타입은 LOCAL / GIT 두 종류로 단순화한다.
     // GitHub/Gitea 구분은 백엔드의 인증·카탈로그·업데이트 처리에서만 유지한다.
@@ -488,7 +491,7 @@
     let autoUpdateQueued = new Set();
     function checkUpdatesAsync() {
         const seq = ++updateCheckSeq; // loadPlugins 재호출 시 이전 배치 결과 무시
-        const targets = allPlugins.filter(p => p.has_update_manifest);
+        const targets = allPlugins.filter(p => p.is_installed && (p.git_url || p.has_update_manifest));
         if (targets.length === 0) return;
 
         const CONCURRENCY = 3;
@@ -710,40 +713,6 @@
         return ' <span class="pm-badge pm-update-check-failed-badge" title="DNS, 인터넷 연결 또는 원격 서버의 일시적인 문제로 업데이트 확인에 실패했습니다. 저장소 연결은 차단하지 않습니다.">업데이트 확인 실패</span>';
     }
 
-    function updateManifestBadgeHtml(p) {
-        if (!p || !p.git_url) return '';
-        const status = p.update_manifest_status || (p.has_update_manifest ? 'enabled' : 'missing');
-        const states = {
-            disabled: {
-                label: '업데이트 비활성',
-                title: 'update_manifest는 있지만 enabled=false로 자동 업데이트가 비활성화되어 있습니다.',
-                icon: 'fa-circle-pause',
-                className: 'pm-update-state-disabled'
-            },
-            missing: {
-                label: '업데이트 정보 없음',
-                title: '이 Git 설치본은 update_manifest를 제공하지 않습니다.',
-                icon: 'fa-circle-info',
-                className: 'pm-update-state-missing'
-            },
-            invalid: {
-                label: '업데이트 설정 오류',
-                title: 'update_manifest는 있지만 현재 업데이트 규약에 맞지 않습니다.',
-                icon: 'fa-triangle-exclamation',
-                className: 'pm-update-state-invalid'
-            },
-            unsupported: {
-                label: '업데이트 미지원',
-                title: '현재 설치 구조에서는 Plugin Manager 자동 업데이트를 지원하지 않습니다.',
-                icon: 'fa-circle-exclamation',
-                className: 'pm-update-state-unsupported'
-            }
-        };
-        const state = states[status];
-        if (!state) return '';
-        return ` <span class="pm-badge pm-update-state-badge ${state.className} pm-installed-validation-badge" title="${escapeHtmlAttr(state.title)}"><i class="fa-solid ${state.icon}"></i> ${state.label}</span>`;
-    }
-
     function patchCardUpdateCheckFailed(p) {
         const card = document.getElementById(`pm-card-${p.id}`);
         if (!card) return;
@@ -823,6 +792,7 @@
     function renderCatalogCard(p) {
         const cat = p.catalog || {};
         const fullName = cat.full_name || p.git_url || p.id;
+        const installing = catalogInstallInFlight.has(p.id);
         // 수집된 플러그인 이름 우선, 없으면 owner/repo 표시
         const displayName = (p.name && p.name !== p.id) ? p.name : fullName;
         const installErr = (p.install_error || '').trim();
@@ -850,26 +820,30 @@
         const sourceIcon = getSourceIcon(sourceType);
         const sourceLabel = getSourceLabel(sourceType);
         let installButton = '';
-        if (installErr) {
-            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
+        if (installing) {
+            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-id="${escapeHtmlAttr(p.id)}" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled aria-busy="true" title="플러그인을 설치하는 중입니다">
+                                <i class="fa-solid fa-circle-notch fa-spin"></i> 설치 중...
+                             </button>`;
+        } else if (installErr) {
+            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-id="${escapeHtmlAttr(p.id)}" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="설치 오류 — 마우스를 올리면 상세 내용이 표시됩니다">
                                 <i class="fa-solid fa-circle-exclamation"></i> 설치 불가
                              </button>`;
         } else if (!catalogInstallAllowed) {
-            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="${escapeHtmlAttr(validationMessage || '카탈로그 검증을 통과하지 못해 설치가 차단되었습니다.')}">
+            installButton = `<button class="pm-btn pm-btn-sm pm-btn-install pm-btn-disabled" data-id="${escapeHtmlAttr(p.id)}" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" disabled title="${escapeHtmlAttr(validationMessage || '카탈로그 검증을 통과하지 못해 설치가 차단되었습니다.')}">
                                 <i class="fa-solid fa-shield-halved"></i> 설치 차단
                              </button>`;
         } else if (!catalogValid) {
-            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="검증 실패 플러그인 설치 허용 설정에 따라 위험 설치가 가능합니다.">
+            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-id="${escapeHtmlAttr(p.id)}" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="검증 실패 플러그인 설치 허용 설정에 따라 위험 설치가 가능합니다.">
                                 <i class="fa-solid fa-triangle-exclamation"></i> 위험 설치
                              </button>`;
         } else {
-            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="Git 저장소에서 설치">
+            installButton = `<button class="pm-btn pm-btn-accent pm-btn-sm pm-btn-install" data-id="${escapeHtmlAttr(p.id)}" data-git-url="${escapeHtml(p.git_url || '')}" data-name="${escapeHtml(fullName)}" title="저장소 ZIP에서 설치">
                                 <i class="fa-solid fa-download"></i> 설치
                              </button>`;
         }
 
         return `
-            <div class="pm-plugin-card pm-catalog-card" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}"${installErr ? ` data-install-error="${escapeHtml(installErr)}"` : ''}>
+            <div class="pm-plugin-card pm-catalog-card${installing ? ' pm-installing' : ''}" id="pm-card-${CSS.escape(p.id)}" data-id="${p.id}"${installing ? ' aria-busy="true"' : ''}${installErr ? ` data-install-error="${escapeHtml(installErr)}"` : ''}>
                 <div>
                     <div class="pm-plugin-top">
                         <div class="pm-plugin-icon-title">
@@ -893,6 +867,15 @@
                     ${desc}
                 </div>
 
+                ${installing ? `
+                <div class="pm-install-progress" role="status" aria-live="polite">
+                    <div class="pm-install-progress-label">
+                        <i class="fa-solid fa-circle-notch fa-spin"></i>
+                        저장소 다운로드 · 검증 · 설치 진행 중...
+                    </div>
+                    <div class="pm-install-progress-track"><span></span></div>
+                </div>` : ''}
+
                 <div class="pm-plugin-footer">
                     <div class="pm-catalog-meta">
                         <a href="${escapeHtml(p.git_url || '')}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(p.git_url || '')}" onclick="event.stopPropagation();">
@@ -913,38 +896,91 @@
     }
 
     // 미설치 카드 설치 버튼 — 기존 install_git 경로 재사용
+    function waitForInstallUiPaint() {
+        return new Promise(resolve => {
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        });
+    }
+
+    function setCatalogInstallProgress(pluginId, btn, active, originalHtml) {
+        if (!pluginId) return;
+        const card = document.getElementById(`pm-card-${CSS.escape(pluginId)}`);
+
+        if (active) {
+            catalogInstallInFlight.add(pluginId);
+            if (btn) {
+                btn.disabled = true;
+                btn.setAttribute('aria-busy', 'true');
+                btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 설치 중...';
+            }
+            if (card) {
+                card.classList.add('pm-installing');
+                card.setAttribute('aria-busy', 'true');
+                if (!card.querySelector('.pm-install-progress')) {
+                    const footer = card.querySelector('.pm-plugin-footer');
+                    const progressHtml = `
+                        <div class="pm-install-progress" role="status" aria-live="polite">
+                            <div class="pm-install-progress-label">
+                                <i class="fa-solid fa-circle-notch fa-spin"></i>
+                                저장소 다운로드 · 검증 · 설치 진행 중...
+                            </div>
+                            <div class="pm-install-progress-track"><span></span></div>
+                        </div>`;
+                    if (footer) footer.insertAdjacentHTML('beforebegin', progressHtml);
+                }
+            }
+            return;
+        }
+
+        catalogInstallInFlight.delete(pluginId);
+        if (btn && btn.isConnected) {
+            btn.disabled = false;
+            btn.removeAttribute('aria-busy');
+            if (originalHtml) btn.innerHTML = originalHtml;
+        }
+        if (card) {
+            card.classList.remove('pm-installing');
+            card.removeAttribute('aria-busy');
+            const progress = card.querySelector('.pm-install-progress');
+            if (progress) progress.remove();
+        }
+    }
+
     function bindInstallButton(btn) {
         btn.addEventListener('click', async function(e) {
             e.preventDefault();
             e.stopPropagation();
 
+            const pluginId = this.getAttribute('data-id');
             const gitUrl = this.getAttribute('data-git-url');
             const name = this.getAttribute('data-name') || gitUrl;
-            if (!gitUrl) {
+            if (!pluginId || !gitUrl) {
                 showAlert('설치할 저장소 URL이 없습니다.', true);
                 return;
             }
+            if (catalogInstallInFlight.has(pluginId)) return;
             if (!window.confirm('"' + name + '" 플러그인을 설치하시겠습니까?')) return;
 
             const origHtml = this.innerHTML;
-            this.disabled = true;
-            this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 설치 중...';
+            setCatalogInstallProgress(pluginId, this, true, origHtml);
+
+            // fetch보다 먼저 버튼/프로그레스가 실제 화면에 그려지도록 브라우저에 두 프레임 양보한다.
+            await waitForInstallUiPaint();
 
             try {
-                const res = await callPluginAction({ action: 'install_git', git_url: gitUrl });
-                this.disabled = false;
-                this.innerHTML = origHtml;
+                const res = await callPluginAction({ action: 'install_git', plugin_id: pluginId, git_url: gitUrl });
                 if (res.success) {
+                    catalogInstallInFlight.delete(pluginId);
                     showAlert(res.message || "'" + name + "' 플러그인이 설치되었습니다!");
                     silentReload();
                 } else {
+                    setCatalogInstallProgress(pluginId, this, false, origHtml);
                     // 실패 시 목록 재조회 — 백엔드가 install_error를 저장하므로 카드가 설치 불가 상태로 전환됨
                     showAlert(res.error || '플러그인 설치 실패', true);
                     loadPlugins();
                 }
             } catch(err) {
-                this.disabled = false;
-                this.innerHTML = origHtml;
+                setCatalogInstallProgress(pluginId, this, false, origHtml);
                 showAlert('설치 중 통신 오류가 발생했습니다: ' + err.message, true);
             }
         });
@@ -1037,7 +1073,7 @@
                 ? '<span class="pm-badge pm-badge-feature"><i class="fa-solid fa-window-maximize"></i> 상세 뷰</span>'
                 : '';
 
-            const updateBtnHtml = (p.has_update && (p.has_update_manifest || !p.is_system))
+            const updateBtnHtml = p.has_update
                 ? `<button class="pm-btn pm-btn-warning pm-btn-sm pm-btn-update" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="최신 버전으로 업데이트 (v${escapeHtml(p.latest_version)})">
                     <i class="fa-solid fa-arrow-up-from-bracket"></i> v${escapeHtml(p.latest_version)}
                    </button>`
@@ -1054,7 +1090,8 @@
                 ? updateCheckFailedBadgeHtml()
                 : (p.update_blocked ? blockedBadgeHtml(p.blocked_reason) : '');
 
-            // 위험 설치/카탈로그 검증 상태와 update_manifest 상태는 서로 다른 의미이므로 각각 표시한다.
+            // 설치 소스의 카탈로그 검증 상태만 표시한다. update_manifest는 선택 계약이므로
+            // 업데이트 지원 여부 배지로 사용하지 않는다.
             const installedCatalogStatus = String(p.catalog_status || '').toLowerCase();
             const installedValidationMessage = (p.catalog_validation_message || '').trim();
             let installedValidationBadge = '';
@@ -1063,9 +1100,7 @@
             } else if (installedCatalogStatus === 'unknown') {
                 installedValidationBadge = ` <span class="pm-badge pm-badge-install-error pm-installed-validation-badge" title="${escapeHtmlAttr(installedValidationMessage || '현재 설치 소스의 카탈로그 검증이 아직 완료되지 않았습니다.')}"><i class="fa-solid fa-clock"></i> 검증 대기</span>`;
             }
-            const updateManifestBadge = updateManifestBadgeHtml(p);
-
-            const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url && p.has_update_manifest)
+            const updateChannelSelectHtml = (catalogMeta && catalogMeta.update_path_selection_enabled && p.git_url)
                 ? `<select class="pm-update-channel-select" data-id="${p.id}" title="업데이트 경로 선택 — 선택한 경로만 사용하며 폴백하지 않습니다" style="padding:0.35rem 0.5rem;border-radius:6px;background:var(--app-input-bg,rgba(15,23,42,.6));border:1px solid var(--app-border,rgba(255,255,255,.15));color:var(--app-text-primary,#fff);font-size:.78rem;">
                     <option value="branch" ${(p.effective_update_channel || 'branch') === 'branch' ? 'selected' : ''}>branch</option>
                     <option value="release" ${p.effective_update_channel === 'release' ? 'selected' : ''}>release</option>
@@ -1104,7 +1139,7 @@
                                 </div>
                                 <div>
                                     <h4 class="pm-plugin-name">${p.name}</h4>
-                                    <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateManifestBadge}${updateStatusBadge}</span>
+                                    <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateStatusBadge}</span>
                                 </div>
                             </div>
                             ${settingsBtnHtml}
