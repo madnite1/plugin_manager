@@ -355,7 +355,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """
         data_dir = self._get_data_dir()
         unified_path = self._get_db_path()
-        required_tables = {"repos", "settings", "plugin_sources", "meta", "source_meta"}
+        required_tables = {
+            "repos", "settings", "plugin_sources", "meta", "source_meta",
+            "replace_suppressions",
+        }
 
         if not os.path.isfile(unified_path):
             return False
@@ -608,6 +611,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             pass
         conn.execute("CREATE TABLE IF NOT EXISTS source_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS replace_suppressions (
+                plugin_id    TEXT NOT NULL,
+                git_url      TEXT NOT NULL,
+                fingerprint  TEXT NOT NULL,
+                replaced_by  TEXT,
+                replaced_at  TEXT,
+                PRIMARY KEY (plugin_id, git_url)
+            )
+            """
+        )
 
     def _migrate_legacy_databases(self):
         """catalog.db와 plugin_sources.db를 plugin_manager.db 하나로 안전하게 통합한다."""
@@ -2768,19 +2783,38 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             return False, "시스템 핵심 파일은 소스를 교체할 수 없습니다."
 
         candidates = self._catalog_replace_candidates(plugin_id, db_type)
-        candidate_urls = {str(c["git_url"]).rstrip("/") for c in candidates}
-        if new_git_url.rstrip("/") not in candidate_urls:
+        candidate_urls = {
+            self._normalize_repository_url(c.get("git_url")): str(c.get("git_url") or "")
+            for c in candidates if c.get("git_url")
+        }
+        requested_url = self._normalize_repository_url(new_git_url)
+        selected_url = candidate_urls.get(requested_url)
+        if not selected_url:
             return False, (
                 "소스 교체 거부: 요청한 저장소는 이 플러그인의 카탈로그 후보가 아닙니다. "
                 "(카탈로그 갱신 후 다시 시도하세요)"
             )
 
+        previous_info = self._read_git_source_info(plugin_id) or {}
+        previous_url = str(previous_info.get("git_url") or "").strip()
+        previous_row = self._catalog_find_repo_by_git_url(plugin_id, previous_url) if previous_url else None
+
         ok, msg = self._install_from_git(
-            new_git_url, db_type, force=force, require_manifest=False
+            selected_url, db_type, force=force, require_manifest=False
         )
         if not ok:
             return False, f"소스 교체 실패 (기존 코드/데이터는 자동 복원됨): {msg}"
-        return True, f"플러그인 '{plugin_id}' 소스가 교체되었습니다: {new_git_url}. {msg}"
+
+        # 교체 성공 뒤에만 이전 저장소의 현재 상태를 기록한다. 같은 상태는 역방향 후보에서
+        # 숨기되, 이후 저장소가 갱신되면 fingerprint 변화로 자동 재노출된다.
+        try:
+            if previous_url:
+                self._catalog_record_replace_suppression(
+                    plugin_id, previous_url, selected_url, row=previous_row
+                )
+        except Exception:
+            logger.warning("이전 저장소 후보 억제 기록 실패: %s", plugin_id, exc_info=True)
+        return True, f"플러그인 '{plugin_id}' 소스가 교체되었습니다: {selected_url}. {msg}"
 
     def _build_repo_zip_url(self, git_url):
         """
@@ -4191,6 +4225,18 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                         value TEXT
                     )""" 
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS replace_suppressions (
+                        plugin_id    TEXT NOT NULL,
+                        git_url      TEXT NOT NULL,
+                        fingerprint  TEXT NOT NULL,
+                        replaced_by  TEXT,
+                        replaced_at  TEXT,
+                        PRIMARY KEY (plugin_id, git_url)
+                    )
+                    """
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -5325,17 +5371,119 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         except Exception:
             return []
 
-    def _catalog_replace_candidates(self, plugin_id, db_type=None):
-        """같은 plugin_id의 카탈로그 행 중 현재 소스를 제외한 유효 후보 목록.
+    @staticmethod
+    def _normalize_repository_url(git_url):
+        """저장소 비교용 URL 정규화. 끝 슬래시와 선택적 .git 접미사는 동일하게 취급한다."""
+        url = str(git_url or "").strip()
+        if not url:
+            return ""
+        url = url.rstrip("/")
+        url = re.sub(r"(?i)\.git$", "", url)
+        return url.rstrip("/")
 
-        소스 교체 후보: 같은 plugin_id, is_valid='valid', 현재 설치된 소스(git_url)와 다른 행.
-        반환: [{full_name, html_url, source, base_url, git_url, latest_version, plugin_name, default_branch}]
+    def _catalog_repo_git_url(self, row):
+        """카탈로그 행에서 사용자가 설치할 수 있는 저장소 URL을 계산한다."""
+        r = row or {}
+        source = str(r.get("source") or "github")
+        base_url = r.get("base_url")
+        if source == "gitea" and base_url:
+            return r.get("html_url") or ("{0}/{1}".format(base_url, r.get("full_name") or ""))
+        return r.get("html_url") or ("https://github.com/" + str(r.get("full_name") or ""))
+
+    def _catalog_repo_fingerprint(self, row, git_url=None):
+        """저장소 변경 당시 상태와 현재 상태를 비교하기 위한 안정적인 지문을 만든다."""
+        r = row or {}
+        payload = {
+            "git_url": self._normalize_repository_url(git_url or self._catalog_repo_git_url(r)),
+            "pushed_at": str(r.get("pushed_at") or ""),
+            "default_branch": str(r.get("default_branch") or ""),
+            "latest_version": str(r.get("latest_version") or ""),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _catalog_find_repo_by_git_url(self, plugin_id, git_url):
+        """plugin_id와 정규화 URL이 모두 일치하는 현재 카탈로그 행을 찾는다."""
+        target = self._normalize_repository_url(git_url)
+        if not target:
+            return None
+        for row in self._catalog_list_repos(None, valid_only=False):
+            pid = str(row.get("plugin_id") or "").strip() or str(row.get("full_name") or "").split("/")[-1]
+            if pid != plugin_id:
+                continue
+            if self._normalize_repository_url(self._catalog_repo_git_url(row)) == target:
+                return row
+        return None
+
+    def _catalog_record_replace_suppression(self, plugin_id, old_git_url, new_git_url, row=None):
+        """저장소 변경 직전의 이전 저장소 상태만 후보에서 숨기도록 기록한다.
+
+        URL 자체를 영구 차단하지 않는다. 이후 pushed_at/branch/version 중 하나라도 바뀌면
+        fingerprint가 달라져 다시 정상 후보가 된다.
+        """
+        old_url = self._normalize_repository_url(old_git_url)
+        new_url = self._normalize_repository_url(new_git_url)
+        if not old_url or not new_url or old_url == new_url:
+            return False
+        repo_row = row or self._catalog_find_repo_by_git_url(plugin_id, old_url)
+        if not repo_row:
+            return False
+        fingerprint = self._catalog_repo_fingerprint(repo_row, old_url)
+        self._catalog_init_db()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        self._catalog_db_execute(
+            """
+            INSERT INTO replace_suppressions(plugin_id, git_url, fingerprint, replaced_by, replaced_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(plugin_id, git_url) DO UPDATE SET
+                fingerprint=excluded.fingerprint,
+                replaced_by=excluded.replaced_by,
+                replaced_at=excluded.replaced_at
+            """,
+            (plugin_id, old_url, fingerprint, new_url, now),
+        )
+        full_name = str(repo_row.get("full_name") or "").strip()
+        if full_name:
+            self._catalog_db_execute("DELETE FROM repos WHERE full_name=?", (full_name,))
+        return True
+
+    def _catalog_candidate_is_suppressed(self, plugin_id, git_url, row):
+        """이전 저장소가 변경 당시와 같은 상태면 숨기고, 상태가 바뀌면 억제를 해제한다."""
+        normalized = self._normalize_repository_url(git_url)
+        if not normalized:
+            return False
+        try:
+            self._catalog_init_db()
+            matches = self._catalog_db_query(
+                "SELECT fingerprint FROM replace_suppressions WHERE plugin_id=? AND git_url=?",
+                (plugin_id, normalized),
+            )
+            if not matches:
+                return False
+            current = self._catalog_repo_fingerprint(row, normalized)
+            if str(matches[0].get("fingerprint") or "") == current:
+                return True
+            # 저장소에 새 push/branch/version 변화가 생겼다면 과거 억제 기록을 폐기한다.
+            self._catalog_db_execute(
+                "DELETE FROM replace_suppressions WHERE plugin_id=? AND git_url=?",
+                (plugin_id, normalized),
+            )
+            return False
+        except Exception:
+            # 억제 메타 오류가 실제 저장소 후보를 숨기는 방향으로 실패하지 않게 한다.
+            return False
+
+    def _catalog_replace_candidates(self, plugin_id, db_type=None):
+        """같은 plugin_id의 카탈로그 행 중 현재 소스와 직전 교체 상태를 제외한 유효 후보 목록.
+
+        저장소 변경으로 떠난 이전 소스는 그 당시 fingerprint가 그대로인 동안에만 숨긴다.
+        이후 저장소가 갱신되면 억제를 자동 해제해 다시 선택할 수 있다.
         """
         try:
             installed_git = None
             git_info = self._read_git_source_info(plugin_id)
             if git_info:
-                installed_git = str(git_info.get("git_url") or "").strip().rstrip("/") or None
+                installed_git = self._normalize_repository_url(git_info.get("git_url")) or None
         except Exception:
             installed_git = None
 
@@ -5347,12 +5495,13 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 continue
             source = str(r.get("source") or "github")
             base_url = r.get("base_url")
-            if source == "gitea" and base_url:
-                git_url = r.get("html_url") or ("{0}/{1}".format(base_url, r["full_name"]))
-            else:
-                git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
-            # 현재 소스 제외
-            if installed_git and git_url.rstrip("/") == installed_git:
+            git_url = self._catalog_repo_git_url(r)
+            normalized_git = self._normalize_repository_url(git_url)
+            # 현재 소스 자신은 .git/끝 슬래시 표기 차이까지 정규화해서 제외한다.
+            if installed_git and normalized_git == installed_git:
+                continue
+            # 직전에 떠난 저장소가 그때와 같은 상태라면 역방향 후보로 다시 띄우지 않는다.
+            if self._catalog_candidate_is_suppressed(plugin_id, git_url, r):
                 continue
             candidates.append({
                 "full_name": r["full_name"],
@@ -5387,15 +5536,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             inst = installed_by_id.get(plugin_id)
             if not inst:
                 continue
-            current_git = str(inst.get("git_url") or "").strip().rstrip("/")
+            current_git = self._normalize_repository_url(inst.get("git_url"))
             if not current_git:
                 continue
-            source = str(r.get("source") or "github")
-            if source == "gitea" and r.get("base_url"):
-                row_git = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
-            else:
-                row_git = r.get("html_url") or ("https://github.com/" + r["full_name"])
-            if str(row_git or "").strip().rstrip("/") != current_git:
+            row_git = self._catalog_repo_git_url(r)
+            if self._normalize_repository_url(row_git) != current_git:
                 continue
             catalog_status = str(r.get("is_valid") or "unknown").strip().lower() or "unknown"
             catalog_valid = catalog_status == "valid"
@@ -5419,13 +5564,12 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 continue  # 미설치 — 아래 병합 루프에서 처리
             inst = installed_by_id[plugin_id]
             source = str(r.get("source") or "github")
-            if source == "gitea" and r.get("base_url"):
-                git_url = r.get("html_url") or ("{0}/{1}".format(r["base_url"], r["full_name"]))
-            else:
-                git_url = r.get("html_url") or ("https://github.com/" + r["full_name"])
-            cur_url = str(inst.get("git_url") or "").strip().rstrip("/")
-            if cur_url and git_url.rstrip("/") == cur_url:
+            git_url = self._catalog_repo_git_url(r)
+            cur_url = self._normalize_repository_url(inst.get("git_url"))
+            if cur_url and self._normalize_repository_url(git_url) == cur_url:
                 continue  # 현재 소스 자신 — 후보 아님
+            if self._catalog_candidate_is_suppressed(plugin_id, git_url, r):
+                continue
             cand = {
                 "full_name": r["full_name"],
                 "html_url": r.get("html_url"),

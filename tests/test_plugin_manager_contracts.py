@@ -556,6 +556,102 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertFalse(captured["require_manifest"])
         self.assertEqual(captured["git_url"], target_url)
 
+    def test_repository_url_normalization_treats_dot_git_and_trailing_slash_as_same(self):
+        normalize = self.manager._normalize_repository_url
+
+        self.assertEqual(
+            normalize("https://git.example.com/bookoasis/demo.git/"),
+            "https://git.example.com/bookoasis/demo",
+        )
+        self.assertEqual(
+            normalize("https://git.example.com/bookoasis/demo/"),
+            "https://git.example.com/bookoasis/demo",
+        )
+
+    def test_replaced_source_is_hidden_only_while_catalog_fingerprint_is_unchanged(self):
+        db_path = self.root / "plugin_manager.db"
+        self.manager._get_catalog_db_path = lambda: str(db_path)
+        self.manager._get_db_path = lambda: str(db_path)
+        self.manager._catalog_init_db()
+
+        old_url = "https://git.example.com/legacy/demo.git"
+        new_url = "https://git.example.com/new/demo"
+        row = {
+            "full_name": "legacy/demo",
+            "html_url": "https://git.example.com/legacy/demo",
+            "description": "old",
+            "topics": "[]",
+            "default_branch": "main",
+            "pushed_at": "2026-09-16T01:00:00Z",
+            "plugin_id": "demo",
+            "plugin_name": "Demo",
+            "latest_version": "1.0.0",
+            "is_valid": "valid",
+            "last_checked": "2026-09-16T01:01:00Z",
+            "install_error": None,
+            "source": "gitea",
+            "base_url": "https://git.example.com",
+        }
+        self.manager._catalog_db_execute(
+            """
+            INSERT INTO repos(full_name, html_url, description, topics, default_branch, pushed_at,
+                              plugin_id, plugin_name, latest_version, is_valid, last_checked,
+                              install_error, source, base_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(row[k] for k in (
+                "full_name", "html_url", "description", "topics", "default_branch", "pushed_at",
+                "plugin_id", "plugin_name", "latest_version", "is_valid", "last_checked",
+                "install_error", "source", "base_url",
+            )),
+        )
+
+        self.assertTrue(
+            self.manager._catalog_record_replace_suppression("demo", old_url, new_url, row=row)
+        )
+        self.assertEqual(
+            self.manager._catalog_db_query("SELECT * FROM repos WHERE full_name='legacy/demo'"), []
+        )
+
+        # 다음 카탈로그 갱신에서 같은 저장소 상태가 다시 수집되면 역방향 후보로 숨긴다.
+        self.assertTrue(
+            self.manager._catalog_candidate_is_suppressed(
+                "demo", "https://git.example.com/legacy/demo/", row
+            )
+        )
+
+        # 이후 실제 push가 발생하면 fingerprint가 달라져 다시 후보가 되고 억제 기록도 제거한다.
+        changed = dict(row, pushed_at="2026-09-16T02:00:00Z")
+        self.assertFalse(
+            self.manager._catalog_candidate_is_suppressed("demo", old_url, changed)
+        )
+        self.assertEqual(
+            self.manager._catalog_db_query(
+                "SELECT * FROM replace_suppressions WHERE plugin_id='demo'"
+            ),
+            [],
+        )
+
+    def test_replace_candidates_excludes_current_repo_after_url_normalization(self):
+        row = {
+            "full_name": "bookoasis/demo",
+            "html_url": "https://git.example.com/bookoasis/demo",
+            "default_branch": "main",
+            "pushed_at": "2026-09-16T01:00:00Z",
+            "plugin_id": "demo",
+            "plugin_name": "Demo",
+            "latest_version": "1.0.0",
+            "source": "gitea",
+            "base_url": "https://git.example.com",
+        }
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://git.example.com/bookoasis/demo.git/"
+        }
+        self.manager._catalog_list_valid_repos = lambda db_type=None: [row]
+        self.manager._catalog_candidate_is_suppressed = lambda *args, **kwargs: False
+
+        self.assertEqual(self.manager._catalog_replace_candidates("demo", "general"), [])
+
     def test_catalog_reverifies_when_repository_changed_after_last_check(self):
         now = self.pm_module.datetime(2026, 9, 13, 14, 30, tzinfo=self.pm_module.timezone.utc)
         row = {
