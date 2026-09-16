@@ -449,12 +449,15 @@
             if (!checked) { showAlert('교체할 소스를 선택하세요.', true); return; }
             const targetUrl = checked.value;
             this.disabled = true;
-            const origHtml = this.innerHTML;
             this.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 교체 중...';
+
+            // 저장소 교체는 다운로드/재설치/의존성 처리로 오래 걸릴 수 있으므로
+            // 응답을 기다리지 않고 확인 즉시 선택 모달을 닫는다.
+            close();
+            showAlert(`'${pluginName}' 저장소 변경을 진행 중입니다...`);
 
             try {
                 const res = await callPluginAction({ action: 'replace_git', plugin_id: pluginId, git_url: targetUrl });
-                close();
                 if (res.success) {
                     showAlert(res.message || `'${pluginName}' 소스가 교체되었습니다.`);
                     silentReload(); // 목록 재조회 (새 소스 기준 카드)
@@ -462,8 +465,6 @@
                     showAlert(res.error || '소스 교체 실패', true);
                 }
             } catch(err) {
-                this.disabled = false;
-                this.innerHTML = origHtml;
                 showAlert('소스 교체 중 통신 오류가 발생했습니다: ' + err.message, true);
             }
         });

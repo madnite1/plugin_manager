@@ -869,6 +869,19 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertNotIn("업데이트 정보 없음", script)
         self.assertNotIn("updateManifestBadgeHtml", script)
 
+    def test_replace_modal_closes_before_waiting_for_replace_request(self):
+        script = (Path(__file__).resolve().parents[1] / "script.js").read_text(encoding="utf-8")
+        start = script.index("modal.querySelector('.pm-replace-confirm').addEventListener")
+        end = script.index("    // 버전 비교 헬퍼", start)
+        handler = script[start:end]
+
+        self.assertLess(
+            handler.index("close();"),
+            handler.index("await callPluginAction({ action: 'replace_git'"),
+        )
+        self.assertIn("저장소 변경을 진행 중입니다", handler)
+        self.assertNotIn("this.disabled = false;", handler)
+
     def test_invalid_uninstalled_catalog_entry_remains_visible_but_blocked(self):
         invalid_row = {
             "full_name": "example/broken",
