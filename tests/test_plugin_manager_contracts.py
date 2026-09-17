@@ -441,6 +441,98 @@ class PluginManagerPhase0RegressionTests(unittest.TestCase):
         self.assertIsNone(cards[0]["supports_detail_view"])
 
 
+    def test_gitea_topic_search_does_not_fallback_to_keyword_query(self):
+        server = {
+            "url": "https://git.example.com",
+            "host": "git.example.com",
+            "token": "",
+        }
+        calls = []
+
+        def fake_search(db_type, topic, source="github", gitea_server=None):
+            calls.append({
+                "topic": topic,
+                "source": source,
+                "server": gitea_server,
+            })
+            return {
+                "data": [
+                    {
+                        "full_name": "bookoasis/demo",
+                        "html_url": "https://git.example.com/bookoasis/demo",
+                        "description": "BookOasis plugin without topic",
+                        "topics": [],
+                        "default_branch": "main",
+                        "updated_at": "2026-09-17T00:00:00Z",
+                    }
+                ]
+            }
+
+        self.manager._catalog_search_topic = fake_search
+
+        result = self.manager._catalog_search_gitea_topic(
+            "general", "bookoasis-plugin", server
+        )
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["topic"], "bookoasis-plugin")
+        self.assertEqual(calls[0]["source"], "gitea")
+
+    def test_successful_gitea_refresh_removes_stale_repo_without_configured_topic(self):
+        db_path = self.root / "plugin_manager.db"
+        plugins_root = self.root / "plugins"
+        plugins_root.mkdir()
+        self.manager._get_catalog_db_path = lambda: str(db_path)
+        self.manager._get_db_path = lambda: str(db_path)
+        self.manager._get_plugins_base_dir = lambda: str(plugins_root)
+        self.manager._catalog_init_db()
+        self.manager._catalog_db_execute(
+            """
+            INSERT INTO repos(full_name, html_url, description, topics, default_branch, pushed_at,
+                              plugin_id, plugin_name, latest_version, is_valid, last_checked,
+                              install_error, source, base_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "bookoasis/stale",
+                "https://git.example.com/bookoasis/stale",
+                "stale repo",
+                "[]",
+                "main",
+                "2026-09-16T00:00:00Z",
+                "stale",
+                "Stale",
+                "1.0.0",
+                "valid",
+                "2026-09-16T00:01:00Z",
+                None,
+                "gitea",
+                "https://git.example.com",
+            ),
+        )
+        self.manager._catalog_get_topics = lambda db_type: ["bookoasis-plugin"]
+        self.manager._catalog_search_topic = lambda *args, **kwargs: {"items": []}
+        self.manager._catalog_get_gitea_servers = lambda db_type: [
+            {
+                "url": "https://git.example.com",
+                "host": "git.example.com",
+                "token": "",
+                "enabled": True,
+            }
+        ]
+        self.manager._catalog_search_gitea_topic = lambda *args, **kwargs: {"items": []}
+
+        ok, _message = self.manager._catalog_refresh_once("general", force_verify=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.manager._catalog_db_query(
+                "SELECT full_name FROM repos WHERE full_name='bookoasis/stale'"
+            ),
+            [],
+        )
+
     def test_catalog_manifest_requires_update_contract(self):
         valid = {
             "enabled": True,

@@ -4444,26 +4444,20 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         tok = str(raw or "").strip()
         return tok or None
 
-    def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None, force_q_fallback=False):
+    def _catalog_search_topic(self, db_type, topic, source="github", gitea_server=None):
         """토픽 검색 (per_page=100). 응답 dict 반환 (예외 전파).
 
         - GitHub: Search API (토큰 설정 시 Authorization: Bearer ***
         - Gitea : 등록 서버의 /api/v1/repos/search?topic=...&topic=true (토큰 필요 시 token ***)
-          force_q_fallback=True면 topic 파라미터 대신 q 키워드 검색 (topic 무시 서버 대응)
         """
         if source == "gitea":
             if not gitea_server:
                 raise RuntimeError("Gitea 서버 설정이 없습니다.")
-            # Gitea Search API: topic 파라미터 사용 시 topic=true 필요 (v1.24+ 문서 기준)
-            # 1차: topic 검색 (+topic=true), 2차: q 키워드 검색(토픽 필터 무시 폴백)
-            if force_q_fallback:
-                url = "{0}/api/v1/repos/search?q={1}&limit=50&page=1".format(
-                    gitea_server["url"], topic
-                )
-            else:
-                url = "{0}/api/v1/repos/search?topic={1}&topic=true&limit=50&page=1".format(
-                    gitea_server["url"], topic
-                )
+            # Gitea Search API는 토픽 검색만 사용한다. 저장소명/설명 q 검색 폴백은
+            # 토픽 미설정 저장소까지 카탈로그에 섞이므로 사용하지 않는다.
+            url = "{0}/api/v1/repos/search?topic={1}&topic=true&limit=50&page=1".format(
+                gitea_server["url"], topic
+            )
             headers = {"User-Agent": "BookOasis/1.0", "Accept": "application/json"}
             token = gitea_server.get("token") or ""
             if token:
@@ -4486,8 +4480,8 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
     def _catalog_search_gitea_topic(self, db_type, topic, server):
         """Gitea 토픽 검색 → GitHub과 동일한 {items:[...]} 형태로 정규화.
         Gitea API 응답: {data: [ {full_name, html_url, description, topics, default_branch, updated_at, private}, ... ]}
-        일부 서버는 topic 파라미터를 무시하고 전체를 반환 → 클라이언트 토픽 필터에서 0개면
-        q 키워드 검색으로 폴백 (VERSION 존재 여부는 별도 검증 단계에서 판별).
+        서버가 topic 파라미터를 무시하더라도 응답의 topics를 클라이언트에서 다시 검사하며,
+        실제 토픽이 없는 저장소는 카탈로그 후보에 포함하지 않는다.
         """
         raw = self._catalog_search_topic(db_type, topic, source="gitea", gitea_server=server)
         items = raw.get("data") if isinstance(raw, dict) else None
@@ -4525,43 +4519,6 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "_base_url": server["url"],
             })
 
-        # topic 필터 결과 0개 → 서버가 topic 파라미터를 무시한 것으로 보고 q 키워드 폴백
-        # q는 저장소명/설명 키워드이므로 토픽명 그대로가 아닌, 토픽명에서 하이픈/밑줄로 분해한 첫 단어로 검색
-        # (예: bookoasis-plugin → bookoasis)
-        if not out:
-            q_terms = []
-            for part in str(topic).lower().replace(",", " ").split():
-                for seg in re.split(r"[-_]", part):
-                    if seg and len(seg) >= 3 and seg not in q_terms:
-                        q_terms.append(seg)
-            if not q_terms:
-                q_terms = [str(topic).lower().strip()]
-            seen = set()
-            for q in q_terms:
-                try:
-                    fb_raw = self._catalog_search_topic(db_type, q, source="gitea", gitea_server=server, force_q_fallback=True)
-                except Exception:
-                    continue
-                fb_items = fb_raw.get("data") if isinstance(fb_raw, dict) else None
-                if not isinstance(fb_items, list):
-                    continue
-                for it in fb_items:
-                    if not isinstance(it, dict):
-                        continue
-                    full_name = str(it.get("full_name") or "").strip()
-                    if not full_name or full_name in seen:
-                        continue
-                    seen.add(full_name)
-                    out.append({
-                        "full_name": full_name,
-                        "html_url": str(it.get("html_url") or ""),
-                        "description": str(it.get("description") or "")[:500],
-                        "topics": json.dumps(it.get("topics") or [], ensure_ascii=False),
-                        "default_branch": str(it.get("default_branch") or "main"),
-                        "pushed_at": str(it.get("updated_at") or ""),
-                        "_source": "gitea",
-                        "_base_url": server["url"],
-                    })
         return {"items": out}
 
     @staticmethod
@@ -4861,6 +4818,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             gitea_servers = self._catalog_get_gitea_servers(db_type)
             gitea_errors = []
+            successful_gitea_base_urls = set()
             for server in gitea_servers:
                 try:
                     for topic in topics:
@@ -4878,6 +4836,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                                 "source": "gitea",
                                 "base_url": server["url"],
                             }
+                    successful_gitea_base_urls.add(server["url"])
                 except Exception as e:
                     # 개별 Gitea 서버 실패는 전체 갱신을 막지 않음 (GitHub는 이미 수집됨)
                     gitea_errors.append("{0}: {1}".format(server.get("host", "?"), str(e)[:200]))
@@ -4918,23 +4877,15 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             #    모든 토픽 검색이 성공한 시점에만 실행 — GitHub 실패 시 위에서 raise 되어 도달 안 함.
             removed = 0
             base_dir = self._get_plugins_base_dir()
-            # 성공한 Gitea 서버의 base_url 집합 (실패한 서버 것은 보호 안 함)
-            successful_gitea_base_urls = set()
-            for server in gitea_servers:
-                if server.get("enabled"):
-                    # merged에 이 서버의 repo가 있는지 확인
-                    for key, info in merged.items():
-                        if key[0] == "gitea" and info.get("base_url") == server["url"]:
-                            successful_gitea_base_urls.add(server["url"])
-                            break
+            # Gitea는 해당 서버의 모든 토픽 검색이 정상 완료된 경우에만 이번 결과를
+            # 정리 기준으로 신뢰한다. 검색 실패/비활성 서버의 기존 행은 보존한다.
             for r in self._catalog_db_query("SELECT full_name, plugin_id, source, base_url FROM repos"):
                 key = (str(r.get("source") or "github"), r["full_name"])
                 if key in merged:
                     continue
-                # Gitea repo인데 성공한 서버의 base_url이면 보호
                 if r.get("source") == "gitea":
                     base_url = r.get("base_url")
-                    if base_url and base_url in successful_gitea_base_urls:
+                    if not base_url or base_url not in successful_gitea_base_urls:
                         continue
                 plugin_id = str(r.get("plugin_id") or "").strip() or str(r["full_name"]).split("/")[-1]
                 if os.path.isdir(os.path.join(base_dir, plugin_id)):
