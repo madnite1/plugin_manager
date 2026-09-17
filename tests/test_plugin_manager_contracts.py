@@ -648,6 +648,134 @@ class M3UPlayerPlugin(BaseMetadataProvider):
         self.assertFalse(captured["require_manifest"])
         self.assertEqual(captured["git_url"], target_url)
 
+    def test_update_action_forwards_force(self):
+        captured = {}
+
+        def fake_update(plugin_id, db_type, force=False):
+            captured.update({"plugin_id": plugin_id, "db_type": db_type, "force": force})
+            return True, "ok"
+
+        self.manager._update_plugin = fake_update
+
+        ok, _ = self.manager.apply(
+            "general", None, {"action": "update", "plugin_id": "demo", "force": True}
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(captured["plugin_id"], "demo")
+        self.assertEqual(captured["db_type"], "general")
+        self.assertTrue(captured["force"])
+
+    def test_repository_update_validation_failure_uses_risk_confirm_flow(self):
+        installed = self.root / "installed" / "demo"
+        target = self.root / "target" / "demo"
+        write_provider(installed)
+        write_provider(target)
+        (target / "VERSION").write_text(
+            '{"plugin version": "2.0.0"}\n', encoding="utf-8"
+        )
+        checks = [{
+            "name": "금지 패턴",
+            "ok": False,
+            "detail": "mr_resolver.py: subprocess import 발견",
+            "guide_ref": "가이드 §2.1 보안 제약",
+        }]
+
+        self.manager._validate_plugin_path = lambda plugin_id: (str(installed), None)
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/demo",
+            "branch": "main",
+        }
+        self.manager._download_repository_zip = lambda *args, **kwargs: (
+            {"zip_bytes": b"zip", "ref_type": "branch", "ref_name": "main"}, None
+        )
+        self.manager._extract_repository_zip = lambda *args, **kwargs: str(target)
+        self.manager._validate_plugin_source = lambda *args, **kwargs: (False, checks)
+        self.manager._catalog_get_allow_invalid_install = lambda db_type: True
+
+        ok, message = self.manager._update_plugin("demo", "general")
+
+        self.assertFalse(ok)
+        self.assertIn("__VALIDATION_FAILED__", message)
+        self.assertIn("subprocess import 발견", message)
+
+    def test_repository_update_force_bypasses_general_validation_after_confirmation(self):
+        installed = self.root / "installed" / "demo"
+        target = self.root / "target" / "demo"
+        write_provider(installed)
+        write_provider(target)
+        (target / "VERSION").write_text(
+            '{"plugin version": "2.0.0"}\n', encoding="utf-8"
+        )
+        checks = [{
+            "name": "금지 패턴",
+            "ok": False,
+            "detail": "mr_resolver.py: subprocess import 발견",
+            "guide_ref": "가이드 §2.1 보안 제약",
+        }]
+        captured = {}
+
+        self.manager._validate_plugin_path = lambda plugin_id: (str(installed), None)
+        self.manager._read_git_source_info = lambda plugin_id: {
+            "git_url": "https://github.com/example/demo",
+            "branch": "main",
+        }
+        self.manager._download_repository_zip = lambda *args, **kwargs: (
+            {"zip_bytes": b"zip", "ref_type": "branch", "ref_name": "main"}, None
+        )
+        self.manager._extract_repository_zip = lambda *args, **kwargs: str(target)
+        self.manager._validate_plugin_source = lambda *args, **kwargs: (False, checks)
+
+        def fake_update_existing(target_dir, dest_dir, plugin_id, source_checks, db_type, force=False):
+            captured.update({
+                "target_dir": target_dir,
+                "dest_dir": dest_dir,
+                "plugin_id": plugin_id,
+                "source_checks": source_checks,
+                "db_type": db_type,
+                "force": force,
+            })
+            return True, "updated"
+
+        self.manager._update_existing_from_zip = fake_update_existing
+        self.manager._sources_set = lambda *args, **kwargs: None
+
+        ok, message = self.manager._update_plugin("demo", "general", force=True)
+
+        self.assertTrue(ok, message)
+        self.assertTrue(captured["force"])
+        self.assertEqual(captured["source_checks"], checks)
+
+    def test_legacy_raw_update_receives_force_from_update(self):
+        installed = self.root / "installed" / "demo"
+        write_provider(installed)
+        manifest = {
+            "enabled": True,
+            "provider": "github-raw",
+            "raw_base_url": "https://raw.githubusercontent.com/example/demo/main",
+            "files": ["demo.py", "VERSION"],
+            "version_file": "VERSION",
+            "version_key": "plugin version",
+        }
+        captured = {}
+
+        self.manager._validate_plugin_path = lambda plugin_id: (str(installed), None)
+        self.manager._read_git_source_info = lambda plugin_id: None
+        self.manager._extract_update_manifest_files = lambda plugin_dir: (
+            ["demo.py", "VERSION"], manifest
+        )
+
+        def fake_raw(plugin_id, db_type, force=False):
+            captured.update({"plugin_id": plugin_id, "db_type": db_type, "force": force})
+            return True, "raw updated"
+
+        self.manager._update_plugin_raw_legacy = fake_raw
+
+        ok, _ = self.manager._update_plugin("demo", "general", force=True)
+
+        self.assertTrue(ok)
+        self.assertTrue(captured["force"])
+
     def test_repository_url_normalization_treats_dot_git_and_trailing_slash_as_same(self):
         normalize = self.manager._normalize_repository_url
 

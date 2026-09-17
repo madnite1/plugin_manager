@@ -143,9 +143,10 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         elif action == "update":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
+            force = item_data.get("force") in (True, 1, "1", "true", "True")
             if not plugin_id:
                 return False, "업데이트할 플러그인 ID가 누락되었습니다."
-            return self._update_plugin(plugin_id, db_type)
+            return self._update_plugin(plugin_id, db_type, force=force)
 
         elif action == "rollback":
             plugin_id = str(item_data.get("plugin_id", "")).strip()
@@ -3622,7 +3623,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         all_ok = all(c.get("ok") for c in checks)
         return all_ok, checks
 
-    def _update_plugin_raw_legacy(self, plugin_id, db_type):
+    def _update_plugin_raw_legacy(self, plugin_id, db_type, force=False):
         """구형 호환용 raw 파일 개별 다운로드 업데이트 경로.
 
         저장소 ZIP 자체를 기술적으로 가져올 수 없는 경우에만 사용한다. 다운로드한 파일을
@@ -3695,12 +3696,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     f.write(content)
 
             source_ok, source_checks = self._validate_plugin_source(target_dir, plugin_id)
-            if not source_ok:
-                details = [c.get("detail") for c in source_checks if not c.get("ok") and c.get("detail")]
-                return False, "raw 호환 업데이트 패키지 검증 실패: " + "; ".join(details[:4])
+            if not source_ok and not force:
+                return self._validation_fail_response(source_checks, db_type)
 
             ok, msg = self._update_existing_from_zip(
-                target_dir, pdir, plugin_id, source_checks, db_type, force=False
+                target_dir, pdir, plugin_id, source_checks, db_type, force=force
             )
             if not ok:
                 return False, msg
@@ -3713,7 +3713,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
 
-    def _update_plugin(self, plugin_id, db_type):
+    def _update_plugin(self, plugin_id, db_type, force=False):
         """선택한 branch/release/tag의 저장소 ZIP으로 플러그인 폴더 전체를 교체한다."""
         pdir, err = self._validate_plugin_path(plugin_id)
         if err or not pdir:
@@ -3734,7 +3734,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 소스 메타가 없는 오래된 설치본에 한해 선택적 update_manifest raw 경로를 지원한다.
             _files, manifest = self._extract_update_manifest_files(pdir)
             if self._build_update_spec(plugin_id, manifest):
-                return self._update_plugin_raw_legacy(plugin_id, db_type)
+                return self._update_plugin_raw_legacy(plugin_id, db_type, force=force)
             return False, "업데이트에 사용할 Git/게시판 소스 정보가 없습니다."
 
         zip_info, zip_err = self._download_repository_zip(git_url, db_type, plugin_id=plugin_id)
@@ -3769,12 +3769,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 )
 
             source_ok, source_checks = self._validate_plugin_source(target_plugin_dir, plugin_id)
-            if not source_ok:
-                details = [c.get("detail") for c in source_checks if not c.get("ok") and c.get("detail")]
-                return False, "저장소 ZIP 정적 검증에 실패했습니다: " + "; ".join(details[:4])
+            if not source_ok and not force:
+                return self._validation_fail_response(source_checks, db_type)
 
             ok, msg = self._update_existing_from_zip(
-                target_plugin_dir, pdir, plugin_id, source_checks, db_type, force=False
+                target_plugin_dir, pdir, plugin_id, source_checks, db_type, force=force
             )
             if not ok:
                 return False, msg
