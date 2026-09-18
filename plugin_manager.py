@@ -66,6 +66,7 @@ _CATALOG_LOOP_TICK_SECONDS = 60
 # SHA-256을 계산해 실제 코드가 달라졌는지 확인한다.
 _CATALOG_CODE_CHECK_SECONDS = 30
 _CATALOG_MAX_TOPICS = 5  # GitHub 비인증 Search API 분당 10회 제한 (토픽 수 + VERSION 검증 합계 한도 보호)
+_CATALOG_MAX_DOCUMENT_FILES = 20
 _CATALOG_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # VERSION 재검증 TTL: 저장소가 20개를 넘어가면 24시간 이내 검증 결과 재사용
 _CATALOG_VERIFY_MAX_REPOS = 20
@@ -199,6 +200,11 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
         elif action == "save_config":
             return self._catalog_save_config(item_data, db_type)
+
+        elif action == "get_document":
+            plugin_id = str(item_data.get("plugin_id", "")).strip()
+            name = str(item_data.get("name", "")).strip()
+            return self._get_plugin_document(plugin_id, name, db_type)
 
         return False, f"지원하지 않는 액션입니다: {action}"
 
@@ -920,6 +926,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             # 모든 카드에 동일한 설정값이므로 플러그인마다 통합 DB를 다시 조회하지 않는다.
             rollback_enabled = self._catalog_get_rollback_enabled(db_type)
             update_path_selection = self._catalog_get_update_path_selection_enabled(db_type)
+            document_files = self._catalog_get_document_files(db_type)
 
             for entry in sorted(os.listdir(base_dir)):
                 full_path = os.path.join(base_dir, entry)
@@ -983,6 +990,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
                 rollback_info = self._read_rollback_info(plugin_id) if rollback_enabled else None
                 plugin_data_dir = self._get_plugin_data_dir(plugin_id)
+                documents = self._available_plugin_documents(full_path, document_files)
 
                 plugins.append({
                     "id": plugin_id,
@@ -1007,6 +1015,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                     ),
                     "update_manifest_status": update_manifest_status,
                     "has_config": has_config,
+                    "documents": documents,
                     "is_system": (plugin_id in ("plugin_manager",)),
                     "git_url": git_url,
                     "update_channel": update_channel,
@@ -3813,6 +3822,27 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             res_msg += " (실패: " + ", ".join(failed) + ")"
         return True, res_msg
 
+    def _get_plugin_document(self, plugin_id, name, db_type):
+        pdir, err = self._validate_plugin_path(plugin_id)
+        if err or not pdir or not os.path.isdir(pdir):
+            return False, err or "설치된 플러그인을 찾을 수 없습니다."
+        rel = str(name or "").strip().replace("\\", "/")
+        if rel not in self._catalog_get_document_files(db_type):
+            return False, "설정에 등록되지 않은 문서입니다."
+        target = self._resolve_plugin_document_path(pdir, rel)
+        if not target:
+            return False, "문서 파일을 찾을 수 없습니다: {0}".format(rel)
+        try:
+            if os.path.getsize(target) > 2 * 1024 * 1024:
+                return False, "문서 파일이 너무 큽니다. (최대 2 MiB)"
+            with open(target, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            return False, "UTF-8 Markdown 문서만 표시할 수 있습니다."
+        except OSError as e:
+            return False, "문서 읽기 실패: {0}".format(e)
+        return True, {"plugin_id": plugin_id, "name": rel, "content": content}
+
     def _validate_plugin_path(self, plugin_id):
         """플러그인 ID 및 경로 안전성 검증 (플러그인 폴더 경계 이탈 차단)"""
         pid = str(plugin_id or "").strip()
@@ -4344,6 +4374,43 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
         """PM_CATALOG_TOPICS 조회 (쉼표 구분 문자열 → 정규화된 리스트)"""
         raw = self._catalog_get_setting("PM_CATALOG_TOPICS", default=None)
         return self._catalog_normalize_topics(raw)
+
+    def _catalog_get_document_files(self, db_type):
+        raw = self._catalog_get_setting("PM_DOCUMENT_FILES", default=None)
+        if not raw:
+            return []
+        try:
+            values = json.loads(str(raw))
+        except Exception:
+            values = re.split(r"[\r\n,]+", str(raw))
+        if not isinstance(values, list):
+            return []
+        result = []
+        for value in values:
+            rel = str(value or "").strip().replace("\\", "/")
+            if rel and rel.lower().endswith(".md") and ".." not in rel.split("/") and not rel.startswith("/"):
+                if rel not in result:
+                    result.append(rel)
+        return result[:_CATALOG_MAX_DOCUMENT_FILES]
+
+    @staticmethod
+    def _resolve_plugin_document_path(plugin_dir, relative_path):
+        root = os.path.realpath(plugin_dir)
+        target = os.path.realpath(os.path.join(root, *str(relative_path).split("/")))
+        try:
+            if os.path.commonpath([root, target]) != root:
+                return None
+        except ValueError:
+            return None
+        cursor = root
+        for part in str(relative_path).split("/"):
+            cursor = os.path.join(cursor, part)
+            if os.path.islink(cursor):
+                return None
+        return target if os.path.isfile(target) else None
+
+    def _available_plugin_documents(self, plugin_dir, configured_files):
+        return [rel for rel in configured_files if self._resolve_plugin_document_path(plugin_dir, rel)]
 
     # ---- Gitea 서버 설정 ----
 
@@ -5240,6 +5307,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
             "last_refresh": meta.get("last_refresh"),
             "refresh_interval_hours": self._catalog_get_interval_hours(db_type),
             "topics": self._catalog_get_topics(db_type),
+            "document_files": self._catalog_get_document_files(db_type),
             "refresh_state": refresh_state,
             "refresh_error": meta.get("refresh_error") or None,
             "allow_invalid_install": self._catalog_get_allow_invalid_install(db_type),
@@ -5586,6 +5654,7 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
                 "update_manifest_enabled": False,
                 "update_manifest_status": "missing",
                 "has_config": False,
+                "documents": [],
                 "is_system": False,
                 "is_installed": False,
                 "git_url": git_url,
@@ -5626,6 +5695,28 @@ class PluginManagerMetadataProvider(BaseMetadataProvider):
 
             topics = self._catalog_normalize_topics(item_data.get("topics"))
             self._catalog_set_setting("PM_CATALOG_TOPICS", ",".join(topics))
+
+            document_raw = item_data.get("document_files")
+            if document_raw is None:
+                document_files = self._catalog_get_document_files(db_type)
+            else:
+                parts = re.split(r"[\r\n,]+", str(document_raw)) if isinstance(document_raw, str) else list(document_raw or [])
+                document_files, invalid_documents = [], []
+                for item in parts:
+                    rel = str(item or "").strip().replace("\\", "/")
+                    if not rel:
+                        continue
+                    bad = (not rel.lower().endswith(".md") or rel.startswith("/") or bool(re.match(r"^[A-Za-z]:", rel)) or any(part in ("", ".", "..") for part in rel.split("/")))
+                    if bad:
+                        invalid_documents.append(rel)
+                    elif rel not in document_files:
+                        document_files.append(rel)
+                if len(document_files) > _CATALOG_MAX_DOCUMENT_FILES:
+                    invalid_documents.extend(document_files[_CATALOG_MAX_DOCUMENT_FILES:])
+                    document_files = document_files[:_CATALOG_MAX_DOCUMENT_FILES]
+                if invalid_documents:
+                    return False, "문서 목록에는 플러그인 폴더 기준의 .md 파일만 등록할 수 있습니다: " + ", ".join(invalid_documents[:5])
+                self._catalog_set_setting("PM_DOCUMENT_FILES", json.dumps(document_files, ensure_ascii=False))
 
             allow_raw = item_data.get("allow_invalid_install")
             if allow_raw is None or str(allow_raw).strip() == "":

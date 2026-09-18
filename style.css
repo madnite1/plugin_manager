@@ -1365,3 +1365,162 @@ input:checked + .pm-slider:before {
     padding: 1rem 1.25rem;
     border-top: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
 }
+
+/* Plugin document viewer */
+.pm-plugin-top-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-shrink: 0;
+}
+
+.pm-modal.pm-documents-modal-box {
+    width: min(1100px, 96vw);
+    max-width: 1100px;
+    height: min(820px, 88vh);
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+}
+
+.pm-documents-shell {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 210px minmax(0, 1fr);
+}
+
+.pm-documents-list {
+    min-width: 0;
+    overflow-y: auto;
+    padding: 0.8rem;
+    border-right: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
+    background: rgba(15, 23, 42, 0.18);
+}
+
+.pm-document-item {
+    width: 100%;
+    display: block;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--app-text-secondary, #cbd5e1);
+    text-align: left;
+    padding: 0.6rem 0.7rem;
+    margin-bottom: 0.35rem;
+    cursor: pointer;
+    font-size: 0.84rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pm-document-item:hover,
+.pm-document-item.active {
+    background: rgba(99, 102, 241, 0.14);
+    border-color: var(--app-accent, #6366f1);
+    color: var(--app-text-primary, #fff);
+}
+
+.pm-markdown-viewer {
+    min-width: 0;
+    overflow: auto;
+    padding: 1.5rem 1.75rem 2.5rem;
+    line-height: 1.7;
+    color: var(--app-text-primary, #e2e8f0);
+}
+
+.pm-markdown-viewer h1,
+.pm-markdown-viewer h2,
+.pm-markdown-viewer h3,
+.pm-markdown-viewer h4 {
+    color: var(--app-text-primary, #fff);
+    line-height: 1.3;
+    margin: 1.5em 0 0.65em;
+}
+
+.pm-markdown-viewer h1:first-child,
+.pm-markdown-viewer h2:first-child,
+.pm-markdown-viewer h3:first-child {
+    margin-top: 0;
+}
+
+.pm-markdown-viewer pre {
+    overflow-x: auto;
+    padding: 1rem;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
+}
+
+.pm-markdown-viewer code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: rgba(255, 255, 255, 0.08);
+    padding: 0.12em 0.3em;
+    border-radius: 4px;
+}
+
+.pm-markdown-viewer pre code {
+    background: transparent;
+    padding: 0;
+}
+
+.pm-markdown-viewer table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+.pm-markdown-viewer th,
+.pm-markdown-viewer td {
+    border: 1px solid var(--app-border, rgba(255, 255, 255, 0.14));
+    padding: 0.5rem 0.65rem;
+    text-align: left;
+}
+
+.pm-markdown-viewer blockquote {
+    margin: 1rem 0;
+    padding: 0.15rem 0 0.15rem 1rem;
+    border-left: 3px solid var(--app-accent, #6366f1);
+    color: var(--app-text-muted, #94a3b8);
+}
+
+.pm-document-loading,
+.pm-document-error {
+    padding: 2rem;
+    text-align: center;
+    color: var(--app-text-muted, #94a3b8);
+}
+
+.pm-document-error {
+    color: #f87171;
+}
+
+@media (max-width: 720px) {
+    .pm-modal.pm-documents-modal-box {
+        width: 96vw;
+        height: 92vh;
+        max-height: 92vh;
+    }
+    .pm-documents-shell {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(0, 1fr);
+    }
+    .pm-documents-list {
+        display: flex;
+        gap: 0.4rem;
+        overflow-x: auto;
+        overflow-y: hidden;
+        border-right: 0;
+        border-bottom: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
+    }
+    .pm-document-item {
+        width: auto;
+        flex: 0 0 auto;
+        margin-bottom: 0;
+    }
+    .pm-markdown-viewer {
+        padding: 1rem;
+    }
+}

@@ -18,6 +18,7 @@
 
     const intervalInput = root.querySelector('#pm-catalog-interval');
     const topicsInput = root.querySelector('#pm-catalog-topics');
+    const documentFilesInput = root.querySelector('#pm-document-files');
     const allowInvalidInput = root.querySelector('#pm-allow-invalid-install');
     const autoUpdateInput = root.querySelector('#pm-auto-update');
     const rollbackEnabledInput = root.querySelector('#pm-rollback-enabled');
@@ -116,6 +117,9 @@
             if (topicsInput && !topicsInput.dataset.touched && Array.isArray(meta.topics)) {
                 topicsInput.value = meta.topics.join('\n');
             }
+            if (documentFilesInput && !documentFilesInput.dataset.touched && Array.isArray(meta.document_files)) {
+                documentFilesInput.value = meta.document_files.join('\n');
+            }
             if (allowInvalidInput && !allowInvalidInput.dataset.touched) {
                 allowInvalidInput.checked = !!meta.allow_invalid_install;
             }
@@ -146,6 +150,7 @@
     // 사용자가 필드를 건드리면 touched 마킹 — 초기값 fetch가 나중에 도착해도 덮어쓰지 않음
     if (intervalInput) intervalInput.addEventListener('input', () => { intervalInput.dataset.touched = '1'; });
     if (topicsInput) topicsInput.addEventListener('input', () => { topicsInput.dataset.touched = '1'; });
+    if (documentFilesInput) documentFilesInput.addEventListener('input', () => { documentFilesInput.dataset.touched = '1'; });
     if (allowInvalidInput) allowInvalidInput.addEventListener('change', () => { allowInvalidInput.dataset.touched = '1'; });
     if (autoUpdateInput) autoUpdateInput.addEventListener('change', () => { autoUpdateInput.dataset.touched = '1'; });
     if (rollbackEnabledInput) rollbackEnabledInput.addEventListener('change', () => { rollbackEnabledInput.dataset.touched = '1'; });
@@ -182,6 +187,7 @@
     async function saveCatalogSettings(form, submitBtn) {
         const intervalVal = intervalInput ? intervalInput.value.trim() : '';
         const topicsVal = topicsInput ? topicsInput.value.trim() : '';
+        const documentFilesVal = documentFilesInput ? documentFilesInput.value.trim() : '';
 
         const uniqueTopics = parseTopics(topicsVal);
         if (uniqueTopics.length > 5) {
@@ -200,6 +206,7 @@
             type: 'general',
             refresh_interval_hours: intervalVal,
             topics: topicsVal,
+            document_files: documentFilesVal,
             allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
             auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
             rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,

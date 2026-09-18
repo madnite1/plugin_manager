@@ -1121,6 +1121,12 @@
                     <i class="fa-solid fa-trash-can pm-text-danger"></i>
                    </button>`;
 
+            const documentBtnHtml = Array.isArray(p.documents) && p.documents.length > 0
+                ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-documents" data-id="${p.id}" data-name="${escapeHtmlAttr(p.name)}" title="플러그인 문서 보기">
+                    <i class="fa-solid fa-file-lines"></i> 문서
+                   </button>`
+                : '';
+
             const settingsBtnHtml = p.has_config
                 ? `<button class="pm-btn pm-btn-secondary pm-btn-sm pm-btn-icon-only pm-btn-settings" data-id="${p.id}" data-name="${p.name}" title="설정">
                     <i class="fa-solid fa-gear"></i>
@@ -1143,7 +1149,7 @@
                                     <span class="pm-plugin-id">${p.id} • v${p.version}${installedValidationBadge}${updateStatusBadge}</span>
                                 </div>
                             </div>
-                            ${settingsBtnHtml}
+                            <div class="pm-plugin-top-actions">${documentBtnHtml}${settingsBtnHtml}</div>
                         </div>
 
                         <div class="pm-badges-row">
@@ -1283,6 +1289,19 @@
         // Catalog Install Button (미설치 카드)
         document.querySelectorAll('.pm-btn-install').forEach(bindInstallButton);
 
+        // Documents Button
+        document.querySelectorAll('.pm-btn-documents').forEach(btn => {
+            btn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const pluginId = this.getAttribute('data-id');
+                const pluginName = this.getAttribute('data-name') || pluginId;
+                const plugin = allPlugins.find(item => item.id === pluginId);
+                const documents = plugin && Array.isArray(plugin.documents) ? plugin.documents : [];
+                if (pluginId && documents.length) openDocumentsModal(pluginId, pluginName, documents);
+            });
+        });
+
         // Settings Button (카드 우상단 톱니바퀴)
         document.querySelectorAll('.pm-btn-settings').forEach(btn => {
             btn.addEventListener('click', function(e) {
@@ -1305,6 +1324,60 @@
                 openDeleteModal(pluginId, pluginName, hasData);
             });
         });
+    }
+
+    function renderMarkdownDocument(markdownText) {
+        const source = String(markdownText == null ? '' : markdownText)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        if (!window.marked || typeof window.marked.parse !== 'function') return '<pre>' + source + '</pre>';
+        const template = document.createElement('template');
+        template.innerHTML = window.marked.parse(source);
+        template.content.querySelectorAll('a').forEach(el => el.removeAttribute('href'));
+        template.content.querySelectorAll('img').forEach(el => el.remove());
+        return template.innerHTML;
+    }
+
+    function closeDocumentsModal() {
+        const modal = document.getElementById('pm-documents-modal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    async function loadPluginDocument(pluginId, name) {
+        const contentEl = document.getElementById('pm-documents-content');
+        if (!contentEl) return;
+        contentEl.innerHTML = '<div class="pm-document-loading"><i class="fa-solid fa-spinner fa-spin"></i> 문서를 불러오는 중...</div>';
+        const result = await callPluginAction({ action: 'get_document', plugin_id: pluginId, name: name });
+        if (!result || !result.success || !result.message || typeof result.message !== 'object') {
+            contentEl.innerHTML = '<div class="pm-document-error">' + escapeHtml((result && result.error) || '문서를 불러오지 못했습니다.') + '</div>';
+            return;
+        }
+        contentEl.innerHTML = renderMarkdownDocument(result.message.content || '');
+        contentEl.scrollTop = 0;
+        document.querySelectorAll('#pm-documents-list .pm-document-item').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.documentName === name);
+        });
+    }
+
+    function openDocumentsModal(pluginId, pluginName, documents) {
+        const modal = document.getElementById('pm-documents-modal');
+        const titleEl = document.getElementById('pm-documents-modal-title');
+        const listEl = document.getElementById('pm-documents-list');
+        const contentEl = document.getElementById('pm-documents-content');
+        if (!modal || !listEl || !contentEl || !documents.length) return;
+        if (titleEl) titleEl.textContent = pluginName + ' 문서';
+        listEl.innerHTML = '';
+        contentEl.innerHTML = '';
+        documents.forEach(name => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'pm-document-item';
+            btn.dataset.documentName = name;
+            btn.textContent = name;
+            btn.addEventListener('click', () => loadPluginDocument(pluginId, name));
+            listEl.appendChild(btn);
+        });
+        modal.style.display = 'flex';
+        loadPluginDocument(pluginId, documents[0]);
     }
 
     // Settings Modal Control
@@ -1497,6 +1570,7 @@
 
         const intervalInput = document.getElementById('pm-catalog-interval');
         const topicsInput = document.getElementById('pm-catalog-topics');
+        const documentFilesInput = document.getElementById('pm-document-files');
         const allowInvalidInput = document.getElementById('pm-allow-invalid-install');
         const autoUpdateInput = document.getElementById('pm-auto-update');
         const rollbackEnabledInput = document.getElementById('pm-rollback-enabled');
@@ -1529,6 +1603,7 @@
                 type: 'general',
                 refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
                 topics: topicsInput ? topicsInput.value.trim() : '',
+                document_files: documentFilesInput ? documentFilesInput.value.trim() : '',
                 allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                 auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                 rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
@@ -1578,6 +1653,7 @@
                         item_data: Object.assign({ action: 'save_config' }, {
                             refresh_interval_hours: intervalInput ? intervalInput.value.trim() : '',
                             topics: topicsInput ? topicsInput.value.trim() : '',
+                            document_files: documentFilesInput ? documentFilesInput.value.trim() : '',
                             allow_invalid_install: allowInvalidInput ? allowInvalidInput.checked : false,
                             auto_update: autoUpdateInput ? autoUpdateInput.checked : false,
                             rollback_enabled: rollbackEnabledInput ? rollbackEnabledInput.checked : false,
@@ -1905,6 +1981,12 @@
                     });
             });
         }
+
+        // Documents Modal buttons
+        const documentsCloseBtn = document.getElementById('pm-documents-modal-close-btn');
+        const documentsCancelBtn = document.getElementById('pm-documents-modal-cancel-btn');
+        if (documentsCloseBtn) documentsCloseBtn.addEventListener('click', closeDocumentsModal);
+        if (documentsCancelBtn) documentsCancelBtn.addEventListener('click', closeDocumentsModal);
 
         // Settings Modal buttons
         const settingsCloseBtn = document.getElementById('pm-settings-modal-close-btn');
