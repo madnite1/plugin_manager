@@ -1456,6 +1456,18 @@
                         if (rawConfig) pluginConfig = JSON.parse(rawConfig);
                     } catch(e) {}
 
+                    // 코어 설정 화면과 동일하게 커스텀 settings.html의 name 기반 필드에
+                    // 저장된 config 값을 먼저 주입한 뒤 플러그인 settings.js를 실행한다.
+                    Object.entries(pluginConfig).forEach(([key, value]) => {
+                        const field = rootEl.querySelector(`[name="${CSS.escape(key)}"]`);
+                        if (!field) return;
+                        if (field.type === 'checkbox') {
+                            field.checked = value === true || value === '1' || value === 1 || value === 'true';
+                        } else {
+                            field.value = value ?? '';
+                        }
+                    });
+
                     if (p.settings_ui && p.settings_ui.css) {
                         const styleEl = document.createElement('style');
                         styleEl.textContent = p.settings_ui.css;
